@@ -45,7 +45,6 @@ import { ProcessTimelineView } from "./process-timeline-view"
 import { ProviderErrorRow } from "./provider-error-row"
 import {
 	COMPACTION_COMPLETED_TEXT,
-	CompactionStatusDivider,
 	compactionStatusFromMetadata,
 	isCompactionStatusText,
 } from "./compaction-status-divider"
@@ -266,18 +265,29 @@ function AttachmentThumbnail({
 // Part extraction helpers
 // ============================================================
 
-/** A renderable part — either a tool call, an intermediate text block, or reasoning */
+/** A renderable part — tool, text, reasoning, or inline compaction marker */
 type RenderablePart =
 	| { kind: "tool"; part: ToolPart }
 	| { kind: "text"; id: string; text: string; metadata?: Record<string, unknown> }
 	| { kind: "reasoning"; part: ReasoningPart }
+	| { kind: "compaction"; id: string; status: SessionCompactionStatus }
 
 type TextRenderablePart = Extract<RenderablePart, { kind: "text" }>
+
+function compactionStatusFromPart(part: {
+	text: string
+	metadata?: Record<string, unknown>
+}): SessionCompactionStatus | null {
+	const fromMeta = compactionStatusFromMetadata(part.metadata)
+	if (fromMeta) return fromMeta
+	if (!isCompactionStatusText(part.text)) return null
+	return part.text.trim() === COMPACTION_COMPLETED_TEXT ? "completed" : "started"
+}
 
 /**
  * Flattens all assistant parts into an ordered list of renderable items
  * AND extracts the tool-only subset in a single pass.
- * Preserves the natural order: text, reasoning, tool, text, tool, text...
+ * Preserves the natural order: text, reasoning, tool, compaction, text, tool...
  * Filters out synthetic text, todoread without output, and empty text.
  * Strips OpenRouter [REDACTED] chunks from reasoning and skips empty reasoning.
  */
@@ -294,9 +304,12 @@ function getPartsAndTools(assistantMessages: ChatMessageEntry[]): {
 				if (part.tool === "todoread" && part.state.status !== "completed") continue
 				ordered.push({ kind: "tool", part })
 			} else if (part.type === "text" && !part.synthetic && part.text.trim()) {
-				if (isCompactionStatusText(part.text)) continue
 				const metadata = (part as { metadata?: Record<string, unknown> }).metadata
-				if (compactionStatusFromMetadata(metadata)) continue
+				const compactionStatus = compactionStatusFromPart({ text: part.text, metadata })
+				if (compactionStatus) {
+					ordered.push({ kind: "compaction", id: part.id, status: compactionStatus })
+					continue
+				}
 				ordered.push({ kind: "text", id: part.id, text: part.text, metadata })
 			} else if (part.type === "reasoning") {
 				// Strip OpenRouter's encrypted [REDACTED] chunks
@@ -310,34 +323,23 @@ function getPartsAndTools(assistantMessages: ChatMessageEntry[]): {
 	return { ordered, tools }
 }
 
-function compactionStatusesFromTurn(
-	assistantMessages: ChatMessageEntry[],
+/**
+ * Live session status can arrive before the synthetic assistant marker
+ * (e.g. context/compactionStarted). Append a trailing started marker on the
+ * latest turn when the chronological parts do not already end with one.
+ */
+function withLiveCompactionStatus(
+	ordered: RenderablePart[],
 	sessionStatus: SessionCompactionStatus | null | undefined,
 	isLastTurn: boolean,
-): SessionCompactionStatus[] {
-	const statuses: SessionCompactionStatus[] = []
-	for (const msg of assistantMessages) {
-		for (const part of msg.parts) {
-			if (part.type !== "text") continue
-			const metadata = (part as { metadata?: Record<string, unknown> }).metadata
-			const fromPart = compactionStatusFromMetadata(metadata)
-			if (fromPart) {
-				statuses.push(fromPart)
-				continue
-			}
-			if (isCompactionStatusText(part.text)) {
-				statuses.push(
-					part.text.trim() === COMPACTION_COMPLETED_TEXT ? "completed" : "started",
-				)
-			}
-		}
-	}
-	// Live session status can arrive before the synthetic assistant marker
-	// (e.g. context/compactionStarted). Surface it on the latest turn.
-	if (isLastTurn && sessionStatus === "started" && statuses[statuses.length - 1] !== "started") {
-		statuses.push("started")
-	}
-	return statuses
+): RenderablePart[] {
+	if (!isLastTurn || sessionStatus !== "started") return ordered
+	const last = ordered[ordered.length - 1]
+	if (last?.kind === "compaction" && last.status === "started") return ordered
+	return [
+		...ordered,
+		{ kind: "compaction", id: "live-compaction-started", status: "started" },
+	]
 }
 
 /**
@@ -355,6 +357,7 @@ function getLastResponseText(orderedParts: RenderablePart[]): string | undefined
 function splitCompletedTurnParts(orderedParts: RenderablePart[]): {
 	completedProcessParts: RenderablePart[]
 	finalResponsePart: TextRenderablePart | undefined
+	trailingProcessParts: RenderablePart[]
 } {
 	let finalResponseIndex = -1
 	for (let i = orderedParts.length - 1; i >= 0; i--) {
@@ -368,12 +371,19 @@ function splitCompletedTurnParts(orderedParts: RenderablePart[]): {
 	}
 
 	if (finalResponseIndex === -1) {
-		return { completedProcessParts: orderedParts, finalResponsePart: undefined }
+		return {
+			completedProcessParts: orderedParts,
+			finalResponsePart: undefined,
+			trailingProcessParts: [],
+		}
 	}
 
 	const finalResponsePart = orderedParts[finalResponseIndex] as TextRenderablePart
-	const completedProcessParts = orderedParts.filter((_, index) => index !== finalResponseIndex)
-	return { completedProcessParts, finalResponsePart }
+	return {
+		completedProcessParts: orderedParts.slice(0, finalResponseIndex),
+		finalResponsePart,
+		trailingProcessParts: orderedParts.slice(finalResponseIndex + 1),
+	}
 }
 
 function researchArtifactTitle(item: TextRenderablePart): string | undefined {
@@ -687,19 +697,18 @@ export const ChatTurnComponent = memo(
 		const userFiles = useMemo(() => getFileParts(turn.userMessage), [turn.userMessage])
 
 		// Ordered parts + tool-only subset in a single pass (avoids double iteration)
-		const { ordered: orderedParts } = useMemo(
+		const { ordered: baseOrderedParts } = useMemo(
 			() => getPartsAndTools(turn.assistantMessages),
 			[turn.assistantMessages],
 		)
+		const orderedParts = useMemo(
+			() => withLiveCompactionStatus(baseOrderedParts, compactionStatus, isLast),
+			[baseOrderedParts, compactionStatus, isLast],
+		)
 
-		const { completedProcessParts, finalResponsePart } = useMemo(
+		const { completedProcessParts, finalResponsePart, trailingProcessParts } = useMemo(
 			() => splitCompletedTurnParts(orderedParts),
 			[orderedParts],
-		)
-		const displayedCompactionStatuses = useMemo(
-			() =>
-				compactionStatusesFromTurn(turn.assistantMessages, compactionStatus, isLast),
-			[turn.assistantMessages, compactionStatus, isLast],
 		)
 
 		// The last text for streaming display and copy action
@@ -746,6 +755,10 @@ export const ChatTurnComponent = memo(
 		const processTimelineItems = useMemo(
 			() => buildProcessTimeline(processOrderedParts),
 			[processOrderedParts],
+		)
+		const trailingTimelineItems = useMemo(
+			() => (working ? [] : buildProcessTimeline(trailingProcessParts)),
+			[trailingProcessParts, working],
 		)
 		const hasWorkToDisclose = !working && processTimelineItems.length > 0
 		const hasCompletedProcessDetails = hasWorkToDisclose
@@ -951,6 +964,24 @@ export const ChatTurnComponent = memo(
 					</div>
 				)}
 
+				{/* Parts that arrived after the final assistant reply (e.g. late compaction) */}
+				{!working && trailingTimelineItems.length > 0 && (
+					<div className="flex flex-col gap-1">
+						<ProcessTimelineView
+							defaultExpandAll={showVerboseTools}
+							expandedRowIds={showVerboseTools ? undefined : expandedRowIds}
+							items={trailingTimelineItems}
+							onDeleteToolPart={onDeletePart ? handleDeleteToolPart : undefined}
+							onToggleRow={showVerboseTools ? undefined : handleToggleTimelineRow}
+							orderedParts={trailingProcessParts}
+							projectRoot={toolPathRoot}
+							renderText={handleRenderTimelineText}
+							turnHasError={!!errorText}
+							working={false}
+						/>
+					</div>
+				)}
+
 				{/* Streaming response — visible while working, when text isn't already inline */}
 				{working && responseText && !textAlreadyInline && (
 					<div>
@@ -1001,15 +1032,6 @@ export const ChatTurnComponent = memo(
 					)}
 					</MessageActions>
 				)}
-
-				{/* Compaction lifecycle dividers sit below turn actions so they
-				    read as a session boundary after Scroll/Copy/Fork. */}
-				{displayedCompactionStatuses.map((status, index) => (
-					<CompactionStatusDivider
-						key={`${status}-${index}`}
-						status={status}
-					/>
-				))}
 			</div>
 		)
 	},

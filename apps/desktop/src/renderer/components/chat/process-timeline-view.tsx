@@ -1,6 +1,7 @@
 import { memo, useCallback, type ReactNode } from "react"
 import type { ToolPart } from "../../lib/types"
 import { ChatToolCall, describeToolGroup } from "./chat-tool-call"
+import { CompactionStatusDivider } from "./compaction-status-divider"
 import {
 	buildProcessTimeline,
 	isReasoningPartActivelyStreaming,
@@ -252,6 +253,10 @@ export const ProcessTimelineView = memo(function ProcessTimelineView({
 							working={working}
 						/>
 					)
+				}
+
+				if (item.kind === "compaction") {
+					return <CompactionStatusDivider key={rowId} status={item.status} />
 				}
 
 				return (

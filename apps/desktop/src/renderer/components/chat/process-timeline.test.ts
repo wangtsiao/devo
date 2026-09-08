@@ -50,6 +50,22 @@ describe("buildProcessTimeline", () => {
 			},
 		])
 	})
+
+	test("keeps compaction markers in chronological order among tools", () => {
+		expect(
+			buildProcessTimeline([
+				tool("t1"),
+				{ kind: "compaction", id: "c-started", status: "started" },
+				{ kind: "compaction", id: "c-done", status: "completed" },
+				tool("t2", "bash"),
+			]),
+		).toEqual([
+			{ kind: "tool", part: tool("t1").part },
+			{ kind: "compaction", id: "c-started", status: "started" },
+			{ kind: "compaction", id: "c-done", status: "completed" },
+			{ kind: "tool", part: tool("t2", "bash").part },
+		])
+	})
 })
 
 function reasoningWithoutEnd(id: string): { kind: "reasoning"; part: ReasoningPart } {

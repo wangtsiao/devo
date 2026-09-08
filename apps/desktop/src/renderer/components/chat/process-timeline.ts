@@ -1,3 +1,4 @@
+import type { SessionCompactionStatus } from "../../atoms/compaction"
 import type { ReasoningPart, ToolPart } from "../../lib/types"
 import { getToolCategory, type ToolCategory } from "./tool-category"
 
@@ -5,17 +6,20 @@ export type ProcessTimelineInput =
 	| { kind: "tool"; part: ToolPart }
 	| { kind: "text"; id: string; text: string; metadata?: Record<string, unknown> }
 	| { kind: "reasoning"; part: ReasoningPart }
+	| { kind: "compaction"; id: string; status: SessionCompactionStatus }
 
 export type ProcessTimelineItem =
 	| { kind: "text"; id: string; text: string; metadata?: Record<string, unknown> }
 	| { kind: "thought"; part: ReasoningPart }
 	| { kind: "tool"; part: ToolPart }
 	| { kind: "tool-group"; category: ToolCategory; tools: ToolPart[] }
+	| { kind: "compaction"; id: string; status: SessionCompactionStatus }
 
 /**
  * Builds an interleaved process timeline from ordered assistant parts.
  * Each reasoning part becomes its own thought row; tools are grouped only when
- * consecutive and share the same category.
+ * consecutive and share the same category. Compaction markers stay in arrival
+ * order among tools/reasoning/text.
  */
 export function buildProcessTimeline(ordered: ProcessTimelineInput[]): ProcessTimelineItem[] {
 	const items: ProcessTimelineItem[] = []
@@ -55,6 +59,9 @@ export function buildProcessTimeline(ordered: ProcessTimelineInput[]): ProcessTi
 				metadata: part.metadata,
 				text: part.text,
 			})
+		} else if (part.kind === "compaction") {
+			flushGroup()
+			items.push({ kind: "compaction", id: part.id, status: part.status })
 		}
 	}
 
@@ -78,7 +85,7 @@ export function isReasoningPartActivelyStreaming(
 		if (part.kind === "text" && part.text.replace("[REDACTED]", "").trim()) {
 			return false
 		}
-		if (part.kind === "tool" || part.kind === "reasoning") {
+		if (part.kind === "tool" || part.kind === "reasoning" || part.kind === "compaction") {
 			return false
 		}
 	}
@@ -94,6 +101,8 @@ export function processTimelineRowId(item: ProcessTimelineItem, index: number): 
 			return item.part.id
 		case "tool":
 			return item.part.id
+		case "compaction":
+			return item.id
 		case "tool-group": {
 			const toolIds = item.tools.map((tool) => tool.id).join("+")
 			return `group-${item.category}-${toolIds || index}`

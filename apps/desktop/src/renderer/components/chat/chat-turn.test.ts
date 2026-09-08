@@ -376,16 +376,18 @@ describe("ChatTurnComponent transcript controls", () => {
     });
   });
 
-  test("renders compaction lifecycle as a transcript divider", () => {
-    const actionsIndex = source.lastIndexOf("</MessageActions>")
-    const dividerIndex = source.indexOf("displayedCompactionStatuses.map")
+  test("renders compaction lifecycle inline in the process timeline", () => {
+    const timelineViewIndex = processTimelineViewSource.indexOf('item.kind === "compaction"')
     expect({
-      filtersStartedTextFromAssistantResponse:
-        source.includes("isCompactionStatusText(part.text)") &&
-        source.includes("continue"),
-      rendersDividerBelowTurnActions:
-        dividerIndex > actionsIndex &&
-        source.includes("<CompactionStatusDivider"),
+      keepsCompactionInOrderedParts:
+        source.includes('ordered.push({ kind: "compaction"') &&
+        source.includes("compactionStatusFromPart"),
+      surfacesLiveStartedInline: source.includes("withLiveCompactionStatus"),
+      rendersInlineInProcessTimeline:
+        timelineViewIndex >= 0 &&
+        processTimelineViewSource.includes("<CompactionStatusDivider"),
+      doesNotPinDividersBelowActions: !source.includes("displayedCompactionStatuses.map"),
+      preservesTrailingAfterFinalReply: source.includes("trailingProcessParts"),
       updatesMemoWhenCompactionStatusChanges: source.includes(
         "prev.compactionStatus !== next.compactionStatus",
       ),
@@ -411,8 +413,11 @@ describe("ChatTurnComponent transcript controls", () => {
         clientSource.includes("upsertCompaction") &&
         clientSource.includes("compaction-${update.itemId}-${update.status}"),
     }).toEqual({
-      filtersStartedTextFromAssistantResponse: true,
-      rendersDividerBelowTurnActions: true,
+      keepsCompactionInOrderedParts: true,
+      surfacesLiveStartedInline: true,
+      rendersInlineInProcessTimeline: true,
+      doesNotPinDividersBelowActions: true,
+      preservesTrailingAfterFinalReply: true,
       updatesMemoWhenCompactionStatusChanges: true,
       chatViewPassesSessionCompactionStatus: true,
       usesRequestedIcons: true,
