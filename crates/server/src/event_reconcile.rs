@@ -101,7 +101,39 @@ fn reconcile_file(rollout_path: &Path, db: &Database) -> Result<FileOutcome> {
                 .project_line(&legacy)
                 .with_context(|| format!("project legacy line in {}", rollout_path.display()))?,
             Ok(ParsedRolloutLine::V2(v2)) => vec![*v2],
-            Err(devo_core::RolloutLineReadError::TruncatedTail) if lines.peek().is_none() => break,
+            Err(devo_core::RolloutLineReadError::TruncatedTail) => {
+                let only_blank_remain = {
+                    let mut blank = true;
+                    while let Some((_, next)) = lines.peek() {
+                        match next {
+                            Ok(line) if line.trim().is_empty() => {
+                                let _ = lines.next();
+                            }
+                            Ok(_) => {
+                                blank = false;
+                                break;
+                            }
+                            Err(_) => {
+                                blank = false;
+                                break;
+                            }
+                        }
+                    }
+                    blank
+                };
+                if only_blank_remain {
+                    break;
+                }
+                return Ok(FileOutcome {
+                    inserted,
+                    damaged: true,
+                    reason: Some(format!(
+                        "rollout {} is damaged at line {}: truncated rollout line (crash tail; only the final line may be ignored)",
+                        rollout_path.display(),
+                        line_index + 1
+                    )),
+                });
+            }
             Err(error) => {
                 return Ok(FileOutcome {
                     inserted,

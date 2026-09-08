@@ -238,7 +238,28 @@ pub fn read_execution_replay(
                 _ => {}
             },
             Ok(ParsedRolloutLine::Legacy(_)) => {}
-            Err(RolloutLineReadError::TruncatedTail) if lines.peek().is_none() => break,
+            Err(RolloutLineReadError::TruncatedTail) => {
+                let mut only_blank = true;
+                while let Some(next) = lines.peek() {
+                    match next {
+                        Ok(line) if line.trim().is_empty() => {
+                            let _ = lines.next();
+                        }
+                        Ok(_) => {
+                            only_blank = false;
+                            break;
+                        }
+                        Err(_) => {
+                            only_blank = false;
+                            break;
+                        }
+                    }
+                }
+                if only_blank {
+                    break;
+                }
+                return Err(RolloutLineReadError::TruncatedTail.into());
+            }
             Err(error) => return Err(error.into()),
         }
     }

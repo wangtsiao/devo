@@ -645,8 +645,13 @@ impl RolloutStore {
             let parsed = match parse_rollout_line(&line) {
                 Ok(parsed) => parsed,
                 // A truncated final line is a crash tail: the write never
-                // completed, nothing was acknowledged.
-                Err(RolloutLineReadError::TruncatedTail) if lines.peek().is_none() => break,
+                // completed, nothing was acknowledged. Trailing blank lines
+                // after a crash do not make it mid-file damage.
+                Err(RolloutLineReadError::TruncatedTail)
+                    if rollout_remainder_is_crash_tail(&mut lines) =>
+                {
+                    break;
+                }
                 // Fail closed: a damaged or unsupported mid-file line means
                 // the session's history is unreadable past this point; the
                 // session refuses to resume rather than silently dropping
@@ -719,7 +724,11 @@ impl RolloutStore {
             }
             let parsed = match parse_rollout_line(&line) {
                 Ok(parsed) => parsed,
-                Err(RolloutLineReadError::TruncatedTail) if lines.peek().is_none() => break,
+                Err(RolloutLineReadError::TruncatedTail)
+                    if rollout_remainder_is_crash_tail(&mut lines) =>
+                {
+                    break;
+                }
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!(
@@ -1072,15 +1081,84 @@ fn v2_line_timestamp(line: &RolloutLineV2) -> chrono::DateTime<Utc> {
     }
 }
 
-/// Builds the write-path projector for an existing rollout file by replaying
-/// its current contents: legacy lines go through the forward projector (so
-/// the seq counter and approval folds advance exactly as if the file had
-/// been written through the v2 path), v2 lines re-sync that state via
-/// [`LegacyProjector::observe_v2_line`]. Bounded per path: runs once, on the
-/// first append, and the result is cached in the store.
-///
-/// Fails closed on any damaged or unsupported line: appending onto history
-/// the projector could not fully read would fork the session's history.
+/// True when every remaining JSONL row is blank (or there are none). Used so a
+/// truncated crash tail followed only by blank lines is still treated as final.
+fn rollout_remainder_is_crash_tail<I>(lines: &mut std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = (usize, std::io::Result<String>)>,
+{
+    while let Some((_, next)) = lines.peek() {
+        match next {
+            Ok(line) if line.trim().is_empty() => {
+                let _ = lines.next();
+            }
+            Ok(_) => return false,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Removes a trailing truncated JSONL crash tail so later appends cannot leave
+/// mid-file truncation for loaders.
+fn discard_rollout_crash_tail(rollout_path: &Path) -> Result<()> {
+    let contents = match std::fs::read(rollout_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read rollout file {}", rollout_path.display()));
+        }
+    };
+    if contents.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&contents);
+    let mut keep_len = 0usize;
+    let mut line_start = 0usize;
+    for (idx, _) in text.match_indices('\n') {
+        let raw = &text[line_start..idx];
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            keep_len = idx + 1;
+        } else {
+            match parse_rollout_line(line) {
+                Ok(_) => keep_len = idx + 1,
+                Err(RolloutLineReadError::TruncatedTail) => {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(rollout_path)
+                        .with_context(|| {
+                            format!("open rollout for truncate {}", rollout_path.display())
+                        })?
+                        .set_len(keep_len as u64)
+                        .with_context(|| {
+                            format!("truncate rollout crash tail {}", rollout_path.display())
+                        })?;
+                    return Ok(());
+                }
+                Err(_) => return Ok(()),
+            }
+        }
+        line_start = idx + 1;
+    }
+    let trailing = text[line_start..].trim_end_matches('\r');
+    if !trailing.trim().is_empty()
+        && matches!(
+            parse_rollout_line(trailing),
+            Err(RolloutLineReadError::TruncatedTail)
+        )
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(rollout_path)
+            .with_context(|| format!("open rollout for truncate {}", rollout_path.display()))?
+            .set_len(keep_len as u64)
+            .with_context(|| format!("truncate rollout crash tail {}", rollout_path.display()))?;
+    }
+    Ok(())
+}
+
 /// Builds the write-path state for an existing rollout file by replaying its
 /// current contents: legacy lines go through the forward projector (so the
 /// seq counter and approval folds advance exactly as if the file had been
@@ -1110,6 +1188,7 @@ fn hydrate_write_state(rollout_path: &Path) -> Result<WritePathState> {
     };
     let reader = BufReader::new(file);
     let mut lines = reader.lines().enumerate().peekable();
+    let mut saw_crash_tail = false;
     while let Some((line_index, line)) = lines.next() {
         let line = line.with_context(|| format!("read line from {}", rollout_path.display()))?;
         if line.trim().is_empty() {
@@ -1122,7 +1201,12 @@ fn hydrate_write_state(rollout_path: &Path) -> Result<WritePathState> {
                 })?;
             }
             Ok(ParsedRolloutLine::V2(v2)) => projector.observe_v2_line(&v2),
-            Err(RolloutLineReadError::TruncatedTail) if lines.peek().is_none() => break,
+            Err(RolloutLineReadError::TruncatedTail)
+                if rollout_remainder_is_crash_tail(&mut lines) =>
+            {
+                saw_crash_tail = true;
+                break;
+            }
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
@@ -1135,6 +1219,13 @@ fn hydrate_write_state(rollout_path: &Path) -> Result<WritePathState> {
         }
         // The line index counts physical JSONL rows regardless of format.
         next_line_index += 1;
+    }
+    drop(lines);
+    if saw_crash_tail {
+        // Drop the unacked crash-tail bytes so a later append cannot turn this
+        // into mid-file truncation for loaders. Must run after the read handle
+        // is closed (Windows cannot truncate an open file).
+        discard_rollout_crash_tail(rollout_path)?;
     }
     Ok(WritePathState {
         projector,
@@ -4666,8 +4757,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hydration_tolerates_truncated_final_line() {
+    #[tokio::test]
+    async fn hydration_tolerates_truncated_final_line() {
         use tempfile::TempDir;
 
         let dir = TempDir::new().expect("temp dir");
@@ -4698,6 +4789,48 @@ mod tests {
         restarted_store
             .append_turn(&record, turn)
             .expect("crash tail is tolerated");
+        let deps = test_deps(dir.path());
+        restarted_store
+            .load_session_from_rollout(&record.rollout_path, &deps)
+            .await
+            .expect("append after crash tail must remain loadable");
+    }
+
+    #[tokio::test]
+    async fn load_tolerates_truncated_crash_tail_with_trailing_blank_lines() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("temp dir");
+        let deps = test_deps(dir.path());
+        let rollout_store = super::RolloutStore::new(dir.path().to_path_buf(), None);
+        let record = rollout_store.create_session_record(
+            SessionId::new(),
+            Utc::now(),
+            dir.path().to_path_buf(),
+            Vec::new(),
+            None,
+            Some("test-model".into()),
+            None,
+            None,
+            "test-provider".into(),
+            None,
+        );
+        rollout_store
+            .append_session_meta(&record)
+            .expect("append session meta");
+        write_raw_lines(
+            &record.rollout_path,
+            &[
+                r#"{"v":2,"kind":"item","timestamp":"2026"#.to_string(),
+                String::new(),
+            ],
+        );
+
+        let recovered = rollout_store
+            .load_session_from_rollout(&record.rollout_path, &deps)
+            .await
+            .expect("truncated crash tail with trailing blank must load");
+        assert_eq!(recovered.summary.session_id, record.id);
     }
 
     #[tokio::test]

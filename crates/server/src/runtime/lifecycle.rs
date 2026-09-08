@@ -367,6 +367,16 @@ impl ServerRuntime {
                 continue;
             };
 
+            // Stop the live turn writer before appending recovery / terminal
+            // rollout lines. Otherwise a concurrent journal append can leave a
+            // truncated JSONL row that is no longer the final line once
+            // shutdown facts are written, and restart hydration fails closed.
+            self.signal_active_turn_interrupt(session_id).await;
+            self.active_turns.abort_task(session_id).await;
+            // In-flight spawn_blocking appends are not cancelled by abort; yield
+            // so they can finish under the rollout file lock before we write.
+            tokio::task::yield_now().await;
+
             if let Err(error) = self
                 .persist_recovery_disposition(
                     session_id,

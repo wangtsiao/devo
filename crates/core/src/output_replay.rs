@@ -36,7 +36,31 @@ pub fn read_output_references(path: &Path) -> anyhow::Result<Vec<OutputArtifact>
                 }
             }
             Ok(ParsedRolloutLine::Legacy(_)) => {}
-            Err(RolloutLineReadError::TruncatedTail) if lines.peek().is_none() => break,
+            Err(RolloutLineReadError::TruncatedTail) => {
+                let only_blank_remain = {
+                    let mut blank = true;
+                    while let Some(next) = lines.peek() {
+                        match next {
+                            Ok(line) if line.trim().is_empty() => {
+                                let _ = lines.next();
+                            }
+                            Ok(_) => {
+                                blank = false;
+                                break;
+                            }
+                            Err(_) => {
+                                blank = false;
+                                break;
+                            }
+                        }
+                    }
+                    blank
+                };
+                if only_blank_remain {
+                    break;
+                }
+                return Err(RolloutLineReadError::TruncatedTail.into());
+            }
             Err(error) => return Err(error.into()),
         }
     }

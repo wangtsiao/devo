@@ -5522,8 +5522,10 @@ mod tests {
         );
 
         runtime.shutdown().await;
-        open.store(true, std::sync::atomic::Ordering::SeqCst);
         drop(runtime);
+        // Unblock only after the runtime is gone so a gated provider response
+        // cannot race another rollout write during teardown.
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let rebuilt = build_runtime_with_provider(
             data_root.path(),
