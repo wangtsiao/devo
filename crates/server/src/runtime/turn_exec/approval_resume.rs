@@ -458,10 +458,9 @@ impl ServerRuntime {
             self.tool_registry_for_actor_state(&working.state)
         };
         let usage_parent_session_id = working.state.parent_session_id();
-        let usage_context_window =
-            Some(crate::runtime::context_occupancy::occupancy_window_tokens(Some(
-                &turn_config.model,
-            )));
+        let usage_context_window = Some(
+            crate::runtime::context_occupancy::occupancy_window_tokens(Some(&turn_config.model)),
+        );
         let stream = Arc::clone(&working.state.stream);
         let event_task = spawn_turn_event_stream(
             Arc::clone(self),

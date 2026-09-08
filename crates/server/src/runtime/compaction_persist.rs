@@ -328,9 +328,7 @@ impl ServerRuntime {
             let window = inline
                 .summary
                 .effective_context_window
-                .or_else(|| {
-                    model.map(super::context_occupancy::resolved_compaction_limit)
-                })
+                .or_else(|| model.map(super::context_occupancy::resolved_compaction_limit))
                 .unwrap_or(0);
             let previous_occupancy = inline.summary.last_context_occupancy.clone();
             let occupancy = super::context_occupancy::occupancy_after_compaction(

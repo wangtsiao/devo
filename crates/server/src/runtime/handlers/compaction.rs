@@ -661,9 +661,8 @@ impl ServerRuntime {
                             .summary
                             .effective_context_window
                             .or_else(|| {
-                                model.map(
-                                    super::super::context_occupancy::resolved_compaction_limit,
-                                )
+                                model
+                                    .map(super::super::context_occupancy::resolved_compaction_limit)
                             })
                             .unwrap_or(0);
                         let occupancy = super::super::context_occupancy::occupancy_after_compaction(

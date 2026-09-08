@@ -1247,9 +1247,8 @@ impl ServerRuntime {
         let history = devo_core::read_canonical_history(&rollout_path).ok()?;
         let mut session = history.session.map(|session| *session)?;
         if let Some(model) = self.deps.model_catalog.get(&session.model.model) {
-            session.settings.effective_context_window = Some(
-                crate::runtime::context_occupancy::resolved_compaction_limit(model),
-            );
+            session.settings.effective_context_window =
+                Some(crate::runtime::context_occupancy::resolved_compaction_limit(model));
         }
         Some(session)
     }
