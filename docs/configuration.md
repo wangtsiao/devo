@@ -420,9 +420,9 @@ the percent overlay so the default 95% applies again. For a custom model with
 no hard window yet, entering a value sets `context_window` to that amount and
 percent to 100.
 
-A legacy `compaction_token_limit` in `config.toml` is still loaded for
-compatibility but is **ignored** for occupancy and auto-compact. There is no
-separate Auto-compact threshold UI.
+A legacy `compaction_token_limit` key in `config.toml` was removed from the
+schema and is ignored if still present. There is no separate Auto-compact
+threshold UI.
 
 ### Wire API values
 
@@ -586,8 +586,8 @@ collapse_reasoning = true
     reasoning in full and collapse longer reasoning to a one-line `Thought · …`
     summary (full text remains available in Ctrl+T).
   - `false`: show full reasoning while streaming and after it finishes.
-- Legacy `compaction_token_limit`, if present, is ignored. Set each model's
-  usable Context window in Settings › Models instead.
+- Legacy `compaction_token_limit`, if present in old configs, is ignored. Set
+  each model's usable Context window in Settings › Models instead.
 
 ### Migrating provider settings from `config.toml`
 

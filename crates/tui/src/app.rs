@@ -49,8 +49,6 @@ pub struct InitialTuiSession {
     pub permission_preset: PermissionPreset,
     /// Initial sandbox profile restored from project-level config.
     pub sandbox_profile: Option<String>,
-    /// Initial global compaction token limit from user `config.toml`, when set.
-    pub compaction_token_limit: Option<u64>,
     /// Default collaboration mode from user `config.toml`.
     pub default_collaboration_mode: CollaborationMode,
     /// Working directory used for the initial session.

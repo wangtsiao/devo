@@ -526,7 +526,6 @@ impl ChatWidget {
 
     pub(crate) fn note_effective_context_window_updated(&mut self, effective_context_window: u64) {
         self.effective_context_window = Some(effective_context_window);
-        self.default_compaction_token_limit = Some(effective_context_window);
         if let Some(occupancy) = self.last_context_occupancy.as_mut() {
             occupancy.context_window_tokens = effective_context_window;
         }

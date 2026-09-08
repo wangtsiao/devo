@@ -7,10 +7,9 @@ use devo_protocol::native::item::ContextOccupancy;
 
 /// Resolve the applied compaction / occupancy limit for a model.
 ///
-/// Global `compaction_token_limit` and session overrides are ignored: the only
-/// user-facing limit is the model's usable window
+/// The only user-facing limit is the model's usable window
 /// (`context_window × effective_context_window_percent / 100`).
-pub(crate) fn resolved_compaction_limit(_global: Option<u64>, model: &Model) -> u64 {
+pub(crate) fn resolved_compaction_limit(model: &Model) -> u64 {
     let model_window = u64::from(model.context_window.max(1));
     u64::from(model.effective_context_window())
         .min(model_window)
@@ -19,23 +18,18 @@ pub(crate) fn resolved_compaction_limit(_global: Option<u64>, model: &Model) -> 
 
 /// Window used for occupancy percent (bar denominator).
 ///
-/// Always the model effective window. Session overrides and global compaction
-/// preferences are not applied (product: one Context window, stored as ratio).
-pub(crate) fn occupancy_window_tokens(
-    _override_limit: Option<usize>,
-    model: Option<&Model>,
-    global_compaction_token_limit: Option<u64>,
-) -> u64 {
+/// Always the model effective window when a model is known.
+pub(crate) fn occupancy_window_tokens(model: Option<&Model>) -> u64 {
     let Some(model) = model else {
         return 1;
     };
-    resolved_compaction_limit(global_compaction_token_limit, model)
+    resolved_compaction_limit(model)
 }
 
 /// Apply an absolute compaction limit onto session token-budget fields.
 pub(crate) fn apply_resolved_compaction_limit(config: &mut devo_core::SessionConfig, limit: usize) {
     // Keep override cleared so mid-turn / resume paths do not revive a stale
-    // global threshold; the budget itself carries the applied model window.
+    // absolute threshold; the budget itself carries the applied model window.
     config.effective_context_window_override = None;
     config.token_budget.context_window = limit;
     config.token_budget.auto_compact_token_limit = Some(limit);
@@ -100,26 +94,17 @@ mod tests {
     }
 
     #[test]
-    fn resolved_compaction_limit_ignores_global() {
-        let model = sample_model(/*context_window*/ 200_000, /*percent*/ 95.0);
-        assert_eq!(resolved_compaction_limit(Some(100_000), &model), 190_000);
-    }
-
-    #[test]
     fn resolved_compaction_limit_uses_model_effective() {
         let model = sample_model(/*context_window*/ 200_000, /*percent*/ 95.0);
-        assert_eq!(resolved_compaction_limit(None, &model), 190_000);
+        assert_eq!(resolved_compaction_limit(&model), 190_000);
     }
 
     #[test]
     fn occupancy_window_tokens_uses_model_effective_only() {
         let model = sample_model(/*context_window*/ 200_000, /*percent*/ 95.0);
-        assert_eq!(
-            occupancy_window_tokens(Some(100_000), Some(&model), Some(50_000)),
-            190_000
-        );
-        assert_eq!(occupancy_window_tokens(None, Some(&model), None), 190_000);
-        assert_ne!(occupancy_window_tokens(None, Some(&model), None), 200_000);
+        assert_eq!(occupancy_window_tokens(Some(&model)), 190_000);
+        assert_ne!(occupancy_window_tokens(Some(&model)), 200_000);
+        assert_eq!(occupancy_window_tokens(None), 1);
     }
 
     #[test]

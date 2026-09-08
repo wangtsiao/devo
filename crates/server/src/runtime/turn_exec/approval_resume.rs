@@ -458,19 +458,10 @@ impl ServerRuntime {
             self.tool_registry_for_actor_state(&working.state)
         };
         let usage_parent_session_id = working.state.parent_session_id();
-        let global_compaction = self
-            .deps
-            .config_store
-            .lock()
-            .expect("app config store mutex should not be poisoned")
-            .effective_config()
-            .compaction_token_limit;
         let usage_context_window =
-            Some(crate::runtime::context_occupancy::occupancy_window_tokens(
-                working.state.core.config.effective_context_window_override,
-                Some(&turn_config.model),
-                global_compaction,
-            ));
+            Some(crate::runtime::context_occupancy::occupancy_window_tokens(Some(
+                &turn_config.model,
+            )));
         let stream = Arc::clone(&working.state.stream);
         let event_task = spawn_turn_event_stream(
             Arc::clone(self),

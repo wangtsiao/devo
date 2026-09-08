@@ -160,7 +160,6 @@ check_interval_hours = 48
             },
             project_root_markers: vec![".workspace".into()],
             projects: BTreeMap::new(),
-            compaction_token_limit: None,
             default_collaboration_mode: CollaborationMode::Build,
         }
     );

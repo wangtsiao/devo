@@ -89,7 +89,6 @@ fn widget_with_model_and_reasoning_effort(
         initial_reasoning_effort_selection,
         initial_permission_preset: devo_protocol::PermissionPreset::AutoReview,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -131,7 +130,6 @@ fn onboarding_widget_with_model(
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::AutoReview,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -169,7 +167,6 @@ fn onboarding_widget_with_available_model_and_exit_after_onboarding(
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::AutoReview,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -2121,7 +2118,6 @@ fn permissions_command_marks_initial_project_preset_current() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::FullAccess,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -7341,7 +7337,6 @@ fn slash_model_opens_model_picker_instead_of_printing_current_model() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -8952,7 +8947,7 @@ fn new_session_prepared_clears_pending_queue() {
 }
 
 #[test]
-fn new_session_prepared_restores_default_compaction_limit() {
+fn new_session_prepared_clears_session_effective_window() {
     let cwd = std::env::current_dir().expect("current directory is available");
     let model = Model {
         slug: "test-model".to_string(),
@@ -8969,7 +8964,6 @@ fn new_session_prepared_restores_default_compaction_limit() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: Some(100_000),
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9010,7 +9004,7 @@ fn new_session_prepared_restores_default_compaction_limit() {
     });
     assert!(
         widget.status_summary_text().contains("50.0k"),
-        "session override should use 50K compaction threshold: {}",
+        "session metadata should use 50K context window: {}",
         widget.status_summary_text()
     );
 
@@ -9028,8 +9022,8 @@ fn new_session_prepared_restores_default_compaction_limit() {
         total_cache_read_tokens: 0,
     });
     assert!(
-        widget.status_summary_text().contains("100.0k"),
-        "new session should restore the default 100K compaction threshold: {}",
+        widget.status_summary_text().contains("190.0k"),
+        "new session should fall back to the model effective window: {}",
         widget.status_summary_text()
     );
 }
@@ -9050,7 +9044,6 @@ fn new_session_prepared_restores_default_permissions_and_mode() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: CollaborationMode::Plan,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9171,7 +9164,6 @@ fn model_selection_updates_session_projection_and_emits_context_override() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9254,7 +9246,6 @@ fn model_selection_with_reasoning_effort_support_applies_default_immediately() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9310,7 +9301,6 @@ fn model_selection_without_reasoning_effort_support_finishes_immediately() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: devo_protocol::PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9572,7 +9562,6 @@ fn collapsed_reasoning_live_view_keeps_only_latest_lines() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9641,7 +9630,6 @@ fn collapsed_reasoning_live_view_caps_wrapped_visual_rows() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9727,7 +9715,6 @@ fn collapsed_short_reasoning_stays_full_after_completion() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9781,7 +9768,6 @@ fn collapsed_wrapping_reasoning_compacts_after_completion() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,
@@ -9843,7 +9829,6 @@ fn collapsed_long_reasoning_compacts_to_one_line_after_completion() {
         initial_reasoning_effort_selection: None,
         initial_permission_preset: PermissionPreset::Default,
         initial_sandbox_profile: Some("workspace".to_string()),
-        initial_compaction_token_limit: None,
         initial_default_collaboration_mode: devo_protocol::CollaborationMode::Build,
         initial_user_message: None,
         enhanced_keys_supported: true,

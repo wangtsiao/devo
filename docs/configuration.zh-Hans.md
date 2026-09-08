@@ -351,8 +351,8 @@ Desktop / TUI 模型编辑器以绝对 token 数显示可用窗口。保存时�
 恢复默认 95%。自定义模型尚无硬窗口时，输入值会把 `context_window` 设为该值，
 百分比设为 100。
 
-`config.toml` 中遗留的 `compaction_token_limit` 仍可加载以保持兼容，但对占用
-与自动压缩**已忽略**。不再有单独的自动压缩阈值 UI。
+`config.toml` 中遗留的 `compaction_token_limit` 已从配置 schema 移除；若仍写在
+文件中会被忽略。不再有单独的自动压缩阈值 UI。
 
 ### Wire API 可选值
 
@@ -503,7 +503,7 @@ collapse_reasoning = true
   - `true`（默认）：流式输出时只显示最新 3 行；结束后短推理完整保留，较长推理折叠为
     一行 `Thought · …` 摘要（完整文本仍可在 Ctrl+T 查看）。
   - `false`：流式输出与结束后都显示完整推理。
-- 若仍存在遗留的 `compaction_token_limit`，会被忽略；请在 Settings › Models 中
+- 若旧配置中仍存在遗留的 `compaction_token_limit`，会被忽略；请在 Settings › Models 中
   为各模型设置可用 Context window。
 
 ### 从旧配置迁移

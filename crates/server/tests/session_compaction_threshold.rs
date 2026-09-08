@@ -1,6 +1,6 @@
 //! Session effective context window uses the model usable window only.
-//! Global `compaction_token_limit` and `effectiveContextWindow` patches do not
-//! change applied policy.
+//! Legacy `compaction_token_limit` in config.toml and `effectiveContextWindow`
+//! patches do not change applied policy.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -211,7 +211,7 @@ async fn effective_context_window_patch_echoes_model_and_skips_global_config() -
         let document: toml::Value = toml::from_str(&config_text)?;
         assert!(
             document.get("compaction_token_limit").is_none(),
-            "effectiveContextWindow must not write compaction_token_limit"
+            "effectiveContextWindow must not write the removed compaction_token_limit key"
         );
     }
 
@@ -231,10 +231,12 @@ async fn effective_context_window_patch_echoes_model_and_skips_global_config() -
 }
 
 #[tokio::test]
-async fn new_session_ignores_existing_global_compaction_limit() -> Result<()> {
+async fn new_session_ignores_legacy_compaction_token_limit_in_toml() -> Result<()> {
     let data_root = TempDir::new()?;
     let cwd = data_root.path().join("workspace");
     std::fs::create_dir_all(&cwd)?;
+    // Unknown keys are ignored by serde; this proves a leftover user config
+    // key does not affect the applied model-derived window.
     std::fs::write(
         data_root.path().join("config.toml"),
         "compaction_token_limit = 100000\n",
@@ -256,7 +258,7 @@ async fn new_session_ignores_existing_global_compaction_limit() -> Result<()> {
         .expect("new session should expose an applied effective window");
     assert_ne!(
         applied, 100_000,
-        "stale compaction_token_limit must not become the applied window"
+        "legacy compaction_token_limit in config.toml must not become the applied window"
     );
     Ok(())
 }

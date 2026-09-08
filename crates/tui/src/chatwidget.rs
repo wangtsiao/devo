@@ -107,7 +107,6 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) initial_reasoning_effort_selection: Option<String>,
     pub(crate) initial_permission_preset: devo_protocol::PermissionPreset,
     pub(crate) initial_sandbox_profile: Option<String>,
-    pub(crate) initial_compaction_token_limit: Option<u64>,
     pub(crate) initial_default_collaboration_mode: devo_protocol::CollaborationMode,
     pub(crate) initial_user_message: Option<UserMessage>,
     pub(crate) enhanced_keys_supported: bool,
@@ -315,8 +314,6 @@ pub(crate) struct ChatWidget {
     sandbox_profile: Option<String>,
     /// Applied auto-compaction threshold for the active session (clamped to model).
     effective_context_window: Option<u64>,
-    /// Global default compaction limit from settings/`config.toml` (survives `/new`).
-    default_compaction_token_limit: Option<u64>,
     /// Global default collaboration mode from settings/`config.toml`.
     default_collaboration_mode: devo_protocol::CollaborationMode,
     /// Persist scope for the next model/permissions picker selection.
@@ -449,7 +446,6 @@ impl ChatWidget {
             initial_reasoning_effort_selection,
             initial_permission_preset,
             initial_sandbox_profile,
-            initial_compaction_token_limit,
             initial_default_collaboration_mode,
             initial_user_message,
             enhanced_keys_supported,
@@ -589,8 +585,7 @@ impl ChatWidget {
             pending_proposed_plan_actions: false,
             permission_preset: initial_permission_preset,
             sandbox_profile: initial_sandbox_profile,
-            effective_context_window: initial_compaction_token_limit,
-            default_compaction_token_limit: initial_compaction_token_limit,
+            effective_context_window: None,
             default_collaboration_mode: initial_default_collaboration_mode,
             settings_picker_persist_scope: crate::app_command::PersistScope::Session,
             busy: false,

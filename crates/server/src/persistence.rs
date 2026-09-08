@@ -1805,19 +1805,11 @@ impl ReplayState {
         record.model_binding_id = turn_config.model_binding_id.clone();
         record.reasoning_effort_selection = summary_reasoning_effort_selection.clone();
 
-        let global_compaction_limit = runtime_context
-            .config_store
-            .lock()
-            .expect("app config store mutex should not be poisoned")
-            .effective_config()
-            .compaction_token_limit;
         let applied_compaction_limit = crate::runtime::context_occupancy::resolved_compaction_limit(
-            global_compaction_limit,
             &turn_config.model,
         );
         // Apply before wrapping in Mutex so resume never needs to lock a
         // single-owner Arc that `from_runtime_session` later unwraps.
-        // Prefer the global config preference; ignore legacy session overrides.
         crate::runtime::context_occupancy::apply_resolved_compaction_limit(
             &mut core_session.config,
             applied_compaction_limit as usize,

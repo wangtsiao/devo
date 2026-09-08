@@ -169,7 +169,8 @@ The effective context is
 drives occupancy and auto-compact. In Desktop / TUI model settings, the
 **Context window** field is an absolute token count; on save it is stored as
 percent of the hard `context_window` (default percent 95 when unset). A legacy
-`compaction_token_limit` in `config.toml` is ignored.
+`compaction_token_limit` key was removed from the schema and is ignored if still
+present in old `config.toml` files.
 
 ## Wire API values
 

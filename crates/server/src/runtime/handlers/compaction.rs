@@ -633,13 +633,6 @@ impl ServerRuntime {
                         let compacted_prompt_token_estimate =
                             conversation_tokens.try_into().unwrap_or(usize::MAX);
                         core_session.prompt_token_estimate = compacted_prompt_token_estimate;
-                        let global = self
-                            .deps
-                            .config_store
-                            .lock()
-                            .expect("app config store mutex should not be poisoned")
-                            .effective_config()
-                            .compaction_token_limit;
                         let model = runtime_session
                             .summary
                             .model
@@ -668,11 +661,9 @@ impl ServerRuntime {
                             .summary
                             .effective_context_window
                             .or_else(|| {
-                                model.map(|model| {
-                                    super::super::context_occupancy::resolved_compaction_limit(
-                                        global, model,
-                                    )
-                                })
+                                model.map(
+                                    super::super::context_occupancy::resolved_compaction_limit,
+                                )
                             })
                             .unwrap_or(0);
                         let occupancy = super::super::context_occupancy::occupancy_after_compaction(

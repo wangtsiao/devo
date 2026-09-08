@@ -266,7 +266,6 @@ pub async fn run_interactive_tui(config: InteractiveTuiConfig) -> Result<AppExit
         initial_reasoning_effort_selection: initial_session.reasoning_effort_selection.clone(),
         initial_permission_preset: initial_session.permission_preset,
         initial_sandbox_profile: initial_session.sandbox_profile.clone(),
-        initial_compaction_token_limit: initial_session.compaction_token_limit,
         initial_default_collaboration_mode: initial_session.default_collaboration_mode,
         initial_user_message: None,
         enhanced_keys_supported: tui.enhanced_keys_supported(),

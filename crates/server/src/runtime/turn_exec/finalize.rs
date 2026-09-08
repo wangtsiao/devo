@@ -498,18 +498,7 @@ fn effective_context_window_tokens(state: &SessionActorState, runtime: &ServerRu
                 .as_deref()
                 .and_then(|slug| runtime.deps.model_catalog.get(slug))
         });
-    let global = runtime
-        .deps
-        .config_store
-        .lock()
-        .expect("app config store mutex should not be poisoned")
-        .effective_config()
-        .compaction_token_limit;
-    super::super::context_occupancy::occupancy_window_tokens(
-        state.core.config.effective_context_window_override,
-        model,
-        global,
-    )
+    super::super::context_occupancy::occupancy_window_tokens(model)
 }
 
 fn append_terminal_history_items(

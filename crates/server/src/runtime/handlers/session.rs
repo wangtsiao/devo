@@ -186,14 +186,7 @@ impl ServerRuntime {
             effective_context_window: None,
             permission_preset: None,
         };
-        let global_compaction_limit = runtime_context
-            .config_store
-            .lock()
-            .expect("app config store mutex should not be poisoned")
-            .effective_config()
-            .compaction_token_limit;
         let applied_compaction_limit = crate::runtime::context_occupancy::resolved_compaction_limit(
-            global_compaction_limit,
             &initial_turn_config.model,
         );
         let mut summary = summary;
@@ -770,9 +763,8 @@ impl ServerRuntime {
                     .and_then(|catalog| catalog.get(&session_model_slug).cloned())
                     .or_else(|| self.deps.model_catalog.get(&session_model_slug).cloned());
                 if let Some(model) = model {
-                    let applied = crate::runtime::context_occupancy::resolved_compaction_limit(
-                        /*global*/ None, &model,
-                    );
+                    let applied =
+                        crate::runtime::context_occupancy::resolved_compaction_limit(&model);
                     if let Some(handle) = session_handle.as_ref() {
                         handle.notify_effective_context_window(applied as usize);
                     }
@@ -1254,19 +1246,9 @@ impl ServerRuntime {
             })?;
         let history = devo_core::read_canonical_history(&rollout_path).ok()?;
         let mut session = history.session.map(|session| *session)?;
-        let global_compaction_limit = self
-            .deps
-            .config_store
-            .lock()
-            .expect("app config store mutex should not be poisoned")
-            .effective_config()
-            .compaction_token_limit;
         if let Some(model) = self.deps.model_catalog.get(&session.model.model) {
             session.settings.effective_context_window = Some(
-                crate::runtime::context_occupancy::resolved_compaction_limit(
-                    global_compaction_limit,
-                    model,
-                ),
+                crate::runtime::context_occupancy::resolved_compaction_limit(model),
             );
         }
         Some(session)

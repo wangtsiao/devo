@@ -53,14 +53,6 @@ impl ServerRuntime {
         session_id: SessionId,
         context_window_hint: Option<u64>,
     ) -> u64 {
-        let global = self
-            .deps
-            .config_store
-            .lock()
-            .expect("app config store mutex should not be poisoned")
-            .effective_config()
-            .compaction_token_limit;
-
         if let Some(stream) = self.active_stream_state(session_id).await {
             let stream = stream.lock().await;
             if let Some(inline) = stream.turn_inline.as_ref() {
@@ -76,11 +68,7 @@ impl ServerRuntime {
                             .as_deref()
                             .and_then(|binding| self.deps.model_catalog.get(binding))
                     });
-                return super::context_occupancy::occupancy_window_tokens(
-                    inline.hook_context.config.effective_context_window_override,
-                    model,
-                    global,
-                );
+                return super::context_occupancy::occupancy_window_tokens(model);
             }
         }
 
@@ -101,11 +89,7 @@ impl ServerRuntime {
             {
                 return occupancy.context_window_tokens;
             }
-            return super::context_occupancy::occupancy_window_tokens(
-                summary.effective_context_window.map(|limit| limit as usize),
-                model,
-                global,
-            );
+            return super::context_occupancy::occupancy_window_tokens(model);
         }
 
         context_window_hint.unwrap_or(1).max(1)
@@ -146,13 +130,6 @@ impl ServerRuntime {
         let occupancy = if let Some(occupancy) = summary.last_context_occupancy {
             occupancy
         } else {
-            let global = self
-                .deps
-                .config_store
-                .lock()
-                .expect("app config store mutex should not be poisoned")
-                .effective_config()
-                .compaction_token_limit;
             let model = summary
                 .model
                 .as_deref()
@@ -163,12 +140,9 @@ impl ServerRuntime {
                         .as_deref()
                         .and_then(|binding| self.deps.model_catalog.get(binding))
                 });
-            let window = match model {
-                Some(model) => {
-                    crate::runtime::context_occupancy::resolved_compaction_limit(global, model)
-                }
-                None => global.unwrap_or(0),
-            };
+            let window = model
+                .map(crate::runtime::context_occupancy::resolved_compaction_limit)
+                .unwrap_or(0);
             ContextOccupancy::empty(window)
         };
 

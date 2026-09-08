@@ -160,7 +160,7 @@ provider 在 `providers.json` 中使用 credential 引用：
 `context_window * effective_context_window_percent / 100`。该已应用窗口用于占用条
 与自动压缩。Desktop / TUI 模型设置里的 **Context window** 是绝对 token 数；保存时
 会存为硬 `context_window` 的百分比（未设置时默认 95%）。`config.toml` 中遗留的
-`compaction_token_limit` 会被忽略。
+`compaction_token_limit` 已从 schema 移除；若仍写在文件中会被忽略。
 
 ## Wire API 可选值
 

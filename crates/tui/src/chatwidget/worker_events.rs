@@ -1171,7 +1171,7 @@ impl ChatWidget {
                 self.last_query_input_tokens = 0;
                 self.prompt_token_estimate = 0;
                 self.last_context_occupancy = None;
-                self.effective_context_window = self.default_compaction_token_limit;
+                self.effective_context_window = None;
                 if should_append_header {
                     self.push_session_header(/*is_first_run*/ false, None);
                 } else {

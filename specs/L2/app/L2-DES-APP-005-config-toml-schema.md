@@ -245,8 +245,6 @@ Top-level preference keys (outside `[defaults]`) that the TUI/runtime also honor
 
 - `theme`: optional UI theme id (also accepted historically under `[defaults]`).
 - `collapse_reasoning`: optional boolean controlling reasoning display collapsing.
-- `compaction_token_limit`: optional absolute auto-compaction token threshold applied
-  globally to all sessions (clamped per model `context_window`).
 
 Rules:
 
