@@ -216,6 +216,28 @@ describe("getToolInfo", () => {
 		})
 	})
 
+	test("labels explore tools with progressive verbs", () => {
+		expect({
+			reading: getToolInfo("read", { running: true }).title,
+			read: getToolInfo("read", { running: false }).title,
+			grepping: getToolInfo("grep", { running: true }).title,
+			grepped: getToolInfo("grep", { running: false }).title,
+			finding: getToolInfo("glob", { running: true }).title,
+			found: getToolInfo("glob", { running: false }).title,
+			loading: getToolInfo("skill", { running: true }).title,
+			loaded: getToolInfo("skill", { running: false }).title,
+		}).toEqual({
+			reading: "Reading",
+			read: "Read",
+			grepping: "Grepping",
+			grepped: "Grepped",
+			finding: "Finding",
+			found: "Found",
+			loading: "Loading",
+			loaded: "Loaded",
+		})
+	})
+
 	test("labels write and edit with Writing/Added and Editing/Edited", () => {
 		expect({
 			writing: getToolInfo("write", { running: true }).title,

@@ -74,7 +74,12 @@ function truncateOutput(output: string, max = MAX_OUTPUT_LENGTH): string {
 }
 
 /** Shell-family tools that share the command/terminal display. */
-const SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "shell_command", "exec_command"])
+const SHELL_TOOLS: ReadonlySet<string> = new Set([
+	"bash",
+	"shell_command",
+	"exec_command",
+	"write_stdin",
+])
 
 /**
  * The shell tool's result text is `<stdout>\n<envelope-json>`, where the
@@ -202,22 +207,23 @@ export function getToolInfo(
 	icon: typeof WrenchIcon
 	title: string
 } {
+	const running = options?.running === true
 	switch (tool) {
 		case "read":
-			return { icon: EyeIcon, title: "Read" }
+			return { icon: EyeIcon, title: running ? "Reading" : "Read" }
 		case "glob":
-			return { icon: SearchIcon, title: "Glob" }
-		case "grep":
-			return { icon: SearchIcon, title: "Grep" }
 		case "list":
-			return { icon: SearchIcon, title: "List" }
+		case "find":
+			return { icon: SearchIcon, title: running ? "Finding" : "Found" }
+		case "grep":
+			return { icon: SearchIcon, title: running ? "Grepping" : "Grepped" }
 		case "webfetch":
-			return { icon: GlobeIcon, title: "Fetch" }
+			return { icon: GlobeIcon, title: running ? "Fetching" : "Fetched" }
 		case "bash":
 		case "shell_command":
 		case "exec_command":
 		case "write_stdin":
-			return { icon: TerminalIcon, title: options?.running ? "Running" : "Ran" }
+			return { icon: TerminalIcon, title: running ? "Running" : "Ran" }
 		case "edit":
 			return {
 				icon: EditIcon,
@@ -236,6 +242,8 @@ export function getToolInfo(
 					input: options?.input,
 				}),
 			}
+		case "skill":
+			return { icon: ZapIcon, title: running ? "Loading" : "Loaded" }
 		case "task":
 			return { icon: ZapIcon, title: "Agent" }
 		case "todowrite":
@@ -254,7 +262,7 @@ export function getToolInfo(
 				const label = segments.slice(2).join("__") || segments[1] || tool
 				return { icon: PlugIcon, title: `MCP · ${label}` }
 			}
-			return { icon: WrenchIcon, title: tool }
+			return { icon: WrenchIcon, title: running ? "Running" : tool === "tool" ? "Ran" : tool }
 	}
 }
 
@@ -380,15 +388,15 @@ export function getToolSubtitle(
 	let subtitle: string | undefined
 
 	switch (part.tool) {
-		case "read":
-			subtitle =
-				formatToolPathForDisplay(
-					(input.filePath as string | undefined) ?? (input.path as string | undefined),
-					options,
-				) ??
-				formatToolPathForDisplay(extractFromRaw(state, "filePath", "path"), options)
+		case "bash":
+		case "shell_command":
+		case "exec_command":
+		case "write_stdin":
+			subtitle = shellCommandSubtitle(input, state, title)
 			break
 		case "glob":
+		case "list":
+		case "find":
 			subtitle =
 				(input.pattern as string) ??
 				(input.path as string) ??
@@ -400,10 +408,20 @@ export function getToolSubtitle(
 				(input.path as string) ??
 				extractFromRaw(state, "pattern", "path")
 			break
-		case "bash":
-		case "shell_command":
-		case "exec_command":
-			subtitle = shellCommandSubtitle(input, state, title)
+		case "skill":
+			subtitle =
+				(input.skill as string) ??
+				(input.name as string) ??
+				title ??
+				extractFromRaw(state, "skill", "name")
+			break
+		case "read":
+			subtitle =
+				formatToolPathForDisplay(
+					(input.filePath as string | undefined) ?? (input.path as string | undefined),
+					options,
+				) ??
+				formatToolPathForDisplay(extractFromRaw(state, "filePath", "path"), options)
 			break
 		case "edit":
 			subtitle =

@@ -359,11 +359,23 @@ function toolNameFromUpdateKind(kind: string, input: Record<string, unknown>): s
 		case "apply_patch":
 			return kind === "apply_patch" ? "apply_patch" : "edit"
 		case "search":
+		case "grep":
 			return "grep"
+		case "glob":
+		case "find":
+		case "list":
+			return kind === "list" ? "list" : "glob"
 		case "execute":
-			return "bash"
+		case "bash":
+		case "shell_command":
+		case "exec_command":
+		case "write_stdin":
+			return kind === "execute" ? "bash" : kind
 		case "fetch":
+		case "webfetch":
 			return "webfetch"
+		case "skill":
+			return "skill"
 		case "think":
 			return "think"
 		case "question":
@@ -391,15 +403,38 @@ function inferToolNameFromInput(input: Record<string, unknown>, title?: string):
 		return "read"
 	}
 	const normalizedTitle = title?.trim().toLowerCase()
-	if (normalizedTitle?.startsWith("read")) return "read"
-	if (normalizedTitle?.startsWith("edit") || normalizedTitle?.startsWith("patch")) return "edit"
-	if (normalizedTitle?.startsWith("write")) return "write"
-	if (normalizedTitle?.startsWith("search")) return "grep"
-	if (normalizedTitle?.startsWith("fetch")) return "webfetch"
-	if (normalizedTitle?.startsWith("run") || normalizedTitle?.startsWith("execute")) return "bash"
-	if (normalizedTitle === "question" || normalizedTitle === "request_user_input") {
-		return "request_user_input"
+	if (!normalizedTitle) return "tool"
+	switch (normalizedTitle) {
+		case "grep":
+			return "grep"
+		case "glob":
+		case "find":
+			return "glob"
+		case "list":
+			return "list"
+		case "bash":
+		case "shell":
+		case "shell_command":
+		case "exec_command":
+		case "write_stdin":
+			return normalizedTitle === "shell" || normalizedTitle === "bash" ? "bash" : normalizedTitle
+		case "skill":
+			return "skill"
+		case "webfetch":
+		case "web_fetch":
+			return "webfetch"
+		case "question":
+		case "request_user_input":
+			return "request_user_input"
+		default:
+			break
 	}
+	if (normalizedTitle.startsWith("read")) return "read"
+	if (normalizedTitle.startsWith("edit") || normalizedTitle.startsWith("patch")) return "edit"
+	if (normalizedTitle.startsWith("write")) return "write"
+	if (normalizedTitle.startsWith("search") || normalizedTitle.startsWith("grep")) return "grep"
+	if (normalizedTitle.startsWith("fetch")) return "webfetch"
+	if (normalizedTitle.startsWith("run") || normalizedTitle.startsWith("execute")) return "bash"
 	return "tool"
 }
 
