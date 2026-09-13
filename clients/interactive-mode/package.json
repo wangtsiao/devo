@@ -1,0 +1,15 @@
+{
+  "name": "@devo/interactive-mode",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Devo-skinned Prime InteractiveMode adapter (Native AgentConnection). Pin a Prime git revision; do not npm @earendil-works.",
+  "type": "module",
+  "scripts": {
+    "build": "echo \"Scaffold — vendor InteractiveMode then wire UI host\"",
+    "test": "node --test src/native-agent-connection.test.js",
+    "test:tmux": "node scripts/run-tmux-smoke.js"
+  },
+  "engines": {
+    "node": ">=22.8.0"
+  }
+}
