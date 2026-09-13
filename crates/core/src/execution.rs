@@ -590,6 +590,7 @@ pub async fn prepare_model_invocation(
         project_instructions,
         active_skills,
         memory_context,
+        None, // harness_digest — host injects via QueryOptions on the live path
         goal_context,
         None, // change_signal
         None, // user_input (already in turn)

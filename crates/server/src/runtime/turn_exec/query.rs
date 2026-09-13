@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use devo_core::tools::handlers::ensure_kernel;
 use devo_core::tools::{
     AgentToolCoordinator, ClientFilesystem, ToolAgentScope, ToolCall, ToolExecutionOptions,
-    ToolRuntime, ToolRuntimeContext,
+    ToolPlanConfig, ToolRuntime, ToolRuntimeContext,
 };
 use devo_core::{Message, QueryEvent, QueryOptions, TurnConfig, query};
 use tokio::sync::mpsc;
@@ -159,6 +160,18 @@ impl ServerRuntime {
                 session_id.to_string(),
             ))
         });
+        let harness_digest = state.record.as_ref().and_then(|record| {
+            record.rollout_path.parent().map(|dir| {
+                // Cold-boundary inject: after skills (prefix), before goal in query.
+                // HarnessDigestInjector fails closed on corrupt JSON (empty omit).
+                let digest = devo_harness::HarnessDigestInjector::digest_or_empty(dir);
+                if digest.is_empty() {
+                    None
+                } else {
+                    Some(digest)
+                }
+            })
+        }).flatten();
         if let (Some(store), Some(record)) = (&output_store, &state.record) {
             let path = record.rollout_path.clone();
             match tokio::task::spawn_blocking(move || {
@@ -170,6 +183,33 @@ impl ServerRuntime {
                 error => tracing::warn!(?error, "output references could not be restored"),
             }
         }
+        // Session-scoped RLM kernel: create on the turn task (not the actor mailbox).
+        // Soft-fail when the runtime is unavailable so Discrete sessions still run.
+        let kernel = match ensure_kernel(&state.kernel, &state.core.cwd).await {
+            Ok(arc) => {
+                state.kernel = Some(Arc::clone(&arc));
+                Some(arc)
+            }
+            Err(err) => {
+                tracing::debug!(%err, "RLM kernel not available for this turn");
+                state.kernel.as_ref().map(Arc::clone)
+            }
+        };
+        if let Some(ref kernel) = kernel {
+            kernel
+                .set_host_handler(Some(super::super::kernel_host::host_handler_for_session(
+                    session_id.to_string(),
+                )))
+                .await;
+        }
+        // When a kernel is available, model tools are ipython-only (RLM surface).
+        let registry = if kernel.is_some() {
+            let mut plan = ToolPlanConfig::default();
+            plan.execution_surface = devo_kernel::ExecutionSurface::Rlm;
+            Arc::new(devo_core::tools::handlers::build_registry_from_plan(&plan))
+        } else {
+            registry
+        };
         let runtime = ToolRuntime::new_with_context_and_options(
             Arc::clone(&registry),
             self.build_permission_checker(session_id, turn_id, permission_mode, permission_profile),
@@ -192,6 +232,7 @@ impl ServerRuntime {
                 network_no_proxy: provider_http.no_proxy,
                 sandbox_profile: state.core.config.sandbox_profile.clone(),
                 sandbox_profile_live,
+                kernel,
             },
             ToolExecutionOptions {
                 output_store: output_store.clone(),
@@ -254,6 +295,7 @@ impl ServerRuntime {
                     compaction_provider: Some(compaction_provider),
                     live_settings: live_turn_settings.clone(),
                     last_model_request,
+                    harness_digest,
                 },
             ));
             tokio::select! {

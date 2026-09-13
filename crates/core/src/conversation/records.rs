@@ -535,6 +535,10 @@ pub enum SessionSettingsField {
     ReasoningEffortSelection,
     /// Session collaboration mode (`SessionRecord::collaboration_mode`).
     CollaborationMode,
+    /// Root auto-refine enable (`SessionSettings.auto_refine_enabled`).
+    AutoRefineEnabled,
+    /// Root auto-refine turn interval (`SessionSettings.auto_refine_turn_interval`).
+    AutoRefineTurnInterval,
 }
 
 /// Stores one field-level session settings change in the rollout file.

@@ -52,8 +52,8 @@ impl ContextAssembler {
     /// Assemble context for a model invocation (L3-BEH-CORE-005 §1).
     ///
     /// Assembly order: base instructions → prior transcript → metadata
-    /// instructions → project instructions → skills/memory → goal context →
-    /// change signal → current user input.
+    /// instructions → project instructions → skills/memory → harness digest →
+    /// goal context → change signal → current user input.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         &self,
@@ -66,6 +66,7 @@ impl ContextAssembler {
         project_instructions: &[String],
         active_skills: &[String],
         memory_context: Option<&str>,
+        harness_digest: Option<&str>,
         goal_context: Option<&str>,
         change_signal: Option<&str>,
         user_input: Option<(TurnId, ItemId)>,
@@ -122,6 +123,14 @@ impl ContextAssembler {
             entries.push(ContextEntry::Instruction {
                 source: InstructionSource::MemoryContext,
                 content: mem.to_string(),
+            });
+        }
+
+        // Step 5b: Continual Harness digest (after skills/memory, before goal)
+        if let Some(digest) = harness_digest.map(str::trim).filter(|d| !d.is_empty()) {
+            entries.push(ContextEntry::Instruction {
+                source: InstructionSource::HarnessDigest,
+                content: digest.to_string(),
             });
         }
 
@@ -219,6 +228,8 @@ pub enum InstructionSource {
     ProjectInstruction(std::path::PathBuf),
     GlobalInstruction(std::path::PathBuf),
     SkillActivation(String),
+    /// Continual Harness \(H\) digest (L2-DES-HARNESS-001 DD-5).
+    HarnessDigest,
     HiddenGoalContext,
     MemoryContext,
     ChangeSignal,
@@ -423,6 +434,7 @@ impl ContextNormalizer {
                             ProviderMessage::System(content.clone())
                         }
                         InstructionSource::MemoryContext
+                        | InstructionSource::HarnessDigest
                         | InstructionSource::HiddenGoalContext
                         | InstructionSource::ChangeSignal
                         | InstructionSource::SkillActivation(_) => {
@@ -646,6 +658,7 @@ mod tests {
             InstructionSource::ProjectInstruction("/tmp/proj".into()),
             InstructionSource::GlobalInstruction("/home/user".into()),
             InstructionSource::SkillActivation("my-skill".into()),
+            InstructionSource::HarnessDigest,
             InstructionSource::HiddenGoalContext,
             InstructionSource::MemoryContext,
             InstructionSource::ChangeSignal,
@@ -826,6 +839,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!ctx.entries.is_empty());
         assert!(ctx.token_estimate > 0);
@@ -844,6 +858,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             None,
             None,
@@ -876,6 +891,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some((turn_id, item_id)),
         );
         let has_input = ctx
@@ -883,6 +899,55 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ContextEntry::TranscriptItem { .. }));
         assert!(has_input);
+    }
+
+    /// Trace: L2-DES-HARNESS-001
+    /// Verifies: harness digest sits after skills/memory and before goal.
+    #[test]
+    fn assemble_injects_harness_digest_before_goal() {
+        use pretty_assertions::assert_eq;
+        let assembler = ContextAssembler::default();
+        let ctx = assembler.assemble(
+            SessionId::new(),
+            TurnId::new(),
+            "base",
+            &[],
+            None,
+            None,
+            &[],
+            &["skill-a".into()],
+            Some("mem"),
+            Some("## Continual harness\nh"),
+            Some("goal"),
+            None,
+            None,
+        );
+        let sources: Vec<_> = ctx
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ContextEntry::Instruction { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+        let skill_idx = sources
+            .iter()
+            .position(|s| matches!(s, InstructionSource::SkillActivation(_)))
+            .expect("skill");
+        let harness_idx = sources
+            .iter()
+            .position(|s| matches!(s, InstructionSource::HarnessDigest))
+            .expect("harness");
+        let goal_idx = sources
+            .iter()
+            .position(|s| matches!(s, InstructionSource::HiddenGoalContext))
+            .expect("goal");
+        assert!(skill_idx < harness_idx);
+        assert!(harness_idx < goal_idx);
+        assert_eq!(
+            sources[harness_idx],
+            InstructionSource::HarnessDigest
+        );
     }
 
     // ── CompactionEngine::evaluate() ──────────────────────────

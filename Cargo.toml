@@ -28,6 +28,8 @@ members = [
     "crates/skills",
     "crates/rmcp-client",
     "crates/keyring-store",
+    "crates/kernel",
+    "crates/harness",
 ]
 resolver = "3"
 
@@ -65,6 +67,8 @@ devo-core = { path = "crates/core" }
 devo-execpolicy = { path = "crates/execpolicy" }
 devo-file-search = { path = "crates/file-search" }
 devo-keyring-store = { path = "crates/keyring-store" }
+devo-kernel = { path = "crates/kernel" }
+devo-harness = { path = "crates/harness" }
 devo-mcp = { path = "crates/mcp" }
 devo-network-proxy = { path = "crates/network-proxy" }
 devo-protocol = { path = "crates/protocol" }

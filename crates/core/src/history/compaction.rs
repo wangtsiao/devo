@@ -350,7 +350,9 @@ fn split_by_user_message_budget(
 }
 
 fn summarizer_request_messages(to_compact: &[ResponseItem]) -> Vec<RequestMessage> {
-    let mut messages: Vec<RequestMessage> = to_compact.iter().map(RequestMessage::from).collect();
+    let without_digests = super::harness_digest_strip::exclude_harness_digests(to_compact);
+    let mut messages: Vec<RequestMessage> =
+        without_digests.iter().map(RequestMessage::from).collect();
     merge_consecutive_assistant_messages(&mut messages);
     normalize_tool_result_messages(&mut messages);
     messages.push(RequestMessage {

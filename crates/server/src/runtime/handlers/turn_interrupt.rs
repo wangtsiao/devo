@@ -109,6 +109,13 @@ impl ServerRuntime {
         }
         self.signal_active_turn_interrupt(params.session_id).await;
 
+        // Abort clears pending compact + refine (Prime order / deadlock class).
+        let native_id = devo_protocol::native::ids::SessionId::from_legacy_uuid(uuid::Uuid::from(
+            params.session_id,
+        ));
+        crate::runtime::compact_host::clear_pending_compact(&native_id);
+        crate::runtime::refine::clear_pending_refine(&native_id);
+
         let removed = self
             .session_interactive
             .drain_pending_user_inputs_for_turn(params.session_id, params.turn_id)

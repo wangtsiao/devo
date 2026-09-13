@@ -1854,6 +1854,7 @@ dependencies = [
  "chrono",
  "devo-config",
  "devo-execpolicy",
+ "devo-kernel",
  "devo-network-proxy",
  "devo-protocol",
  "devo-provider",
@@ -1921,6 +1922,35 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "devo-harness"
+version = "0.1.39"
+dependencies = [
+ "chrono",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "devo-kernel"
+version = "0.1.39"
+dependencies = [
+ "anyhow",
+ "futures",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2117,6 +2147,8 @@ dependencies = [
  "devo-core",
  "devo-execpolicy",
  "devo-file-search",
+ "devo-harness",
+ "devo-kernel",
  "devo-mcp",
  "devo-protocol",
  "devo-provider",
@@ -2189,6 +2221,7 @@ name = "devo-tools"
 version = "0.1.39"
 dependencies = [
  "async-trait",
+ "devo-kernel",
  "devo-protocol",
  "pretty_assertions",
  "serde",

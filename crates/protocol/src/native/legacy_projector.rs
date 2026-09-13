@@ -217,6 +217,7 @@ pub fn legacy_wire_from_native_item(item: &Item) -> Option<(ItemKind, serde_json
         | Item::SubAgent { .. }
         | Item::BackgroundTask { .. }
         | Item::GoalProgress { .. }
+        | Item::Refinement { .. }
         | Item::Warning { .. } => None,
     }
 }
@@ -291,6 +292,7 @@ fn context_compaction_payload(
         CompactionTrigger::Manual => "manual",
         CompactionTrigger::ProviderRetry => "providerRetry",
         CompactionTrigger::AutoThreshold => "autoThreshold",
+        CompactionTrigger::AgentRequested => "agentRequested",
     };
     let summary = summary.unwrap_or_default();
     let failed = summary.starts_with("Compaction failed");

@@ -18,6 +18,8 @@ devo-client = { workspace = true }
 devo-core = { workspace = true }
 devo-execpolicy = { workspace = true }
 devo-file-search = { workspace = true }
+devo-harness = { workspace = true }
+devo-kernel = { workspace = true }
 devo-mcp = { workspace = true }
 devo-protocol = { workspace = true }
 devo-provider = { workspace = true }

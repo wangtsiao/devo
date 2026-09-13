@@ -319,6 +319,19 @@ fn insert_goal_context_message(messages: &mut Vec<RequestMessage>, goal_context:
     );
 }
 
+/// Inject Continual Harness digest after skills prefix, before hidden goal.
+fn insert_harness_digest_message(messages: &mut Vec<RequestMessage>, digest: &str) {
+    let insert_at = if messages.last().is_some_and(is_visible_user_text_message) {
+        messages.len().saturating_sub(1)
+    } else {
+        messages.len()
+    };
+    messages.splice(
+        insert_at..insert_at,
+        [request_text_message(digest.to_string())],
+    );
+}
+
 fn request_text_message(text: String) -> RequestMessage {
     RequestMessage {
         role: Role::User.as_str().to_string(),
@@ -349,6 +362,8 @@ fn is_injected_context_message(message: &RequestMessage) -> bool {
                     || trimmed.starts_with("<context_changes>")
                     || trimmed.starts_with("<user_instructions_updates>")
                     || trimmed.starts_with("<user_instructions>")
+                    || trimmed.contains("[harness-digest]")
+                    || trimmed.starts_with("## Continual harness")
             }
             RequestContent::Reasoning { .. }
             | RequestContent::ProviderReasoning { .. }
@@ -658,6 +673,15 @@ pub async fn query(
             &prefetched_user_inputs,
             &active_turn_config.model.input_modalities,
         );
+        // Continual Harness digest: after skills (prefix), before hidden goal.
+        if let Some(digest) = options
+            .harness_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            insert_harness_digest_message(&mut messages, digest);
+        }
         if let Some(goal_context) = session.goal_context_prompt() {
             insert_goal_context_message(&mut messages, &goal_context);
         }

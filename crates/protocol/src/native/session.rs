@@ -158,6 +158,12 @@ pub struct SessionSettings {
     /// automatic-compaction boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_context_window: Option<u64>,
+    /// Root auto-refine enable (default on when unset). Persist-first via patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refine_enabled: Option<bool>,
+    /// Successful user-visible turns between auto-refine runs (default 25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refine_turn_interval: Option<u32>,
 }
 
 /// Snapshot semantics: the current value is *copied* into the record at
@@ -193,6 +199,8 @@ mod tests {
                 mode: None,
                 sandbox_profile: None,
                 effective_context_window: None,
+                auto_refine_enabled: None,
+                auto_refine_turn_interval: None,
             };
             let json = serde_json::to_value(&settings).expect("serialize settings");
             assert_eq!(

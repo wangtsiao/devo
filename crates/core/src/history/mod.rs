@@ -1,5 +1,6 @@
 pub mod compaction;
 mod context_insertion;
+mod harness_digest_strip;
 mod transactions;
 pub use transactions::response_items_to_messages;
 pub mod normalize;

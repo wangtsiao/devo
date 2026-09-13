@@ -146,6 +146,9 @@ pub struct QueryOptions {
     /// Slot written before each provider attempt so in-turn callers (auto-review)
     /// can reuse the same request prefix for prompt-cache hits.
     pub last_model_request: Option<SharedLastModelRequest>,
+    /// Continual Harness digest (after skills, before goal). Empty/None skips.
+    /// Host loads via `devo_harness::HarnessDigestInjector` at turn start.
+    pub harness_digest: Option<String>,
 }
 
 /// Live per-session settings shared with a running turn. The server writes
@@ -191,6 +194,13 @@ impl std::fmt::Debug for QueryOptions {
             .field(
                 "last_model_request",
                 &self.last_model_request.as_ref().map(|_| "<shared>"),
+            )
+            .field(
+                "harness_digest",
+                &self
+                    .harness_digest
+                    .as_ref()
+                    .map(|d| if d.is_empty() { "<empty>" } else { "<set>" }),
             )
             .finish()
     }

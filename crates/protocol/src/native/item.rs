@@ -318,6 +318,20 @@ pub enum Item {
         goal_id: GoalId,
         summary: String,
     },
+    /// Continual Harness refine outcome (L2-DES-HARNESS-001). Not a memory browser.
+    Refinement {
+        #[schemars(rename = "refinementId")]
+        #[ts(rename = "refinementId")]
+        refinement_id: String,
+        trigger: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+    },
     /// Non-fatal events (model retry, capability downgrade, quota pressure)
     /// that must leave a trace without failing the turn.
     Warning {
@@ -641,6 +655,8 @@ pub enum CompactionTrigger {
     AutoThreshold,
     Manual,
     ProviderRetry,
+    /// Agent scheduled via `compact.run` / `host_request` (turn-end).
+    AgentRequested,
 }
 
 /// Context-window occupancy snapshot (distinct from billing usage, see the

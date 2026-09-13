@@ -243,6 +243,7 @@ impl ServerRuntime {
             first_user_input: None,
             tool_registry,
             file_read_ledger: Arc::new(devo_core::tools::FileReadLedger::new()),
+            kernel: None,
             session_approval_cache: crate::execution::ApprovalGrantCache::default(),
             turn_approval_cache: crate::execution::ApprovalGrantCache::default(),
             session_context_recorded: false,
@@ -559,7 +560,7 @@ impl ServerRuntime {
         }
         // Ephemeral degrade: no rollout → no field lines and an index-built
         // snapshot; durable → history-backed snapshot with version checks.
-        let (session_version, session_model_slug, session_cwd, session_additional_dirs, current) =
+        let (session_version, session_model_slug, session_cwd, session_additional_dirs, mut current) =
             if let Some(rollout_path) = &rollout_path {
                 let history = match devo_core::read_canonical_history(rollout_path) {
                     Ok(history) => history,
@@ -627,6 +628,8 @@ impl ServerRuntime {
                     ),
                     sandbox_profile: None,
                     effective_context_window: None,
+                    auto_refine_enabled: None,
+                    auto_refine_turn_interval: None,
                 };
                 (
                     1,
@@ -770,6 +773,25 @@ impl ServerRuntime {
                     }
                     overlay_compact_limit = Some(applied as usize);
                     applied_window = Some(applied);
+                }
+            }
+            if let Some(enabled) = settings.auto_refine_enabled {
+                current.auto_refine_enabled = Some(enabled);
+                if rollout_path.is_some() {
+                    settings_changes.push((
+                        SessionSettingsField::AutoRefineEnabled,
+                        serde_json::Value::Bool(enabled),
+                    ));
+                }
+            }
+            if let Some(interval) = settings.auto_refine_turn_interval {
+                let interval = interval.max(1);
+                current.auto_refine_turn_interval = Some(interval);
+                if rollout_path.is_some() {
+                    settings_changes.push((
+                        SessionSettingsField::AutoRefineTurnInterval,
+                        serde_json::json!(interval),
+                    ));
                 }
             }
         }
@@ -1112,6 +1134,8 @@ impl ServerRuntime {
                 ),
                 sandbox_profile: None,
                 effective_context_window: None,
+                auto_refine_enabled: None,
+                auto_refine_turn_interval: None,
             },
             git_info: None,
             preview: String::new(),
@@ -1227,7 +1251,7 @@ impl ServerRuntime {
 
     /// Reads the rollout-backed canonical session snapshot; `None` when the
     /// rollout is missing or unreadable.
-    async fn native_session_snapshot(
+    pub(crate) async fn native_session_snapshot(
         &self,
         session_id: SessionId,
     ) -> Option<devo_protocol::native::session::Session> {

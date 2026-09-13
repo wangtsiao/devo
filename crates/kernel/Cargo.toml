@@ -1,0 +1,21 @@
+[package]
+description = "CPython RLM REPL kernel host (REPL protocol v3)"
+edition.workspace = true
+license.workspace = true
+name = "devo-kernel"
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }

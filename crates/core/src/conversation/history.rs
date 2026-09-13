@@ -16,7 +16,6 @@ use devo_protocol::native::item::ItemEnvelope;
 use devo_protocol::native::session::Session;
 use devo_protocol::native::turn::Turn;
 
-use super::legacy_projector::{LegacyProjectError, LegacyProjector};
 use super::rollout_v2::{
     InternalRecordV2, ParsedRolloutLine, RolloutLineReadError, RolloutLineV2, parse_rollout_line,
 };
@@ -55,9 +54,6 @@ pub enum HistoryReadError {
         line_index: usize,
         error: RolloutLineReadError,
     },
-    /// A legacy line failed to project forward.
-    #[error("project legacy line: {0}")]
-    Projection(#[from] LegacyProjectError),
 }
 
 /// Reads one rollout file into canonical history form. Legacy (v1) lines
@@ -73,7 +69,6 @@ pub enum HistoryReadError {
 /// is exact for the real use case.
 pub fn read_canonical_history(path: &Path) -> Result<CanonicalHistory, HistoryReadError> {
     let text = std::fs::read_to_string(path)?;
-    let mut projector = LegacyProjector::new();
     let mut history = CanonicalHistory::default();
     let lines: Vec<&str> = text.lines().collect();
     for (index, raw) in lines.iter().enumerate() {
@@ -92,13 +87,8 @@ pub fn read_canonical_history(path: &Path) -> Result<CanonicalHistory, HistoryRe
                 });
             }
         };
-        let v2_lines = match parsed {
-            ParsedRolloutLine::Legacy(line) => projector.project_line(&line)?,
-            ParsedRolloutLine::V2(line) => vec![*line],
-        };
-        for line in v2_lines {
-            apply_v2_line(&mut history, line);
-        }
+        let ParsedRolloutLine::V2(line) = parsed;
+        apply_v2_line(&mut history, *line);
     }
     Ok(history)
 }
@@ -239,6 +229,16 @@ fn apply_settings_to_canonical_session(
             }
         }
         SessionSettingsField::ModelBindingId => {}
+        SessionSettingsField::AutoRefineEnabled => {
+            if let Ok(enabled) = serde_json::from_value::<bool>(value) {
+                session.settings.auto_refine_enabled = Some(enabled);
+            }
+        }
+        SessionSettingsField::AutoRefineTurnInterval => {
+            if let Ok(interval) = serde_json::from_value::<u32>(value) {
+                session.settings.auto_refine_turn_interval = Some(interval.max(1));
+            }
+        }
     }
 }
 
