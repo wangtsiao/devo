@@ -130,6 +130,8 @@ fn push_json_arg<T: serde::Serialize>(args: &mut Vec<String>, flag: &str, value:
 }
 
 pub fn run_windows_sandbox_wrapper_main() -> ! {
+    let _probe_dir = std::env::var("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".devo/.sandbox")).ok();
+    crate::logging::log_note("PROBE-WRAPPER-MAIN reached", _probe_dir.as_deref());
     let args = std::env::args().skip(2).collect::<Vec<_>>();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -204,6 +206,10 @@ async fn run_windows_sandbox_wrapper_request(request: WindowsSandboxWrapperReque
         .await?;
 
     Ok(crate::forward_sandbox_session_stdio(spawned).await)
+}
+
+pub(crate) fn probe_wrapper_main_reached() {
+    crate::logging::log_note("PROBE-WRAPPER-MAIN reached", None);
 }
 
 fn parse_windows_sandbox_wrapper_args(args: Vec<String>) -> Result<WindowsSandboxWrapperRequest> {

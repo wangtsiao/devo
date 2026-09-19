@@ -409,7 +409,10 @@ fn resolve_kernel_fence(cwd: &std::path::Path) -> Option<devo_kernel::KernelFenc
         readable_roots: resolved.read_only,
         writable_roots: resolved.read_write,
         deny_read: resolved.deny,
-        restrict_network: resolved.restrict_network,
+        // RLM kernel fence: network is restricted by default (§5.2 — the fence
+        // spec carries the RLM default, not the shell profile's; kernel network
+        // goes through the proxy when granted, not through profile inheritance).
+        restrict_network: true,
     })
 }
 

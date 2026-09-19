@@ -286,6 +286,10 @@ async fn run_cli() -> Result<()> {
 
 fn direct_server_early_dispatch() -> devo_arg0::EarlyDispatch {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a.contains("run-as-windows-sandbox")) {
+        std::eprintln!("PROBE-EARLY-DISPATCH argv={:?}",
+            args.iter().take(4).collect::<Vec<_>>());
+    }
     // One-shot Windows sandbox provisioning: `devo sandbox-setup` pops the
     // UAC consent and provisions the sandbox accounts/firewall/ACLs so the
     // RLM kernel fence can be raised (design doc §5.3 setup entry).

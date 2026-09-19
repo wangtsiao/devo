@@ -51,12 +51,13 @@ pub struct WindowsSandboxSessionRequest<'a> {
 pub async fn spawn_windows_sandbox_session_for_level(
     request: WindowsSandboxSessionRequest<'_>,
 ) -> Result<SpawnedProcess> {
+    let _probe_dir = std::env::var("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".devo/.sandbox")).ok();
     crate::logging::log_note(
         &format!(
             "SANDBOX-DISPATCH level={:?} proxy_enforced={}",
             request.windows_sandbox_level, request.proxy_enforced
         ),
-        None,
+        _probe_dir.as_deref(),
     );
     if request.proxy_enforced
         || matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated)
