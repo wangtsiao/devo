@@ -209,7 +209,6 @@ async fn run_windows_sandbox_wrapper_request(request: WindowsSandboxWrapperReque
 }
 
 pub(crate) fn probe_wrapper_main_reached() {
-    crate::logging::log_note("PROBE-WRAPPER-MAIN reached", None);
 }
 
 fn parse_windows_sandbox_wrapper_args(args: Vec<String>) -> Result<WindowsSandboxWrapperRequest> {

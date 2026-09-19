@@ -50,129 +50,12 @@ struct BlockRuleSpec<'a> {
     offline_sid: &'a str,
     remote_addresses: Option<&'a str>,
     remote_ports: Option<&'a str>,
-    /// Per-program rule: block only this executable path (all protocols,
-    /// all remote addresses). This is the only mechanism proven to work
-    /// for selective outbound blocking on Windows (per-user rules don't
-    /// filter outbound — verified 2026-09-19).
-    program: Option<&'a str>,
 }
 
 
 /// Block ALL outbound for a specific executable (proven mechanism on Windows).
 /// Per-user firewall rules don't work for selective outbound (verified); per-program
 /// rules do. This blocks every network connection from the kernel's python.exe.
-
-pub fn ensure_program_outbound_block(
-    program_path: &str,
-    rule_name: &str,
-    log: &mut dyn Write,
-) -> Result<()> {
-    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    if hr.is_err() {
-        return Err(anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperFirewallComInitFailed,
-            format!("CoInitializeEx failed: {hr:?}"),
-        )));
-    }
-    let result = unsafe {
-        (|| -> Result<()> {
-            let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
-                .map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallPolicyAccessFailed,
-                        format!("CoCreateInstance NetFwPolicy2 failed: {err:?}"),
-                    ))
-                })?;
-            let rules = policy.Rules().map_err(|err| {
-                anyhow::Error::new(SetupFailure::new(
-                    SetupErrorCode::HelperFirewallPolicyAccessFailed,
-                    format!("INetFwPolicy2::Rules failed: {err:?}"),
-                ))
-            })?;
-
-            let name = BSTR::from(rule_name);
-            let _ = unsafe { rules.Remove(&name) };
-
-            let rule: INetFwRule3 =
-                unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER) }.map_err(
-                    |err| {
-                        anyhow::Error::new(SetupFailure::new(
-                            SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                            format!("CoCreateInstance NetFwRule failed: {err:?}"),
-                        ))
-                    },
-                )?;
-
-            unsafe {
-                rule.SetName(&name).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetName failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetDescription(&BSTR::from(
-                    "Block kernel python.exe outbound (per-program; per-user rules don't work)",
-                ))
-                .map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetDescription failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetDirection(NET_FW_RULE_DIR_OUT).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetDirection failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetAction(NET_FW_ACTION_BLOCK).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetAction failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetEnabled(VARIANT_TRUE).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetEnabled failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetProfiles(NET_FW_PROFILE2_ALL.0).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetProfiles failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetProtocol(NET_FW_IP_PROTOCOL_ANY.0).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetProtocol failed: {err:?}"),
-                    ))
-                })?;
-                rule.SetApplicationName(&BSTR::from(program_path)).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("SetApplicationName failed: {err:?}"),
-                    ))
-                })?;
-                rules.Add(&rule).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
-                        format!("Rules::Add failed for program block: {err:?}"),
-                    ))
-                })?;
-            }
-
-            let _ = writeln!(
-                log,
-                "firewall: per-program outbound block created for {program_path} ({rule_name})"
-            );
-            Ok(())
-        })()
-    };
-    unsafe { CoUninitialize() };
-    result
-}
 
 pub fn ensure_offline_proxy_allowlist(
     offline_sid: &str,
@@ -226,7 +109,7 @@ pub fn ensure_offline_proxy_allowlist(
                     offline_sid,
                     remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                     remote_ports: None,
-                    program: None,},
+                    },
                 log,
             )?;
 
@@ -242,7 +125,7 @@ pub fn ensure_offline_proxy_allowlist(
                     offline_sid,
                     remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                     remote_ports: None,
-                    program: None,},
+                    },
                 log,
             )?;
 
@@ -261,7 +144,7 @@ pub fn ensure_offline_proxy_allowlist(
                         offline_sid,
                         remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                         remote_ports: Some(&blocked_remote_ports),
-                        program: None,},
+                        },
                     log,
                 )?;
             }
@@ -314,7 +197,7 @@ pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> 
                     offline_sid,
                     remote_addresses: Some(NON_LOOPBACK_REMOTE_ADDRESSES),
                     remote_ports: None,
-                    program: None,},
+                    },
                 log,
             )?;
             Ok(())

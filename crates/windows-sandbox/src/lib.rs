@@ -36,15 +36,6 @@ pub enum WindowsSandboxProxySettingsMode {
     Preserve,
 }
 
-pub fn log_runner_note(msg: &str, devo_home: &Path) {
-    let dir = devo_home.join(".sandbox");
-    let _ = std::fs::create_dir_all(&dir);
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("sandbox.runner.log")) {
-        let _ = writeln!(f, "[{}] {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), msg);
-    }
-}
-
 pub fn windows_sandbox_available() -> bool {
     cfg!(windows)
 }
@@ -438,7 +429,6 @@ pub use token::LocalSid;
 #[cfg(windows)]
 pub use token::convert_string_sid_to_sid;
 #[cfg(windows)]
-pub use token::logon_primary_token;
 #[cfg(windows)]
 pub use token::create_readonly_token_with_cap_from;
 #[cfg(windows)]

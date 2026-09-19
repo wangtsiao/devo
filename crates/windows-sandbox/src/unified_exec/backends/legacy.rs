@@ -316,7 +316,6 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         &env_map,
         devo_home,
     );
-    crate::logging::log_note("PROBE-LEGACY-SPAWN fired", std::env::var("USERPROFILE").ok().map(|h| std::path::PathBuf::from(h).join(".devo/.sandbox")).as_deref());
     let security = prepare_legacy_session_security(
         common.uses_write_capabilities,
         devo_home,
