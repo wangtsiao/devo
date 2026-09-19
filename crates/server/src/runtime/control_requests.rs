@@ -38,6 +38,8 @@ pub(super) fn approval_decision_from_native(
         ApprovalScope::Tool => ApprovalScopeValue::Tool,
         ApprovalScope::CommandPrefix => ApprovalScopeValue::CommandPrefix,
         ApprovalScope::CommandPrefixPersist => ApprovalScopeValue::CommandPrefixPersist,
+        ApprovalScope::PathPrefixPersist => ApprovalScopeValue::PathPrefixPersist,
+        ApprovalScope::HostPersist => ApprovalScopeValue::HostPersist,
     };
     (decision_value, scope)
 }

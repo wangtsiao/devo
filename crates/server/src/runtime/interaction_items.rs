@@ -391,6 +391,12 @@ impl RecoveredWaitingApproval {
             Some(ApprovalScope::CommandPrefixPersist) => {
                 devo_protocol::ApprovalScopeValue::CommandPrefixPersist
             }
+            Some(ApprovalScope::PathPrefixPersist) => {
+                devo_protocol::ApprovalScopeValue::PathPrefixPersist
+            }
+            Some(ApprovalScope::HostPersist) => {
+                devo_protocol::ApprovalScopeValue::HostPersist
+            }
             None => devo_protocol::ApprovalScopeValue::Once,
         }
     }

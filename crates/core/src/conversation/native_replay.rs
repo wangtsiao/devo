@@ -677,6 +677,8 @@ fn legacy_scope_string(scope: ApprovalScope) -> &'static str {
         ApprovalScope::Tool => "tool",
         ApprovalScope::CommandPrefix => "command_prefix",
         ApprovalScope::CommandPrefixPersist => "command_prefix_persist",
+        ApprovalScope::PathPrefixPersist => "path_prefix_persist",
+        ApprovalScope::HostPersist => "host_persist",
     }
 }
 

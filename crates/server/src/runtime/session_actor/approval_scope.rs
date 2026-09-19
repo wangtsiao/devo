@@ -42,11 +42,18 @@ pub(crate) fn apply_approval_scope_to_state(
                 session_cache.tools.insert(pending.tool_name.clone());
             }
         }
-        ApprovalScopeValue::PathPrefix => {
+        ApprovalScopeValue::PathPrefix | ApprovalScopeValue::PathPrefixPersist => {
             if let Some(path) = pending.path.as_ref() {
                 // Session-scoped so "don't ask again for these files" lasts for
                 // the rest of the conversation (session-scoped file approval).
+                // The Persist variant additionally writes a durable rule at
+                // resolution time (see persist_path_prefix_rule).
                 insert_path_prefix_grant(session_cache, pending.resource.as_ref(), path);
+            }
+        }
+        ApprovalScopeValue::HostPersist => {
+            if let Some(host) = pending.host.clone() {
+                session_cache.hosts.insert(host);
             }
         }
         ApprovalScopeValue::Host => {
@@ -82,7 +89,10 @@ pub(crate) fn apply_path_scope_to_permission_profile(
     scope: &ApprovalScopeValue,
     pending: &PendingApproval,
 ) {
-    if !matches!(scope, ApprovalScopeValue::PathPrefix) {
+    if !matches!(
+        scope,
+        ApprovalScopeValue::PathPrefix | ApprovalScopeValue::PathPrefixPersist
+    ) {
         return;
     }
     let Some(path) = pending.path.as_ref() else {
@@ -178,7 +188,10 @@ pub(crate) fn credential_delivery_root(
     scope: &ApprovalScopeValue,
     pending: &PendingApproval,
 ) -> Option<(PathBuf, CredentialAccess)> {
-    if !matches!(scope, ApprovalScopeValue::PathPrefix) {
+    if !matches!(
+        scope,
+        ApprovalScopeValue::PathPrefix | ApprovalScopeValue::PathPrefixPersist
+    ) {
         return None;
     }
     let access = match pending.resource.as_ref() {

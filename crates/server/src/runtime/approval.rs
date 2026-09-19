@@ -330,6 +330,27 @@ impl ServerRuntime {
                 );
                 self.emit_auto_review_decision(session_id, turn_id, request, &assessment)
                     .await;
+                // Surface the auto-decision to the user (goal rule 7 /
+                // user feedback): AutoReview approving on the user's behalf
+                // must be visible, not silent. Rides the same Warning item
+                // channel the fence downgrade uses (TUI live + replay).
+                self.emit_native_item_completed(
+                    self.native_session_turn_ids(session_id, turn_id).await.0,
+                    self.native_session_turn_ids(session_id, turn_id).await.1,
+                    devo_protocol::native::ids::ItemId::new(),
+                    Some(self.allocate_item_sequence(&self.native_session_turn_ids(session_id, turn_id).await.0).await),
+                    devo_protocol::native::item::Item::Warning {
+                        code: "autoReview".to_string(),
+                        message: format!(
+                            "Auto-review allowed `{}` (risk: {}): {}",
+                            request.tool_name,
+                            assessment.risk.as_str(),
+                            assessment.rationale
+                        ),
+                        retryable: false,
+                    },
+                )
+                .await;
                 AutoReviewOutcome::Approve
             }
             Some(assessment) => {
@@ -634,6 +655,97 @@ impl ServerRuntime {
         }
     }
 
+    /// Rule line for a PathPrefixPersist approval (§8, P3). Exposed for tests.
+    pub(crate) fn path_prefix_rule_line(root: &std::path::Path, write: bool) -> String {
+        format!(
+            "path_prefix allow {} {}
+",
+            if write { "write" } else { "read" },
+            root.display()
+        )
+    }
+
+    /// Rule line for a HostPersist approval (§8, P3). Exposed for tests.
+    pub(crate) fn host_rule_line(host: &str) -> String {
+        format!("network_rule allow {host}
+")
+    }
+
+    /// Persist a PathPrefixPersist approval (design doc §8, P3): grant the
+    /// prefix as a readable/writable root in the durable sandbox config so
+    /// every future session derives it into its fence — no re-asking.
+    pub(crate) async fn persist_path_prefix_rule(
+        &self,
+        root: &std::path::Path,
+        write: bool,
+    ) -> Result<(), String> {
+        // Durable form: the devo home rules store, same append-only + reload
+        // pattern as command prefixes. The rule engine (RuntimePermissionProfile
+        // derivation) reads roots from this store at session build.
+        let rules_path = crate::exec_policy_store::default_user_rules_path()
+            .map_err(|error| error.to_string())?;
+        let line = format!(
+            "path_prefix allow {} {}
+",
+            if write { "write" } else { "read" },
+            root.display()
+        );
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            if let Some(dir) = rules_path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
+            if existing.lines().any(|l| l.trim() == line.trim()) {
+                return Ok(()); // idempotent
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&rules_path)
+                .map_err(|e| e.to_string())?;
+            file.write_all(line.as_bytes()).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        *self
+            .user_exec_policy
+            .lock()
+            .expect("user exec policy lock poisoned") =
+            crate::exec_policy_store::load_user_exec_policy();
+        Ok(())
+    }
+
+    /// Persist a HostPersist approval (§8, P3): append a network host rule to
+    /// the durable rules store.
+    pub(crate) async fn persist_host_rule(&self, host: &str) -> Result<(), String> {
+        let rules_path = crate::exec_policy_store::default_user_rules_path()
+            .map_err(|error| error.to_string())?;
+        let line = format!("network_rule allow {host}
+");
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            if let Some(dir) = rules_path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
+            if existing.lines().any(|l| l.trim() == line.trim()) {
+                return Ok(());
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&rules_path)
+                .map_err(|e| e.to_string())?;
+            file.write_all(line.as_bytes()).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub(crate) async fn persist_command_prefix_rule(
         &self,
         prefix: &[String],
@@ -933,13 +1045,51 @@ impl ServerRuntime {
                     &pending_for_scope,
                 )
                 .await;
+                // P3 durable-rule captures (§8) — taken before the pending
+                // value moves into the actor call.
+                let prefix_to_persist = (scope == ApprovalScopeValue::CommandPrefixPersist)
+                    .then(|| pending_for_scope.command_prefix.clone())
+                    .flatten();
+                let path_to_persist = matches!(scope, ApprovalScopeValue::PathPrefixPersist)
+                    .then(|| {
+                        pending_for_scope.path.as_ref().map(|path| {
+                            (
+                                crate::runtime::session_actor::approval_scope::path_prefix_grant_root(path),
+                                matches!(
+                                    pending_for_scope.resource.as_ref(),
+                                    Some(devo_safety::ResourceKind::FileWrite)
+                                ),
+                            )
+                        })
+                    })
+                    .flatten();
+                let host_to_persist = matches!(scope, ApprovalScopeValue::HostPersist)
+                    .then(|| pending_for_scope.host.clone())
+                    .flatten();
                 if let Some(session_handle) = self.session(host_session_id).await {
-                    let prefix_to_persist = (scope == ApprovalScopeValue::CommandPrefixPersist)
-                        .then(|| pending_for_scope.command_prefix.clone())
-                        .flatten();
                     session_handle
                         .apply_approval_scope(scope, pending_for_scope)
                         .await;
+                    // P3 durable rules (§8): always-scopes persist at
+                    // resolution time, mirroring CommandPrefixPersist.
+                    if let Some((root, write)) = path_to_persist
+                        && let Err(error) = self.persist_path_prefix_rule(&root, write).await
+                    {
+                        tracing::warn!(
+                            session_id = %host_session_id,
+                            error = %error,
+                            "failed to persist path prefix rule"
+                        );
+                    }
+                    if let Some(host) = host_to_persist
+                        && let Err(error) = self.persist_host_rule(&host).await
+                    {
+                        tracing::warn!(
+                            session_id = %host_session_id,
+                            error = %error,
+                            "failed to persist host rule"
+                        );
+                    }
                     if let Some(prefix) = prefix_to_persist
                         && let Err(error) = self.persist_command_prefix_rule(&prefix).await
                     {
@@ -1202,9 +1352,15 @@ pub(super) fn approval_scopes_for_request(request: &ToolPermissionRequest) -> Ve
     }
     if request.path.is_some() {
         scopes.push(approval_scope_wire_string(ApprovalScopeValue::PathPrefix));
+        // P3 (§8): the durable variant — persists a readable/writable root
+        // rule so future sessions derive it into their fence.
+        scopes.push(approval_scope_wire_string(
+            ApprovalScopeValue::PathPrefixPersist,
+        ));
     }
     if request.host.is_some() {
         scopes.push(approval_scope_wire_string(ApprovalScopeValue::Host));
+        scopes.push(approval_scope_wire_string(ApprovalScopeValue::HostPersist));
     }
     if let Some(prefix) = request.command_prefix.as_ref() {
         scopes.push(approval_scope_wire_string(
@@ -1286,6 +1442,12 @@ pub(super) fn native_approval_scope(
         }
         ApprovalScopeValue::CommandPrefixPersist => {
             devo_protocol::native::item::ApprovalScope::CommandPrefixPersist
+        }
+        ApprovalScopeValue::PathPrefixPersist => {
+            devo_protocol::native::item::ApprovalScope::PathPrefixPersist
+        }
+        ApprovalScopeValue::HostPersist => {
+            devo_protocol::native::item::ApprovalScope::HostPersist
         }
     }
 }
@@ -1440,6 +1602,32 @@ fn acp_permission_options_for_scopes(
         options.push(devo_protocol::AcpPermissionOption {
             option_id: "allow_host".to_string(),
             name: format!("Yes, and allow `{host}` for this session"),
+            kind: devo_protocol::AcpPermissionOptionKind::AllowAlways,
+            meta: None,
+        });
+    }
+    if scopes
+        .iter()
+        .any(|scope| scope == "pathPrefixPersist" || scope == "path_prefix_persist")
+        && let Some(path) = path
+    {
+        let root = path_prefix_grant_root(path);
+        options.push(devo_protocol::AcpPermissionOption {
+            option_id: "allow_path_prefix_persist".to_string(),
+            name: format!(
+                "Yes, and always allow files under `{}` (saved as a rule)",
+                root.display()
+            ),
+            kind: devo_protocol::AcpPermissionOptionKind::AllowAlways,
+            meta: None,
+        });
+    }
+    if scopes.iter().any(|scope| scope == "hostPersist" || scope == "host_persist")
+        && let Some(host) = host
+    {
+        options.push(devo_protocol::AcpPermissionOption {
+            option_id: "allow_host_persist".to_string(),
+            name: format!("Yes, and always allow `{host}` (saved as a rule)"),
             kind: devo_protocol::AcpPermissionOptionKind::AllowAlways,
             meta: None,
         });
@@ -2160,5 +2348,23 @@ mod tests {
             path.push(part);
         }
         path
+    }
+
+    #[test]
+    fn p3_rule_lines_are_stable_and_idempotent_shaped() {
+        // The durable rule text is the wire contract between sessions —
+        // lock its shape (goal rule 7).
+        let write_line = super::ServerRuntime::path_prefix_rule_line(
+            std::path::Path::new(r"C:\Users\me\proj"),
+            true,
+        );
+        assert!(write_line.starts_with("path_prefix allow write "), "{write_line}");
+        let read_line = super::ServerRuntime::path_prefix_rule_line(
+            std::path::Path::new("/home/me/proj"),
+            false,
+        );
+        assert!(read_line.starts_with("path_prefix allow read /"), "{read_line}");
+        let host_line = super::ServerRuntime::host_rule_line("api.example.com");
+        assert_eq!(host_line, "network_rule allow api.example.com\n");
     }
 }

@@ -596,6 +596,8 @@ pub enum ApprovalScope {
     Tool,
     CommandPrefix,
     CommandPrefixPersist,
+    PathPrefixPersist,
+    HostPersist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]

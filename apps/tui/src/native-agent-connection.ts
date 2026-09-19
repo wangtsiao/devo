@@ -3439,8 +3439,12 @@ export function approvalScopeForOptionId(optionId: string): string {
       return "commandPrefixPersist";
     case "allow_path_prefix":
       return "pathPrefix";
+    case "allow_path_prefix_persist":
+      return "pathPrefixPersist";
     case "allow_host":
       return "host";
+    case "allow_host_persist":
+      return "hostPersist";
     case "allow_once":
     case "reject_once":
     default:
