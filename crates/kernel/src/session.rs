@@ -444,6 +444,12 @@ impl KernelSession {
         // Every unimplementable fence is an explicit downgrade, never silent.
         #[cfg(any(windows, unix))]
         let mut fence_outcome = crate::fence::wrap_or_bare(&config, cmd);
+        #[cfg(windows)]
+        tracing::warn!(
+            program = ?fence_outcome.command.as_std().get_program(),
+            state = ?fence_outcome.state,
+            "FENCE-SPAWN-PROGRAM"
+        );
         // Unix: duplicate the channel's peer fd (no CLOEXEC) for the child;
         // its number rides DEVO_GRANT_FD and the descriptor survives exec.
         #[cfg(unix)]
