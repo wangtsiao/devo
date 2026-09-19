@@ -3,6 +3,8 @@
 //! Spawns `python -m rlm.repl`, speaks newline-delimited UTF-8 JSON, and keeps
 //! a session-scoped namespace across turns. See `L2-DES-RLM-001`.
 
+#[cfg(unix)]
+mod credential_unix;
 mod fence;
 mod protocol;
 mod session;

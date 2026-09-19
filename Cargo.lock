@@ -1851,6 +1851,7 @@ dependencies = [
  "devo-windows-sandbox",
  "dunce",
  "futures",
+ "libc",
  "pretty_assertions",
  "serde",
  "serde_json",

@@ -28,3 +28,4 @@ devo-util-paths = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 devo-sandbox = { workspace = true }
 devo-util-process = { workspace = true }
+libc = { workspace = true }
