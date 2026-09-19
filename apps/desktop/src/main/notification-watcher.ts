@@ -59,8 +59,8 @@ export function startNotificationWatcher(transport: DevoNativeTransport): void {
 	setPermissionResponder(async ({ sessionId, permissionId, response }) => {
 		try {
 			await client.permission.respond({
-				sessionID: sessionId,
-				permissionID: permissionId,
+				sessionId: sessionId,
+				permissionId: permissionId,
 				response,
 			})
 		} catch (err) {

@@ -12,7 +12,6 @@ use std::sync::Mutex;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use devo_core::AppConfigStore;
 use futures::stream;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -23,8 +22,6 @@ use tokio::time::Duration;
 use tokio::time::timeout;
 
 use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
 use devo_core::SkillsConfig;
 use devo_core::tools::ToolCallError;
 use devo_core::tools::ToolRegistry;
@@ -45,11 +42,10 @@ use devo_protocol::StopReason;
 use devo_protocol::StreamEvent;
 use devo_protocol::Usage;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
 use devo_server::ClientTransportKind;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
 use devo_server::SuccessResponse;
+use devo_server::test_support::TestRuntime;
 
 const QUEUED_TEXT: &str = "queued follow-up message";
 
@@ -175,33 +171,19 @@ fn build_runtime(
     provider: Arc<dyn ModelProviderSDK>,
     registry: Arc<ToolRegistry>,
 ) -> Arc<ServerRuntime> {
-    let db_path = data_root.join("test_queue_drain.db");
-    let db = Arc::new(devo_server::db::Database::open(db_path).expect("open test database"));
-    ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            registry,
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                enabled: false,
-                user_roots: Vec::new(),
-                workspace_roots: Vec::new(),
-                watch_for_changes: false,
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                include_instructions: Some(false),
-                config: Vec::new(),
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(data_root.to_path_buf(), None).expect("load app config store"),
-            )),
-        ),
-    )
+    TestRuntime::new(provider)
+        .registry(registry)
+        .skills(SkillsConfig {
+            enabled: false,
+            user_roots: Vec::new(),
+            workspace_roots: Vec::new(),
+            watch_for_changes: false,
+            bundled: Some(BundledSkillsConfig { enabled: false }),
+            include_instructions: Some(false),
+            config: Vec::new(),
+        })
+        .db_file("test_queue_drain.db")
+        .runtime(data_root)
 }
 
 async fn initialize_connection(
@@ -246,7 +228,8 @@ fn all_user_request_texts(request: &ModelRequest) -> Vec<String> {
                 RequestContent::ProviderReasoning { .. }
                 | RequestContent::ToolUse { .. }
                 | RequestContent::HostedToolUse { .. }
-                | RequestContent::ToolResult { .. } => None,
+                | RequestContent::ToolResult { .. }
+                | RequestContent::Image { .. } => None,
             })
         })
         .collect()
@@ -353,7 +336,7 @@ async fn queued_input_drains_into_followup_turn_and_broadcasts_empty_queue() -> 
     let session_result: SuccessResponse<devo_protocol::native::rpc_session::SessionNewResult> =
         serde_json::from_value(session_response.clone())
             .with_context(|| format!("session/new response: {session_response}"))?;
-    let session_id = devo_protocol::SessionId::try_from(session_result.result.session.id.as_str())?;
+    let session_id = devo_protocol::SessionId::from(session_result.result.session.id.as_str());
 
     // Subscribe exactly like the TUI does so `event_selectors` is populated
     // and `queue/updated` broadcasts target this connection.

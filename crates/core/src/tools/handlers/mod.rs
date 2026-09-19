@@ -8,6 +8,10 @@ mod glob;
 mod goal_update;
 mod grep;
 mod invalid;
+mod ipython;
+#[cfg(test)]
+#[path = "ipython_tests.rs"]
+mod ipython_tests;
 mod lsp;
 mod mcp;
 mod plan;
@@ -29,6 +33,9 @@ pub use glob::GlobHandler;
 pub use goal_update::{GoalUpdateHandler, goal_update_spec};
 pub use grep::GrepHandler;
 pub use invalid::InvalidHandler;
+pub use ipython::{
+    IpythonHandler, ensure_kernel, kernel_namespace_manifest_path, kernel_namespace_snapshot_path,
+};
 pub use lsp::LspHandler;
 pub use mcp::{McpToolHandler, mcp_search_text, mcp_tool_spec};
 pub use plan::PlanHandler;
@@ -172,6 +179,7 @@ fn build_registry_from_builder(
                 Arc::clone(&loaded_deferred_tools),
                 builder.effective_deferred_loading_config(&DeferredLoadingConfig::default()),
             )),
+            ToolHandlerKind::Ipython => Arc::new(IpythonHandler::new()),
         };
         let legacy_alias = match kind {
             ToolHandlerKind::ShellCommand if name == "shell_command" => Some("bash"),

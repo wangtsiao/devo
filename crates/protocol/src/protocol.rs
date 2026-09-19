@@ -1,5 +1,4 @@
 use std::fmt;
-use std::path::PathBuf;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -145,25 +144,6 @@ pub enum ExecCommandSource {
     UserShell,
     UnifiedExecStartup,
     UnifiedExecInteraction,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FileChange {
-    Add {
-        content: String,
-    },
-    Delete {
-        content: String,
-    },
-    Update {
-        unified_diff: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        old_text: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        new_text: Option<String>,
-        move_path: Option<PathBuf>,
-    },
 }
 
 /// Context/compaction display token usage, not the canonical provider response

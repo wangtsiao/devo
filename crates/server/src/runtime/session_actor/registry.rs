@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use devo_core::TurnId;
-use devo_protocol::SessionId;
+use devo_protocol::native::ids::SessionId;
+use devo_protocol::native::ids::TurnId;
 
 use super::state::SpawnSnapshot;
 use crate::runtime::ServerRuntime;
@@ -65,7 +65,7 @@ impl ServerRuntime {
     #[allow(dead_code)]
     pub(crate) async fn list_session_summaries_from_actors(
         &self,
-    ) -> Vec<crate::session::SessionMetadata> {
+    ) -> Vec<crate::runtime_session_summary::RuntimeSessionSummary> {
         let handles = self.list_session_handles().await;
         let mut summaries = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -95,7 +95,7 @@ impl ServerRuntime {
         &self,
         session_id: SessionId,
     ) -> Option<super::snapshots::TurnReservationSnapshot> {
-        let runtime_turn = self.active_turns.active_turn_metadata(session_id).await;
+        let runtime_turn = self.active_turns.active_turn(session_id).await;
         let stream_busy = self.active_stream_state(session_id).await.is_some();
         if stream_busy || runtime_turn.is_some() {
             let handle = self.session(session_id).await?;
@@ -106,10 +106,10 @@ impl ServerRuntime {
             };
             return Some(super::snapshots::TurnReservationSnapshot {
                 max_turns: handle.max_turns(),
-                active_turn: runtime_turn,
+                active_turn: spawn.parent_active_turn,
                 latest_turn: spawn.parent_latest_turn,
                 ephemeral: spawn.parent_summary.ephemeral,
-                parent_session_id: spawn.parent_summary.parent_session_id,
+                parent_session_id: spawn.parent_summary.parent_session_id(),
                 summary: spawn.parent_summary,
                 runtime_context: spawn.runtime_context,
                 pending_turn_queue: spawn.pending_turn_queue,
@@ -166,24 +166,24 @@ impl ServerRuntime {
         self.active_turns.stream_state(session_id).await
     }
 
-    pub(crate) async fn session_record_snapshot(
+    pub(crate) async fn session_rollout_path(
         &self,
         session_id: SessionId,
-    ) -> Option<devo_core::SessionRecord> {
+    ) -> Option<std::path::PathBuf> {
         if let Some(stream) = self.active_stream_state(session_id).await {
             let stream = stream.lock().await;
             if let Some(inline) = stream.turn_inline.as_ref() {
-                return inline.record.clone();
+                return inline.rollout_path.clone();
             }
         }
         let handle = self.session(session_id).await?;
-        handle.record().await.flatten()
+        handle.rollout_path().await.flatten()
     }
 
     pub(crate) async fn session_summary_snapshot(
         &self,
         session_id: SessionId,
-    ) -> Option<crate::session::SessionMetadata> {
+    ) -> Option<crate::runtime_session_summary::RuntimeSessionSummary> {
         if let Some(stream) = self.active_stream_state(session_id).await {
             let stream = stream.lock().await;
             if let Some(inline) = stream.turn_inline.as_ref() {
@@ -225,14 +225,14 @@ impl ServerRuntime {
         if let Some(stream) = self.active_stream_state(session_id).await {
             let stream = stream.lock().await;
             if let Some(inline) = stream.turn_inline.as_ref() {
-                return Some(inline.summary.parent_session_id);
+                return Some(inline.summary.parent_session_id());
             }
         }
         {
             let registries = self.agent_registries.lock().await;
             for registry in registries.values() {
-                if let Some(parent_id) = registry.child_to_parent.get(&session_id).copied() {
-                    return Some(Some(parent_id));
+                if let Some(parent_id) = registry.child_to_parent.get(&session_id) {
+                    return Some(Some(*parent_id));
                 }
             }
         }

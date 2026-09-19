@@ -19,3 +19,7 @@ uuid = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[target.'cfg(windows)'.dependencies]
+devo-windows-sandbox = { workspace = true }
+devo-util-paths = { workspace = true }

@@ -15,7 +15,7 @@ use devo_protocol::AgentInfo;
 use devo_protocol::AgentMailboxMessage;
 use devo_protocol::AgentOutputEvent;
 use devo_protocol::AgentOutputEventKind;
-use devo_protocol::SessionId;
+use devo_protocol::native::ids::SessionId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -70,13 +70,13 @@ impl AgentRegistry {
         }
     }
 
-    pub fn get(&self, session_id: SessionId) -> Option<&SubagentMetadata> {
-        self.agents.get(&session_id)
+    pub fn get(&self, session_id: &SessionId) -> Option<&SubagentMetadata> {
+        self.agents.get(session_id)
     }
 
-    pub fn children_of(&self, parent_id: SessionId) -> Vec<SessionId> {
+    pub fn children_of(&self, parent_id: &SessionId) -> Vec<SessionId> {
         self.parent_to_children
-            .get(&parent_id)
+            .get(parent_id)
             .cloned()
             .unwrap_or_default()
     }
@@ -97,23 +97,26 @@ impl AgentRegistry {
         }
     }
 
-    pub fn find_child(&self, parent_id: SessionId, target: &str) -> Option<SessionId> {
+    pub fn find_child(&self, parent_id: &SessionId, target: &str) -> Option<SessionId> {
         let target = target.trim();
-        if let Ok(session_id) = target.parse::<SessionId>()
-            && self.agents.contains_key(&session_id)
-        {
-            return Some(session_id);
+        let as_id = SessionId::from_string(target.to_owned());
+        if self.agents.contains_key(&as_id) {
+            return Some(as_id);
         }
         self.children_of(parent_id).into_iter().find(|child_id| {
             self.agents.get(child_id).is_some_and(|meta| {
                 meta.agent_path == target
                     || meta.nickname == target
-                    || meta.session_id.to_string() == target
+                    || meta.session_id.as_str() == target
             })
         })
     }
 
-    pub fn list_children(&self, parent_id: SessionId, path_prefix: Option<&str>) -> Vec<AgentInfo> {
+    pub fn list_children(
+        &self,
+        parent_id: &SessionId,
+        path_prefix: Option<&str>,
+    ) -> Vec<AgentInfo> {
         self.children_of(parent_id)
             .into_iter()
             .filter_map(|child_id| self.agents.get(&child_id))
@@ -141,6 +144,7 @@ pub struct SubagentMetadata {
 impl SubagentMetadata {
     pub fn to_agent_info(&self) -> AgentInfo {
         AgentInfo {
+            // BOUNDARY-OK: legacy AgentInfo / ACP projection still uses UUID SessionId.
             session_id: self.session_id,
             parent_session_id: Some(self.parent_session_id),
             agent_path: self.agent_path.clone(),
@@ -377,7 +381,7 @@ impl SubagentOutputBuffer {
             let inner = self.inner.lock().await;
             return (Vec::new(), inner.next_sequence, true);
         }
-        let target_session_ids = target_session_ids.iter().copied().collect::<HashSet<_>>();
+        let target_session_ids = target_session_ids.iter().cloned().collect::<HashSet<_>>();
         let start = Instant::now();
         loop {
             if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
@@ -474,10 +478,11 @@ mod tests {
     async fn output_buffer_accumulates_assistant_deltas_per_turn() {
         let buffer = SubagentOutputBuffer::new();
         let child = SessionId::new();
+        let legacy_child: devo_protocol::SessionId = child;
         let turn_id = devo_protocol::TurnId::new();
         let base = || AgentOutputEvent {
             sequence: 0,
-            child_session_id: child,
+            child_session_id: legacy_child,
             agent_path: "root/worker".into(),
             turn_id: Some(turn_id),
             kind: AgentOutputEventKind::AssistantDelta,
@@ -505,7 +510,7 @@ mod tests {
         buffer
             .push(AgentOutputEvent {
                 sequence: 0,
-                child_session_id: child,
+                child_session_id: legacy_child,
                 agent_path: "root/worker".into(),
                 turn_id: Some(turn_id),
                 kind: AgentOutputEventKind::Status,
@@ -530,6 +535,7 @@ mod tests {
     async fn wait_after_ignores_streaming_text_until_deadline() {
         let buffer = SubagentOutputBuffer::new();
         let child = SessionId::new();
+        let legacy_child: devo_protocol::SessionId = child;
         let turn_id = devo_protocol::TurnId::new();
         let producer = buffer.clone();
         let streaming = tokio::spawn(async move {
@@ -537,7 +543,7 @@ mod tests {
                 producer
                     .push(AgentOutputEvent {
                         sequence: 0,
-                        child_session_id: child,
+                        child_session_id: legacy_child,
                         agent_path: "root/worker".into(),
                         turn_id: Some(turn_id),
                         kind: AgentOutputEventKind::AssistantMessage,
@@ -604,8 +610,8 @@ mod tests {
             close_requested: false,
         };
         registry.register(parent, child, meta.clone());
-        assert_eq!(registry.get(child), Some(&meta));
-        assert_eq!(registry.children_of(parent), vec![child]);
+        assert_eq!(registry.get(&child), Some(&meta));
+        assert_eq!(registry.children_of(&parent), vec![child]);
     }
 
     #[test]
@@ -630,8 +636,8 @@ mod tests {
             },
         );
         registry.unregister(child);
-        assert!(registry.get(child).is_none());
-        assert!(registry.children_of(parent).is_empty());
+        assert!(registry.get(&child).is_none());
+        assert!(registry.children_of(&parent).is_empty());
     }
 
     #[tokio::test]

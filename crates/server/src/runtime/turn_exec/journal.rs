@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use devo_core::durable_execution::{
     ExecutionRecord, ExecutionReplay, ToolIntentJournal, read_execution_replay,
 };
-use devo_core::{InternalRecordV2, RolloutLineV2, SessionId, TurnId};
+use devo_core::{InternalRecordV2, RolloutLineV2};
+use devo_protocol::native::ids::{SessionId, TurnId};
 use tokio::sync::Mutex;
 
 use super::super::ServerRuntime;
@@ -42,7 +43,7 @@ impl ToolIntentJournal for RolloutToolJournal {
     async fn replay(&self) -> anyhow::Result<ExecutionReplay> {
         let path = self.path.clone();
         let turn_id = self.turn_id;
-        tokio::task::spawn_blocking(move || read_execution_replay(&path, turn_id)).await?
+        tokio::task::spawn_blocking(move || read_execution_replay(&path, &turn_id)).await?
     }
 
     async fn commit(&self, record: ExecutionRecord) -> anyhow::Result<()> {
@@ -51,7 +52,7 @@ impl ToolIntentJournal for RolloutToolJournal {
             let path = self.path.clone();
             let turn_id = self.turn_id;
             *committed = Some(
-                tokio::task::spawn_blocking(move || read_execution_replay(&path, turn_id))
+                tokio::task::spawn_blocking(move || read_execution_replay(&path, &turn_id))
                     .await??,
             );
         }
@@ -72,12 +73,8 @@ impl ToolIntentJournal for RolloutToolJournal {
         let line = RolloutLineV2::Internal {
             v: 2,
             timestamp: chrono::Utc::now(),
-            session_id: devo_protocol::native::ids::SessionId::from_legacy_uuid(
-                self.session_id.into(),
-            ),
-            turn_id: Some(devo_protocol::native::ids::TurnId::from_legacy_uuid(
-                self.turn_id.into(),
-            )),
+            session_id: self.session_id,
+            turn_id: Some(self.turn_id),
             seq: 0,
             entry: InternalRecordV2::Execution { record },
         };

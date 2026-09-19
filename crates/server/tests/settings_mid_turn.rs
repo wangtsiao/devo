@@ -14,7 +14,6 @@ use std::sync::atomic::Ordering;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use devo_core::AppConfigStore;
 use futures::StreamExt;
 use futures::stream;
 use pretty_assertions::assert_eq;
@@ -25,10 +24,6 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
-use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
-use devo_core::SkillsConfig;
 use devo_core::tools::ToolCallError;
 use devo_core::tools::ToolRegistry;
 use devo_core::tools::ToolResult;
@@ -48,10 +43,9 @@ use devo_protocol::StopReason;
 use devo_protocol::StreamEvent;
 use devo_protocol::Usage;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
 use devo_server::ClientTransportKind;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
+use devo_server::test_support::TestRuntime;
 
 /// First stream request issues tool call `call-1`; the second waits for the
 /// test to open the gate and then issues tool call `call-2`; later requests
@@ -61,10 +55,12 @@ struct TwoProbesProvider {
     go_second: Arc<Notify>,
 }
 
-/// Tool-call on request 1, plain-text done afterwards. Used with a tool that
-/// gates its own completion so the test controls the inter-iteration timing.
+/// Tool-call on request 1, plain-text done afterwards. The first stream is
+/// gated so the test can patch settings before the next model request.
 struct ToolThenDoneProvider {
     stream_requests: Mutex<Vec<ModelRequest>>,
+    stream_started: Arc<Notify>,
+    release_stream: Arc<Notify>,
 }
 
 #[async_trait]
@@ -221,7 +217,22 @@ impl ModelProviderSDK for ToolThenDoneProvider {
                 }),
             ]
         };
-        Ok(Box::pin(stream::iter(events)))
+        if request_number == 1 {
+            let stream_started = Arc::clone(&self.stream_started);
+            let release_stream = Arc::clone(&self.release_stream);
+            let mut events = events.into_iter();
+            let first = events.next().expect("first stream event");
+            Ok(Box::pin(
+                stream::once(async move {
+                    stream_started.notify_one();
+                    release_stream.notified().await;
+                    first
+                })
+                .chain(stream::iter(events.collect::<Vec<_>>())),
+            ))
+        } else {
+            Ok(Box::pin(stream::iter(events)))
+        }
     }
 
     fn name(&self) -> &str {
@@ -229,12 +240,8 @@ impl ModelProviderSDK for ToolThenDoneProvider {
     }
 }
 
-/// Probe tool that blocks until the test releases it, so the test controls
-/// when the query loop advances to the next iteration.
-struct GatedProbeTool {
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-}
+/// Probe tool used to advance the query loop after the gated first stream.
+struct GatedProbeTool;
 
 #[async_trait]
 impl ToolHandler for GatedProbeTool {
@@ -260,8 +267,6 @@ impl ToolHandler for GatedProbeTool {
         _input: serde_json::Value,
         _progress: Option<devo_core::tools::ToolProgressSender>,
     ) -> std::result::Result<ToolResult, ToolCallError> {
-        self.started.notify_one();
-        self.release.notified().await;
         Ok(ToolResult::success(
             ToolResultContent::Text("released".into()),
             "released",
@@ -312,33 +317,11 @@ fn build_runtime(
     provider: Arc<dyn ModelProviderSDK>,
     registry: Arc<ToolRegistry>,
 ) -> Arc<ServerRuntime> {
-    let db_path = data_root.join("test_settings_mid_turn.db");
-    let db = Arc::new(devo_server::db::Database::open(db_path).expect("open test database"));
-    ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            registry,
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                enabled: false,
-                user_roots: Vec::new(),
-                workspace_roots: Vec::new(),
-                watch_for_changes: false,
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                include_instructions: Some(false),
-                config: Vec::new(),
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(data_root.to_path_buf(), None).expect("load app config store"),
-            )),
-        ),
-    )
+    TestRuntime::new(provider)
+        .registry(registry)
+        .disabled_skills()
+        .db_file("test_settings_mid_turn.db")
+        .runtime(data_root)
 }
 
 async fn initialize_connection(
@@ -561,9 +544,8 @@ async fn mid_turn_tighten_to_default_triggers_approval_for_network_tool() -> Res
 }
 
 /// Trace: L2-DES-CONV-002
-/// Verifies: switching the model mid-turn makes the *next* model request in
-/// the same turn use the new model (Phase 4: live turn config in the core
-/// query loop).
+/// Verifies: switching model and reasoning selection mid-turn makes the next
+/// model request use the model-aware normalized selection.
 #[tokio::test]
 async fn mid_turn_model_switch_reaches_next_model_request() -> Result<()> {
     let temp_dir = TempDir::new()?;
@@ -573,13 +555,7 @@ async fn mid_turn_model_switch_reaches_next_model_request() -> Result<()> {
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let mut builder = ToolRegistryBuilder::new();
-    builder.register_handler(
-        "gated_probe",
-        Arc::new(GatedProbeTool {
-            started: Arc::clone(&started),
-            release: Arc::clone(&release),
-        }),
-    );
+    builder.register_handler("gated_probe", Arc::new(GatedProbeTool));
     builder.push_spec(ToolSpec {
         name: "gated_probe".into(),
         description: "Blocks until released.".into(),
@@ -595,6 +571,8 @@ async fn mid_turn_model_switch_reaches_next_model_request() -> Result<()> {
     });
     let provider = Arc::new(ToolThenDoneProvider {
         stream_requests: Mutex::new(Vec::new()),
+        stream_started: Arc::clone(&started),
+        release_stream: Arc::clone(&release),
     });
     let runtime = build_runtime(temp_dir.path(), provider.clone(), Arc::new(builder.build()));
     let (connection_id, _notifications_rx) = initialize_connection(&runtime).await?;
@@ -618,6 +596,45 @@ async fn mid_turn_model_switch_reaches_next_model_request() -> Result<()> {
             .with_context(|| format!("session/new response: {session_response}"))?;
     let session_id = session_result.session.id;
 
+    let subscription_response = runtime
+        .handle_incoming(
+            connection_id,
+            json!({
+                "id": 3,
+                "method": "subscription/create",
+                "params": {
+                    "selectors": [{ "kind": "session", "sessionId": session_id.to_string() }],
+                    "includeSnapshot": false
+                }
+            }),
+        )
+        .await
+        .context("subscription/create response")?;
+    assert!(
+        subscription_response.get("error").is_none(),
+        "subscription/create failed: {subscription_response}"
+    );
+
+    let permission_response = runtime
+        .handle_incoming(
+            connection_id,
+            json!({
+                "id": 4,
+                "method": "session/metadata/update",
+                "params": {
+                    "sessionId": session_id,
+                    "expectedVersion": 0,
+                    "settings": { "permissionProfile": "fullAccess" }
+                }
+            }),
+        )
+        .await
+        .context("permission setup response")?;
+    assert!(
+        permission_response.get("error").is_none(),
+        "permission setup failed: {permission_response}"
+    );
+
     let turn_response = runtime
         .handle_incoming(
             connection_id,
@@ -638,61 +655,86 @@ async fn mid_turn_model_switch_reaches_next_model_request() -> Result<()> {
         "turn/start failed: {turn_response}"
     );
 
-    // The first request runs on the turn-start model; the tool call blocks
-    // inside the first iteration, so the next request is not built yet.
-    timeout(Duration::from_secs(10), started.notified())
+    // The first request runs on the turn-start model; its stream is blocked
+    // before the first event, so the next request is not built yet.
+    if timeout(Duration::from_secs(10), started.notified())
         .await
-        .context("gated probe should start")?;
-
-    // Switch model mid-turn.
-    let switch_response = runtime
-        .handle_incoming(
-            connection_id,
-            json!({
-                "id": 6,
-                "method": "session/metadata/update",
-                "params": {
-                    "sessionId": session_id.to_string(),
-                    "expectedVersion": 1,
-                    "model": { "provider": "openai", "model": "gpt-5.5" }
-                }
-            }),
-        )
-        .await
-        .context("model switch response")?;
-    let switch_result: devo_protocol::native::rpc_session::SessionMetadataUpdateResult =
-        serde_json::from_value(switch_response["result"].clone())
-            .with_context(|| format!("model switch response: {switch_response}"))?;
-    assert!(switch_result.applied_to_active_turn);
-    assert_eq!(switch_result.session.model.model, "openai/gpt-5.5");
-
-    // Releasing the tool lets the loop build the next request, which must
-    // already use the switched model.
-    release.notify_one();
-    let second_request_model: Option<String> = timeout(Duration::from_secs(10), async {
-        loop {
-            let requests = provider
+        .is_err()
+    {
+        anyhow::bail!(
+            "gated stream did not start; model request count={}",
+            provider
                 .stream_requests
                 .lock()
                 .expect("requests lock")
-                .len();
-            if requests >= 2 {
-                break;
+                .len()
+        );
+    }
+
+    // Switch model and exercise the migration vocabulary while the first
+    // iteration is blocked. The final `on` maps to the first non-off level.
+    for (request_id, raw, expected) in [
+        (6, "off", "off"),
+        (7, "high", "high"),
+        (8, "none", "off"),
+        (9, "on", "low"),
+    ] {
+        let switch_response = runtime
+            .handle_incoming(
+                connection_id,
+                json!({
+                    "id": request_id,
+                    "method": "session/metadata/update",
+                    "params": {
+                        "sessionId": session_id.to_string(),
+                        "expectedVersion": 0,
+                        "model": { "provider": "openai", "model": "gpt-5.5" },
+                        "settings": { "reasoningEffort": raw }
+                    }
+                }),
+            )
+            .await
+            .context("model and reasoning switch response")?;
+        let switch_result: devo_protocol::native::rpc_session::SessionMetadataUpdateResult =
+            serde_json::from_value(switch_response["result"].clone()).with_context(|| {
+                format!("model and reasoning switch response: {switch_response}")
+            })?;
+        assert!(switch_result.applied_to_active_turn);
+        assert_eq!(switch_result.session.model.model, "openai/gpt-5.5");
+        assert_eq!(
+            switch_result.session.settings.reasoning_effort.as_deref(),
+            Some(expected)
+        );
+    }
+
+    // Releasing the stream lets the loop build the next request, which must
+    // already use the switched model.
+    release.notify_one();
+    let second_request: Option<(String, Option<String>)> =
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let requests = provider
+                    .stream_requests
+                    .lock()
+                    .expect("requests lock")
+                    .len();
+                if requests >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        provider
-            .stream_requests
-            .lock()
-            .expect("requests lock")
-            .get(1)
-            .map(|request| request.model.clone())
-    })
-    .await
-    .context("second model request should arrive")?;
+            provider
+                .stream_requests
+                .lock()
+                .expect("requests lock")
+                .get(1)
+                .map(|request| (request.model.clone(), request.request_thinking.clone()))
+        })
+        .await
+        .context("second model request should arrive")?;
     assert_eq!(
-        second_request_model.as_deref(),
-        Some("openai/gpt-5.5"),
+        second_request,
+        Some(("openai/gpt-5.5".to_string(), Some("enabled".to_string()))),
         "the next model request must use the switched model"
     );
 
@@ -700,7 +742,7 @@ async fn mid_turn_model_switch_reaches_next_model_request() -> Result<()> {
         .handle_incoming(
             connection_id,
             json!({
-                "id": 7,
+                "id": 10,
                 "method": "session/interrupt",
                 "params": {
                     "scope": { "scope": "session", "sessionId": session_id }

@@ -13,6 +13,18 @@ use std::collections::HashMap;
 use std::env;
 
 pub(crate) fn prepare_launch(req: &WindowsSandboxRequest) -> anyhow::Result<WindowsSandboxLaunch> {
+    let mut inner_command = vec![req.shell_program.clone()];
+    inner_command.extend(req.shell_args.iter().cloned());
+    inner_command.push(req.command.clone());
+    prepare_direct_argv_launch(req, inner_command)
+}
+
+/// Direct-argv variant for callers that exec a specific argv (not a shell
+/// command string), e.g. the RLM kernel host spawning `python -m rlm.repl`.
+pub(crate) fn prepare_direct_argv_launch(
+    req: &WindowsSandboxRequest,
+    inner_command: Vec<String>,
+) -> anyhow::Result<WindowsSandboxLaunch> {
     let permission_profile = permission_profile_from_request(req)?;
     let workspace_roots = workspace_roots_from_request(req)?;
     let command_cwd = workspace_roots
@@ -22,9 +34,6 @@ pub(crate) fn prepare_launch(req: &WindowsSandboxRequest) -> anyhow::Result<Wind
     let deny_read_paths_override = deny_read_overrides(req)?;
     let devo_home = find_devo_home()?;
 
-    let mut inner_command = vec![req.shell_program.clone()];
-    inner_command.extend(req.shell_args.iter().cloned());
-    inner_command.push(req.command.clone());
 
     let env_map = env::vars().collect::<HashMap<_, _>>();
     let program = env::current_exe()?;
@@ -44,6 +53,7 @@ pub(crate) fn prepare_launch(req: &WindowsSandboxRequest) -> anyhow::Result<Wind
         deny_read_paths_override.as_slice(),
         &[],
         devo_home.as_path(),
+        req.session_credential_sid.as_deref(),
     );
 
     Ok(WindowsSandboxLaunch {

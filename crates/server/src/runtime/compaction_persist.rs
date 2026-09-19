@@ -8,33 +8,28 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use devo_core::CommandExecutionItem;
 use devo_core::CompactionSnapshotLine;
-use devo_core::ItemId;
 use devo_core::Message;
 use devo_core::ResponseItem;
-use devo_core::SessionId;
-use devo_core::SessionRecord;
-use devo_core::TextItem;
-use devo_core::ToolCallItem;
-use devo_core::ToolResultItem;
-use devo_core::TurnId;
-use devo_core::TurnItem;
-use devo_core::TurnKind;
 use devo_protocol::approx_tokens_from_byte_count;
+use devo_protocol::native::ids::{ItemId, SessionId, TurnId};
 use devo_protocol::native::item::ContextOccupancy;
+use devo_protocol::native::item::Item;
+use devo_protocol::native::item::UserInput;
+use devo_protocol::native::turn::TurnKind;
 
 use super::ServerRuntime;
 use crate::execution::PersistedTurnItem;
+use crate::persisted_native_item::PersistedNativeItem;
+use crate::persisted_native_item::context_compaction_item;
+use crate::persisted_native_item::history_entry_from_native_item;
 use crate::persistence::RolloutStore;
-use crate::persistence::build_item_record;
-use crate::projection::history_item_from_turn_item;
 
 /// Match the compacted preserve suffix against the prompt-visible journal tail.
 pub(crate) fn preserved_item_ids_from_compacted(
     persisted_turn_items: &[PersistedTurnItem],
     compacted_items: &[ResponseItem],
-) -> Vec<ItemId> {
+) -> Vec<devo_protocol::native::ids::ItemId> {
     let mut normalized_persisted_items = Vec::new();
     for item in persisted_turn_items {
         if !crate::persistence::prompt_visible_persisted_turn_item(item) {
@@ -44,49 +39,81 @@ pub(crate) fn preserved_item_ids_from_compacted(
         // The compactor returns a summary followed by the prompt-visible suffix it
         // kept verbatim. Normalize persisted items into that same response shape
         // without allocating a short intermediate Vec for every journal item.
-        match &item.turn_item {
-            TurnItem::UserMessage(TextItem { text }) | TurnItem::SteerInput(TextItem { text }) => {
-                normalized_persisted_items.push((
-                    item.item_id,
-                    ResponseItem::Message(Message::user(text.clone())),
-                ));
+        match &item.item {
+            Item::UserMessage { content, .. } => {
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        UserInput::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                normalized_persisted_items
+                    .push((item.item_id, ResponseItem::Message(Message::user(text))));
             }
-            TurnItem::AgentMessage(TextItem { text })
-            | TurnItem::Plan(TextItem { text })
-            | TurnItem::WebSearch(TextItem { text })
-            | TurnItem::ImageGeneration(TextItem { text })
-            | TurnItem::ContextCompaction(TextItem { text })
-            | TurnItem::HookPrompt(TextItem { text }) => {
+            Item::AssistantMessage { text, .. } => {
                 normalized_persisted_items.push((
                     item.item_id,
                     ResponseItem::Message(Message::assistant_text(text.clone())),
                 ));
             }
-            TurnItem::Reasoning(_) => {}
-            TurnItem::ToolCall(ToolCallItem {
-                tool_call_id,
+            Item::Plan { entries } => {
+                let text = entries
+                    .iter()
+                    .map(|entry| entry.step.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                normalized_persisted_items.push((
+                    item.item_id,
+                    ResponseItem::Message(Message::assistant_text(text)),
+                ));
+            }
+            Item::HostedToolCall { output, .. } => {
+                let text = output
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                normalized_persisted_items.push((
+                    item.item_id,
+                    ResponseItem::Message(Message::assistant_text(text)),
+                ));
+            }
+            Item::ContextCompaction { summary, .. } => {
+                normalized_persisted_items.push((
+                    item.item_id,
+                    ResponseItem::Message(Message::assistant_text(
+                        summary.clone().unwrap_or_default(),
+                    )),
+                ));
+            }
+            Item::Reasoning { .. } => {}
+            Item::ToolCall {
+                call_id,
                 tool_name,
                 input,
-            }) => {
+                ..
+            } => {
                 normalized_persisted_items.push((
                     item.item_id,
                     ResponseItem::ToolCall {
-                        id: tool_call_id.clone(),
+                        id: call_id.clone(),
                         name: tool_name.clone(),
-                        input: input.clone(),
+                        input: input.clone().unwrap_or(serde_json::Value::Null),
                     },
                 ));
             }
-            TurnItem::ToolResult(ToolResultItem {
-                tool_call_id,
+            Item::ToolResult {
+                call_id,
                 output,
                 is_error,
                 ..
-            }) => {
+            } => {
                 normalized_persisted_items.push((
                     item.item_id,
                     ResponseItem::ToolCallOutput {
-                        tool_use_id: tool_call_id.clone(),
+                        tool_use_id: call_id.clone(),
                         content: match output {
                             serde_json::Value::String(text) => text.clone(),
                             other => other.to_string(),
@@ -95,38 +122,42 @@ pub(crate) fn preserved_item_ids_from_compacted(
                     },
                 ));
             }
-            TurnItem::CommandExecution(CommandExecutionItem {
-                tool_call_id,
-                tool_name,
+            Item::CommandExecution {
+                call_id,
                 input,
                 output,
                 is_error,
                 ..
-            }) => {
+            } => {
                 normalized_persisted_items.push((
                     item.item_id,
                     ResponseItem::ToolCall {
-                        id: tool_call_id.clone(),
-                        name: tool_name.clone(),
-                        input: input.clone(),
+                        id: call_id.clone(),
+                        name: "exec_command".into(),
+                        input: input.clone().unwrap_or(serde_json::Value::Null),
                     },
                 ));
                 normalized_persisted_items.push((
                     item.item_id,
                     ResponseItem::ToolCallOutput {
-                        tool_use_id: tool_call_id.clone(),
-                        content: match output {
-                            serde_json::Value::String(text) => text.clone(),
+                        tool_use_id: call_id.clone(),
+                        content: match output.clone().unwrap_or(serde_json::Value::Null) {
+                            serde_json::Value::String(text) => text,
                             other => other.to_string(),
                         },
                         is_error: *is_error,
                     },
                 ));
             }
-            TurnItem::ToolProgress(_)
-            | TurnItem::ApprovalRequest(_)
-            | TurnItem::ApprovalDecision(_)
-            | TurnItem::TurnSummary(_) => {}
+            Item::Approval { .. }
+            | Item::FileChange { .. }
+            | Item::UserInputRequest { .. }
+            | Item::SubAgent { .. }
+            | Item::BackgroundTask { .. }
+            | Item::GoalProgress { .. }
+            | Item::Refinement { .. }
+            | Item::Warning { .. }
+            | Item::BranchSummary { .. } => {}
         }
     }
     let preserved = compacted_items.get(1..).unwrap_or(&[]);
@@ -145,8 +176,8 @@ pub(crate) fn preserved_item_ids_from_compacted(
     }
 }
 
-/// Build the durable summary turn item from compacted history.
-pub(crate) fn summary_turn_item_from_compacted(compacted_items: &[ResponseItem]) -> TurnItem {
+/// Build the durable Native summary item from compacted history.
+pub(crate) fn summary_item_from_compacted(compacted_items: &[ResponseItem]) -> Item {
     let summary_text = compacted_items
         .first()
         .and_then(|item| match item {
@@ -157,30 +188,34 @@ pub(crate) fn summary_turn_item_from_compacted(compacted_items: &[ResponseItem])
                     | devo_core::ContentBlock::ProviderReasoning { .. }
                     | devo_core::ContentBlock::ToolUse { .. }
                     | devo_core::ContentBlock::HostedToolUse { .. }
-                    | devo_core::ContentBlock::ToolResult { .. } => None,
+                    | devo_core::ContentBlock::ToolResult { .. }
+                    | devo_core::ContentBlock::Image { .. } => None,
                 })
             }
             ResponseItem::Reason { text } => Some(text.clone()),
             ResponseItem::ToolCall { .. } | ResponseItem::ToolCallOutput { .. } => None,
         })
         .unwrap_or_default();
-    TurnItem::ContextCompaction(TextItem { text: summary_text })
+    context_compaction_item(summary_text)
 }
 
 /// Construct the rollout compaction snapshot line.
+///
+/// Bridges Native → legacy UUID only at the packed `CompactionSnapshotLine`
+/// durable-record boundary (not for live registry lookups).
 pub(crate) fn build_compaction_snapshot_line(
-    session_id: SessionId,
-    turn_id: TurnId,
-    summary_item_id: ItemId,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    summary_item_id: &ItemId,
     preserved_item_ids: Vec<ItemId>,
     context_occupancy: Option<ContextOccupancy>,
 ) -> CompactionSnapshotLine {
     CompactionSnapshotLine {
         timestamp: Utc::now(),
-        session_id,
-        turn_id,
-        summary_item_id,
-        preserved_item_ids,
+        session_id: *session_id,
+        turn_id: *turn_id,
+        summary_item_id: *summary_item_id,
+        preserved_item_ids: preserved_item_ids.clone(),
         context_occupancy,
     }
 }
@@ -191,52 +226,50 @@ pub(crate) struct CompactionSummaryPersist {
     pub(crate) turn_id: TurnId,
     pub(crate) summary_item_id: ItemId,
     pub(crate) item_seq: u64,
-    pub(crate) summary_turn_item: TurnItem,
+    pub(crate) summary_item: Item,
     pub(crate) snapshot: CompactionSnapshotLine,
 }
 
 /// Append the summary item and compaction snapshot to the durable rollout.
 pub(crate) fn append_compaction_summary_and_snapshot(
     rollout_store: &RolloutStore,
-    record: &SessionRecord,
+    rollout_path: &std::path::Path,
     persist: CompactionSummaryPersist,
 ) -> anyhow::Result<()> {
+    use devo_protocol::native::item::ItemState;
+    use devo_protocol::native::wire_projector::typed_item_envelope;
+
     let CompactionSummaryPersist {
         session_id,
         turn_id,
         summary_item_id,
         item_seq,
-        summary_turn_item,
+        summary_item,
         snapshot,
     } = persist;
-    let item_record = build_item_record(
+    let envelope = typed_item_envelope(
         session_id,
         turn_id,
         summary_item_id,
         item_seq,
-        summary_turn_item,
-        None,
-        None,
+        &summary_item,
+        ItemState::Completed,
+        Utc::now(),
         None,
     );
-    rollout_store.append_item(record, item_record)?;
-    rollout_store.append_compaction_snapshot(record, snapshot)?;
+    rollout_store.append_canonical_item_at(rollout_path, envelope)?;
+    rollout_store.append_compaction_snapshot_at(rollout_path, snapshot)?;
     Ok(())
 }
 
 /// Build the in-memory journal entry for a compaction summary item.
 pub(crate) fn compaction_persisted_turn_item(
-    turn_id: TurnId,
+    turn_id: devo_protocol::native::ids::TurnId,
     turn_kind: TurnKind,
-    item_id: ItemId,
-    summary_turn_item: TurnItem,
+    item_id: devo_protocol::native::ids::ItemId,
+    summary_item: Item,
 ) -> PersistedTurnItem {
-    PersistedTurnItem {
-        turn_id,
-        turn_kind,
-        item_id,
-        turn_item: summary_turn_item,
-    }
+    PersistedNativeItem::new(turn_id, turn_kind, item_id, summary_item)
 }
 
 impl ServerRuntime {
@@ -291,7 +324,7 @@ impl ServerRuntime {
             let mut journal = spawn_stable_items;
             journal.extend(inline.persisted_turn_items.iter().cloned());
             let preserved_item_ids = preserved_item_ids_from_compacted(&journal, compacted_items);
-            let summary_turn_item = summary_turn_item_from_compacted(compacted_items);
+            let summary_item = summary_item_from_compacted(compacted_items);
 
             let prompt_bytes = compacted_items
                 .iter()
@@ -301,8 +334,7 @@ impl ServerRuntime {
 
             let model = inline
                 .summary
-                .model
-                .as_deref()
+                .model_name()
                 .and_then(|slug| {
                     inline
                         .hook_context
@@ -312,21 +344,18 @@ impl ServerRuntime {
                         .or_else(|| self.deps.model_catalog.get(slug))
                 })
                 .or_else(|| {
-                    inline
-                        .summary
-                        .model_binding_id
-                        .as_deref()
-                        .and_then(|binding| {
-                            inline
-                                .hook_context
-                                .runtime_context
-                                .model_catalog
-                                .get(binding)
-                                .or_else(|| self.deps.model_catalog.get(binding))
-                        })
+                    inline.summary.model_binding_id().and_then(|binding| {
+                        inline
+                            .hook_context
+                            .runtime_context
+                            .model_catalog
+                            .get(binding)
+                            .or_else(|| self.deps.model_catalog.get(binding))
+                    })
                 });
             let window = inline
                 .summary
+                .settings
                 .effective_context_window
                 .or_else(|| model.map(super::context_occupancy::resolved_compaction_limit))
                 .unwrap_or(0);
@@ -344,9 +373,9 @@ impl ServerRuntime {
 
             let item_seq = inline.allocate_item_seq();
             let snapshot = build_compaction_snapshot_line(
-                session_id,
-                turn_id,
-                summary_item_id,
+                &session_id,
+                &turn_id,
+                &summary_item_id,
                 preserved_item_ids,
                 Some(occupancy),
             );
@@ -354,31 +383,31 @@ impl ServerRuntime {
             inline
                 .persisted_turn_items
                 .push(compaction_persisted_turn_item(
-                    turn_id,
-                    inline.turn_kind.clone(),
+                    inline.turn_id,
+                    inline.turn_kind,
                     summary_item_id,
-                    summary_turn_item.clone(),
+                    summary_item.clone(),
                 ));
-            if let Some(history_item) = history_item_from_turn_item(&summary_turn_item) {
+            if let Some(history_item) = history_entry_from_native_item(&summary_item) {
                 inline.history_items.push(history_item);
             }
 
             inline
-                .record
+                .rollout_path
                 .clone()
-                .map(|record| (record, item_seq, summary_turn_item, snapshot))
+                .map(|path| (path, item_seq, summary_item, snapshot))
         };
 
-        let (record, item_seq, summary_turn_item, snapshot) = rollout?;
+        let (rollout_path, item_seq, summary_item, snapshot) = rollout?;
         append_compaction_summary_and_snapshot(
             &self.rollout_store,
-            &record,
+            &rollout_path,
             CompactionSummaryPersist {
                 session_id,
                 turn_id,
                 summary_item_id,
                 item_seq,
-                summary_turn_item,
+                summary_item,
                 snapshot,
             },
         )
@@ -401,19 +430,25 @@ mod tests {
         let command_item_id = ItemId::new();
         let command_input = serde_json::json!({ "cmd": "printf ok" });
         let command_output = serde_json::Value::String("ok".to_string());
-        let persisted_turn_items = vec![PersistedTurnItem {
-            turn_id: TurnId::new(),
-            turn_kind: TurnKind::Regular,
-            item_id: command_item_id,
-            turn_item: TurnItem::CommandExecution(CommandExecutionItem {
-                tool_call_id: "call-1".to_string(),
-                tool_name: "exec_command".to_string(),
+        let persisted_turn_items = vec![PersistedNativeItem::new(
+            TurnId::new(),
+            TurnKind::Regular,
+            command_item_id,
+            Item::CommandExecution {
+                call_id: "call-1".to_string(),
                 command: "printf ok".to_string(),
-                input: command_input.clone(),
-                output: command_output.clone(),
+                argv: None,
+                cwd: Default::default(),
+                input: Some(command_input.clone()),
+                output: Some(command_output.clone()),
+                exit_code: None,
+                execution_handle: None,
                 is_error: false,
-            }),
-        }];
+                execution_mode: devo_protocol::native::item::ExecutionMode::Foreground,
+                origin: devo_protocol::native::item::ExecOrigin::AgentTool,
+                sandbox: None,
+            },
+        )];
         let compacted_items = vec![
             ResponseItem::Message(Message::assistant_text("summary")),
             ResponseItem::ToolCall {

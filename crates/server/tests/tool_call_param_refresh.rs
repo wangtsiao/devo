@@ -11,7 +11,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use devo_core::AppConfigStore;
 use futures::stream;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -19,10 +18,6 @@ use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
-use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
-use devo_core::SkillsConfig;
 use devo_core::tools::ToolCallError;
 use devo_core::tools::ToolResult;
 use devo_core::tools::ToolResultContent;
@@ -40,10 +35,9 @@ use devo_protocol::StopReason;
 use devo_protocol::StreamEvent;
 use devo_protocol::Usage;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
 use devo_server::ClientTransportKind;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
+use devo_server::test_support::TestRuntime;
 
 const TOOL_COMMAND: &str = "cargo test -p devo-server";
 
@@ -171,33 +165,11 @@ fn build_runtime(data_root: &Path) -> Arc<ServerRuntime> {
         supports_cancellation: None,
         supports_streaming: None,
     });
-    let db_path = data_root.join("test_tool_param_refresh.db");
-    let db = Arc::new(devo_server::db::Database::open(db_path).expect("open test database"));
-    ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            Arc::new(builder.build()),
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                enabled: false,
-                user_roots: Vec::new(),
-                workspace_roots: Vec::new(),
-                watch_for_changes: false,
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                include_instructions: Some(false),
-                config: Vec::new(),
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(data_root.to_path_buf(), None).expect("load app config store"),
-            )),
-        ),
-    )
+    TestRuntime::new(provider)
+        .registry(Arc::new(builder.build()))
+        .disabled_skills()
+        .db_file("test_tool_param_refresh.db")
+        .runtime(data_root)
 }
 
 fn tool_call_started_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {

@@ -2,7 +2,6 @@ use super::*;
 use std::collections::HashSet;
 use std::path::Path;
 
-use devo_core::TurnStatus;
 use devo_protocol::native::item::{Item, UserInput, UserMessageEntry};
 use devo_protocol::{PendingInputItem, PendingInputKind};
 
@@ -20,10 +19,10 @@ impl ServerRuntime {
             .rollout_store
             .load_session_from_rollout(rollout_path, &self.deps)
             .await?;
-        if runtime_session.summary.session_id != session_id {
+        if runtime_session.summary.session_id() != session_id {
             anyhow::bail!(
                 "rollout session id mismatch: expected {session_id}, got {}",
-                runtime_session.summary.session_id
+                runtime_session.summary.session_id()
             );
         }
         self.apply_persisted_session_side_effects(session_id, &mut runtime_session)
@@ -39,10 +38,7 @@ impl ServerRuntime {
         if !runtime_session.summary.ephemeral
             && let Err(err) = self.deps.db.upsert_session(
                 &runtime_session.summary,
-                runtime_session
-                    .record
-                    .as_ref()
-                    .map(|record| record.rollout_path.as_path()),
+                runtime_session.rollout_path.as_deref(),
             )
         {
             tracing::warn!(
@@ -54,12 +50,13 @@ impl ServerRuntime {
 
         match self.deps.db.get_stats(&session_id) {
             Ok(Some(stats)) => {
-                runtime_session.summary.total_input_tokens = stats.total_input_tokens;
-                runtime_session.summary.total_output_tokens = stats.total_output_tokens;
-                runtime_session.summary.total_tokens = stats.total_tokens;
-                runtime_session.summary.total_cache_creation_tokens =
-                    stats.total_cache_creation_tokens;
-                runtime_session.summary.total_cache_read_tokens = stats.total_cache_read_tokens;
+                runtime_session.summary.set_cumulative_usage(
+                    stats.total_input_tokens,
+                    stats.total_output_tokens,
+                    stats.total_tokens,
+                    stats.total_cache_creation_tokens,
+                    stats.total_cache_read_tokens,
+                );
                 runtime_session.summary.prompt_token_estimate = stats.prompt_token_estimate;
                 if let Ok(mut core) = runtime_session.core_session.try_lock() {
                     core.total_input_tokens = stats.total_input_tokens;
@@ -90,13 +87,13 @@ impl ServerRuntime {
             }
             Ok(None) => {
                 let stats = crate::db::SessionStats {
-                    total_input_tokens: runtime_session.summary.total_input_tokens,
-                    total_output_tokens: runtime_session.summary.total_output_tokens,
-                    total_tokens: runtime_session.summary.total_tokens,
+                    total_input_tokens: runtime_session.summary.total_input_tokens(),
+                    total_output_tokens: runtime_session.summary.total_output_tokens(),
+                    total_tokens: runtime_session.summary.total_tokens(),
                     total_cache_creation_tokens: runtime_session
                         .summary
-                        .total_cache_creation_tokens,
-                    total_cache_read_tokens: runtime_session.summary.total_cache_read_tokens,
+                        .total_cache_creation_tokens(),
+                    total_cache_read_tokens: runtime_session.summary.total_cache_read_tokens(),
                     last_input_tokens: 0,
                     turn_count: 0,
                     prompt_token_estimate: runtime_session.summary.prompt_token_estimate,
@@ -161,9 +158,9 @@ impl ServerRuntime {
             Ok(items) => {
                 if !items.is_empty() {
                     let materialized = runtime_session
-                        .record
+                        .rollout_path
                         .as_ref()
-                        .map(|record| materialized_steer_keys(&record.rollout_path))
+                        .map(|path| materialized_steer_keys(path))
                         .unwrap_or_default();
                     let core_session = runtime_session.core_session.lock().await;
                     let mut queue = core_session
@@ -216,7 +213,7 @@ impl ServerRuntime {
                     && goal.status == crate::goal::GoalStatus::Active
                 {
                     let previous_status = goal.status;
-                    match goal_store.set_status(devo_protocol::ThreadGoalStatus::Paused) {
+                    match goal_store.set_status(crate::goal::GoalStatus::Paused) {
                         Ok(paused_goal) => {
                             if let Err(error) = self
                                 .goal_durable_store
@@ -258,23 +255,19 @@ impl ServerRuntime {
             }
         }
 
-        if let Some(record) = runtime_session.record.as_ref() {
+        if let Some(rollout_path) = runtime_session.rollout_path.as_ref() {
             let host_session_id = runtime_session
                 .summary
-                .parent_session_id
+                .parent_session_id()
                 .unwrap_or(session_id);
             self.restore_waiting_user_inputs_from_rollout(
                 session_id,
                 host_session_id,
-                &record.rollout_path,
+                rollout_path,
             )
             .await;
-            self.restore_waiting_approvals_from_rollout(
-                session_id,
-                host_session_id,
-                &record.rollout_path,
-            )
-            .await;
+            self.restore_waiting_approvals_from_rollout(session_id, host_session_id, rollout_path)
+                .await;
         }
 
         Ok(())
@@ -289,44 +282,58 @@ impl ServerRuntime {
         for (session_id, mut runtime_session) in sessions {
             self.apply_persisted_session_side_effects(session_id, &mut runtime_session)
                 .await?;
-            if runtime_session.summary.parent_session_id.is_none() {
+            if runtime_session.summary.parent_session_id().is_none() {
                 self.insert_root_session_actor(runtime_session)
                     .await
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
             } else {
-                let session_id = runtime_session.summary.session_id;
+                let session_id = runtime_session.summary.session_id();
                 self.insert_session_actor(SessionActorState::from_runtime_session(runtime_session))
                     .await;
                 self.resume_pending_queue_if_idle(session_id).await;
             }
-            // Loading a persisted InProgress turn with no live registry owner is
-            // an abandoned execution. Materialize recovery availability once so
-            // session reads and both clients see authoritative state.
-            if let Some(recovery) = self.turn_recovery(session_id).await?
-                && let Some(handle) = self.session(session_id).await
-                && let Some(snapshot) = handle.turn_persistence_snapshot().await
-                && let Some(record) = snapshot.record
-            {
-                let path = record.rollout_path.clone();
-                let turn_id = recovery.turn_id.clone();
-                let replay = tokio::task::spawn_blocking(move || {
-                    devo_core::durable_execution::read_execution_replay(
-                        &path,
-                        devo_core::TurnId::try_from(turn_id.as_str())?,
-                    )
-                })
-                .await??;
-                if replay.recovery.is_none() {
-                    self.persist_recovery_disposition(
-                        session_id,
-                        devo_core::TurnId::try_from(recovery.turn_id.as_str())?,
-                        devo_core::durable_execution::RecoveryDisposition::Available,
-                        "Execution was lost while the application was not running.",
-                    )
-                    .await?;
-                }
-            }
+            self.materialize_abandoned_turn_recovery_if_needed(session_id)
+                .await?;
         }
+        Ok(())
+    }
+
+    /// When a hydrated session has an abandoned non-terminal turn and no live
+    /// registry owner, persist `RecoveryDisposition::Available` once so resume
+    /// and `turn/recovery/read` agree for crash-kill (not only graceful shutdown).
+    pub(crate) async fn materialize_abandoned_turn_recovery_if_needed(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> anyhow::Result<()> {
+        let Some(recovery) = self.turn_recovery(session_id).await? else {
+            return Ok(());
+        };
+        let Some(handle) = self.session(session_id).await else {
+            return Ok(());
+        };
+        let Some(path) = handle
+            .turn_persistence_snapshot()
+            .await
+            .and_then(|snapshot| snapshot.rollout_path)
+        else {
+            return Ok(());
+        };
+        let turn_id = recovery.turn_id;
+        let replay = tokio::task::spawn_blocking(move || {
+            devo_core::durable_execution::read_execution_replay(&path, &turn_id)
+        })
+        .await??;
+        if replay.recovery.is_some() {
+            return Ok(());
+        }
+        self.persist_recovery_disposition(
+            session_id,
+            recovery.turn_id,
+            devo_core::durable_execution::RecoveryDisposition::Available,
+            "Execution was lost while the application was not running.",
+        )
+        .await?;
+        self.broadcast_recovery_state(session_id).await;
         Ok(())
     }
 
@@ -363,9 +370,10 @@ impl ServerRuntime {
             let Some(snapshot) = session_handle.take_shutdown_deferred_snapshot().await else {
                 continue;
             };
-            let Some(turn_id) = snapshot.active_turn_id else {
+            let Some(legacy_turn_id) = snapshot.active_turn_id else {
                 continue;
             };
+            let turn_id = legacy_turn_id;
 
             // Stop the live turn writer before appending recovery / terminal
             // rollout lines. Otherwise a concurrent journal append can leave a
@@ -389,11 +397,11 @@ impl ServerRuntime {
                 tracing::warn!(%session_id, %error, "failed to save turn recovery state");
             }
 
-            if let Some(turn) = self.active_turns.active_turn_metadata(session_id).await
-                && turn.status == TurnStatus::WaitingApproval
+            if let Some(ref turn) = snapshot.active_turn
+                && turn.native.status == devo_protocol::native::turn::TurnStatus::WaitingApproval
             {
-                if snapshot.record.is_some()
-                    && let Err(error) = self.persist_turn_line_deduped(session_id, &turn).await
+                if snapshot.rollout_path.is_some()
+                    && let Err(error) = self.persist_turn_line_deduped(session_id, turn).await
                 {
                     tracing::warn!(
                         session_id = %session_id,
@@ -403,35 +411,50 @@ impl ServerRuntime {
                 }
                 tracing::info!(
                     session_id = %session_id,
-                    turn_id = %turn.turn_id,
+                    turn_id = %turn.turn_id(),
                     "preserved waiting-approval turn on shutdown"
                 );
                 continue;
             }
 
+            let active_turn = snapshot.active_turn.clone();
+            let native_session_id = if let Some(turn) = active_turn.as_ref() {
+                turn.native.session_id
+            } else if let Some(summary) = session_handle.summary().await {
+                summary.native.id
+            } else {
+                // boundary: legacy session id when summary unavailable
+                session_id
+            };
+            let native_turn_id = active_turn
+                .as_ref()
+                .map(|turn| turn.native.id)
+                .unwrap_or_else(|| {
+                    // boundary: shutdown snapshot legacy turn id without RuntimeTurn
+                    turn_id
+                });
             if let Some((item_id, item_seq, text)) = snapshot.deferred_assistant
                 && !text.trim().is_empty()
             {
-                self.complete_item(
-                    session_id,
-                    turn_id,
+                self.complete_native_item(
+                    native_session_id,
+                    native_turn_id,
                     item_id,
                     item_seq,
-                    ItemKind::AgentMessage,
-                    TurnItem::AgentMessage(TextItem { text: text.clone() }),
-                    serde_json::json!({ "title": "Assistant", "text": text }),
+                    Item::AssistantMessage { text: text.clone() },
                 )
                 .await;
             }
             if let Some((item_id, item_seq, text)) = snapshot.deferred_reasoning {
-                self.complete_item(
-                    session_id,
-                    turn_id,
+                self.complete_native_item(
+                    native_session_id,
+                    native_turn_id,
                     item_id,
                     item_seq,
-                    ItemKind::Reasoning,
-                    TurnItem::Reasoning(TextItem { text: text.clone() }),
-                    serde_json::json!({ "title": "Reasoning", "text": text }),
+                    Item::Reasoning {
+                        text: text.clone(),
+                        provider_payload_ref: None,
+                    },
                 )
                 .await;
             }
@@ -440,11 +463,11 @@ impl ServerRuntime {
             else {
                 continue;
             };
-            if interrupted_turn.turn_id != turn_id {
+            if interrupted_turn.turn_id() != turn_id {
                 continue;
             }
 
-            if snapshot.record.is_some()
+            if snapshot.rollout_path.is_some()
                 && let Err(error) = self
                     .persist_turn_line_deduped(session_id, &interrupted_turn)
                     .await
@@ -458,7 +481,7 @@ impl ServerRuntime {
 
             tracing::info!(
                 session_id = %session_id,
-                turn_id = %interrupted_turn.turn_id,
+                turn_id = %interrupted_turn.turn_id(),
                 "completed deferred items and interrupted turn on shutdown"
             );
         }

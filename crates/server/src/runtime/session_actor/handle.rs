@@ -5,8 +5,8 @@ use anyhow::Context;
 use devo_protocol::ApprovalScopeValue;
 use devo_protocol::CollaborationMode;
 use devo_protocol::PendingInputItem;
-use devo_protocol::SessionId;
 use devo_protocol::ThreadGoal;
+use devo_protocol::native::ids::SessionId;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -24,9 +24,8 @@ use crate::execution::PendingApproval;
 use crate::execution::PersistedTurnItem;
 use crate::runtime::subagent_usage::ParentUsageSnapshot;
 use crate::runtime::turn_exec::ExecuteTurnRequest;
-use crate::session::SessionMetadata;
-use crate::turn::TurnMetadata;
-use devo_core::SessionRecord;
+use crate::runtime_session_summary::RuntimeSessionSummary;
+use crate::turn::RuntimeTurn;
 use devo_core::SessionTitleState;
 use devo_core::TurnConfig;
 use devo_core::TurnId;
@@ -114,7 +113,7 @@ impl SessionHandle {
 
     pub(crate) async fn checkout_turn_working_set(
         &self,
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
     ) -> Option<TurnWorkingSet> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
@@ -143,10 +142,21 @@ impl SessionHandle {
         let _ = reply_rx.await;
     }
 
-    pub(crate) async fn summary(&self) -> Option<SessionMetadata> {
+    pub(crate) async fn summary(&self) -> Option<RuntimeSessionSummary> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
             .send(SessionCommand::GetSummary { reply: reply_tx })
+            .await
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub(crate) async fn native_session(&self) -> Option<devo_protocol::native::session::Session> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if !self
+            .send(SessionCommand::GetNativeSession { reply: reply_tx })
             .await
         {
             return None;
@@ -242,7 +252,7 @@ impl SessionHandle {
     pub(crate) async fn persist_turn_line(
         &self,
         runtime: Arc<crate::runtime::ServerRuntime>,
-        turn: crate::TurnMetadata,
+        turn: RuntimeTurn,
     ) -> anyhow::Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
@@ -328,7 +338,7 @@ impl SessionHandle {
     pub(crate) async fn mark_active_turn_waiting_approval(
         &self,
         turn_id: TurnId,
-    ) -> Option<TurnMetadata> {
+    ) -> Option<RuntimeTurn> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
             .send(SessionCommand::MarkActiveTurnWaitingApproval {
@@ -353,10 +363,10 @@ impl SessionHandle {
         reply_rx.await.ok().flatten()
     }
 
-    pub(crate) async fn record(&self) -> Option<Option<SessionRecord>> {
+    pub(crate) async fn rollout_path(&self) -> Option<Option<std::path::PathBuf>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
-            .send(SessionCommand::GetRecord { reply: reply_tx })
+            .send(SessionCommand::GetRolloutPath { reply: reply_tx })
             .await
         {
             return None;
@@ -406,7 +416,7 @@ impl SessionHandle {
             .await;
     }
 
-    pub(crate) async fn append_history_item(&self, item: crate::session::SessionHistoryItem) {
+    pub(crate) async fn append_history_item(&self, item: crate::session::SessionHistoryEntry) {
         let _ = self.send(SessionCommand::AppendHistoryItem { item }).await;
     }
 
@@ -449,7 +459,7 @@ impl SessionHandle {
         }
     }
 
-    pub(crate) async fn update_summary(&self, summary: SessionMetadata) {
+    pub(crate) async fn update_summary(&self, summary: RuntimeSessionSummary) {
         let _ = self.send(SessionCommand::UpdateSummary { summary }).await;
     }
 
@@ -474,7 +484,7 @@ impl SessionHandle {
         &self,
         title: String,
         title_state: SessionTitleState,
-    ) -> Option<Option<SessionMetadata>> {
+    ) -> Option<Option<RuntimeSessionSummary>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
             .send(SessionCommand::UpdateTitle {
@@ -489,7 +499,7 @@ impl SessionHandle {
         reply_rx.await.ok()
     }
 
-    pub(crate) async fn begin_active_turn(&self, turn: TurnMetadata, turn_config: TurnConfig) {
+    pub(crate) async fn begin_runtime_turn(&self, turn: RuntimeTurn, turn_config: TurnConfig) {
         let _ = self
             .send(SessionCommand::BeginActiveTurn { turn, turn_config })
             .await;
@@ -509,13 +519,17 @@ impl SessionHandle {
         reply_rx.await.ok()
     }
 
-    pub(crate) async fn set_session_idle(&self, latest_turn: Option<TurnMetadata>) {
+    pub(crate) async fn set_runtime_session_idle(&self, latest_turn: Option<RuntimeTurn>) {
         let _ = self
             .send(SessionCommand::SetSessionIdle { latest_turn })
             .await;
     }
 
-    pub(crate) async fn activate_queued_turn(&self, turn: TurnMetadata, turn_config: TurnConfig) {
+    pub(crate) async fn activate_runtime_queued_turn(
+        &self,
+        turn: RuntimeTurn,
+        turn_config: TurnConfig,
+    ) {
         let _ = self
             .send(SessionCommand::ActivateQueuedTurn { turn, turn_config })
             .await;
@@ -528,9 +542,19 @@ impl SessionHandle {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn update_record_rollout_path(&self, rollout_path: PathBuf) {
+    pub(crate) async fn update_rollout_path(&self, rollout_path: PathBuf) {
         let _ = self
-            .send(SessionCommand::UpdateRecordRolloutPath { rollout_path })
+            .send(SessionCommand::UpdateRolloutPath { rollout_path })
+            .await;
+    }
+
+    pub(crate) async fn set_transcript_leaf(
+        &self,
+        leaf_id: Option<devo_protocol::native::ids::ItemId>,
+        epoch: u64,
+    ) {
+        let _ = self
+            .send(SessionCommand::SetTranscriptLeaf { leaf_id, epoch })
             .await;
     }
 
@@ -551,7 +575,7 @@ impl SessionHandle {
         self.try_send(SessionCommand::TouchLastActivity)
     }
 
-    pub(crate) async fn interrupt_active_turn(&self) -> Option<Option<TurnMetadata>> {
+    pub(crate) async fn interrupt_active_turn(&self) -> Option<Option<RuntimeTurn>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
             .send(SessionCommand::InterruptActiveTurn { reply: reply_tx })
@@ -586,16 +610,33 @@ impl SessionHandle {
             .await;
     }
 
-    pub(crate) async fn update_session_metadata(
+    pub(crate) async fn set_archived(
+        &self,
+        archived: bool,
+    ) -> Option<devo_protocol::native::session::Session> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if !self
+            .send(SessionCommand::SetArchived {
+                archived,
+                reply: reply_tx,
+            })
+            .await
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub(crate) async fn update_session_model_settings(
         &self,
         model: Option<String>,
         model_binding_id: Option<String>,
         reasoning_effort_selection: Option<String>,
         collaboration_mode: Option<devo_protocol::CollaborationMode>,
-    ) -> Option<SessionMetadata> {
+    ) -> Option<RuntimeSessionSummary> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
-            .send(SessionCommand::UpdateSessionMetadata {
+            .send(SessionCommand::UpdateSessionModelSettings {
                 model,
                 model_binding_id,
                 reasoning_effort_selection,
@@ -659,9 +700,9 @@ impl SessionHandle {
         });
     }
 
-    /// Best-effort metadata notification (model/effort/collaboration mode);
+    /// Best-effort model/settings notification (model/effort/collaboration mode);
     /// same ordering argument as [`Self::notify_permission_profile`].
-    pub(crate) fn notify_session_metadata(
+    pub(crate) fn notify_session_model_settings(
         &self,
         model: Option<String>,
         model_binding_id: Option<String>,
@@ -669,7 +710,7 @@ impl SessionHandle {
         collaboration_mode: Option<devo_protocol::CollaborationMode>,
     ) {
         let (reply_tx, _reply_rx) = oneshot::channel();
-        let _ = self.try_send(SessionCommand::UpdateSessionMetadata {
+        let _ = self.try_send(SessionCommand::UpdateSessionModelSettings {
             model,
             model_binding_id,
             reasoning_effort_selection,
@@ -702,7 +743,7 @@ impl SessionHandle {
     pub(crate) async fn set_session_title_user_rename(
         &self,
         title: String,
-    ) -> Option<SessionMetadata> {
+    ) -> Option<RuntimeSessionSummary> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if !self
             .send(SessionCommand::SetSessionTitleUserRename {
@@ -757,9 +798,9 @@ impl SessionHandle {
         reply_rx.await.ok()
     }
 
-    pub(crate) async fn try_begin_active_turn(
+    pub(crate) async fn try_begin_runtime_turn(
         &self,
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         turn_config: TurnConfig,
     ) -> Option<bool> {
         let (reply_tx, reply_rx) = oneshot::channel();

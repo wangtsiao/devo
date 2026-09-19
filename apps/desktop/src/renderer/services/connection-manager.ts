@@ -2,7 +2,6 @@ import type { DevoClient } from "@devo-ai/sdk/v2/client"
 import { processEvent } from "../atoms/actions/event-processor"
 import { authHeaderAtom, serverConnectedAtom, serverUrlAtom } from "../atoms/connection"
 import { discoveryAtom } from "../atoms/discovery"
-import { batchUpsertPartsAtom } from "../atoms/parts"
 import {
 	SESSIONS_PAGE_SIZE,
 	projectPaginationFamily,
@@ -15,14 +14,6 @@ import {
 	updateProjectPaginationAtom,
 } from "../atoms/sessions"
 import { appStore } from "../atoms/store"
-import {
-	applyStreamingDelta,
-	flushStreamingParts,
-	isStreamingField,
-	isStreamingPartType,
-	streamingVersionFamily,
-	updateStreamingPart,
-} from "../atoms/streaming"
 import { createLogger } from "../lib/logger"
 import { directoriesMatch } from "../lib/directory-path"
 import type { Event, Session } from "../lib/types"
@@ -120,7 +111,7 @@ function filterDiscoveredSessions(
 		return directoriesMatch(session.directory, directory)
 	})
 	if (options?.roots) {
-		filtered = filtered.filter((session) => !session.parentID)
+		filtered = filtered.filter((session) => !session.parentId)
 	}
 	if (options?.search) {
 		const query = options.search.toLowerCase()
@@ -608,16 +599,12 @@ const FRAME_BUDGET_MS = 16
 
 function coalescingKey(event: Event): string | undefined {
 	switch (event.type) {
-		case "message.part.updated": {
-			const part = event.properties.part
-			return `part:${part.messageID}:${part.id}`
-		}
-		case "message.part.delta":
-			return `part:${event.properties.messageID}:${event.properties.partID}`
 		case "session.status":
-			return `status:${event.properties.sessionID}`
+			return `status:${event.properties.sessionId}`
 		case "context.usage.updated":
-			return `context-usage:${event.properties.sessionID}`
+			return `context-usage:${event.properties.sessionId}`
+		case "item.updated":
+			return `item:${event.properties.info.sessionId}:${event.properties.info.id}`
 		default:
 			return undefined
 	}
@@ -638,13 +625,6 @@ function createEventBatcher() {
 
 		if (events.length === 0) return
 
-		// Collect non-streaming parts across all events in the batch so we can
-		// write them in a single batchUpsertPartsAtom call instead of N individual
-		// upsertPartAtom calls. This significantly reduces Jotai atom writes and
-		// React reconciliation passes during heavy tool-call activity.
-		const batchedParts: import("../lib/types").Part[] = []
-		const batchedPartSessionIds = new Set<string>()
-
 		for (const event of events) {
 			if (event.type === "session.deleted") {
 				const deletedId = event.properties.info?.id
@@ -652,72 +632,11 @@ function createEventBatcher() {
 					discoveredSessions = discoveredSessions.filter((session) => session.id !== deletedId)
 				}
 			}
-			if (event.type === "message.part.updated" && !isStreamingPartType(event.properties.part)) {
-				batchedParts.push(event.properties.part)
-				batchedPartSessionIds.add(event.properties.part.sessionID)
-			} else {
-				processEvent(event)
-			}
-		}
-
-		// Flush collected non-streaming parts in a single batch write
-		if (batchedParts.length > 0) {
-			appStore.set(batchUpsertPartsAtom, batchedParts)
-			// Bump per-session streaming version so the UI picks up the new parts
-			for (const sid of batchedPartSessionIds) {
-				appStore.set(streamingVersionFamily(sid), (v: number) => v + 1)
-			}
+			processEvent(event)
 		}
 	}
 
 	function enqueue(event: Event) {
-		// Fast path: route high-frequency text/reasoning part updates to streaming buffer
-		if (event.type === "message.part.updated") {
-			const part = event.properties.part
-			if (isStreamingPartType(part)) {
-				updateStreamingPart(part)
-				const key = coalescingKey(event)
-				if (key) coalesced.set(key, event)
-				if (scheduled !== undefined) return
-				const elapsed = performance.now() - lastFlush
-				if (elapsed < FRAME_BUDGET_MS) {
-					scheduled = requestAnimationFrame(flush)
-				} else {
-					flush()
-				}
-				return
-			}
-		}
-
-		// Fast path: route incremental text/reasoning deltas to streaming buffer
-		if (event.type === "message.part.delta") {
-			const { messageID, partID, field, delta, sessionID } = event.properties
-			if (isStreamingField(field)) {
-				const applied = applyStreamingDelta(messageID, partID, field, delta, sessionID)
-				if (applied) {
-					const key = coalescingKey(event)
-					if (key) coalesced.set(key, event)
-					if (scheduled !== undefined) return
-					const elapsed = performance.now() - lastFlush
-					if (elapsed < FRAME_BUDGET_MS) {
-						scheduled = requestAnimationFrame(flush)
-					} else {
-						flush()
-					}
-					return
-				}
-				// Part not in streaming buffer yet, fall through to normal processing
-			}
-		}
-
-		// When a session goes idle, flush streaming parts to main store
-		if (event.type === "session.status" && event.properties.status.type === "idle") {
-			const flushedParts = flushStreamingParts()
-			if (flushedParts.length > 0) {
-				appStore.set(batchUpsertPartsAtom, flushedParts)
-			}
-		}
-
 		const key = coalescingKey(event)
 		if (key) {
 			coalesced.set(key, event)

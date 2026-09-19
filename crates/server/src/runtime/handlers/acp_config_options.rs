@@ -15,7 +15,7 @@ use devo_protocol::AcpSessionConfigSelectOption;
 use devo_protocol::AcpSessionConfigSelectOptions;
 use devo_protocol::Model;
 use devo_protocol::PermissionPreset;
-use devo_protocol::SessionId;
+use devo_protocol::native::ids::SessionId;
 
 const ACP_MODE_CONFIG_ID: &str = "mode";
 pub(crate) const ACP_MODEL_CONFIG_ID: &str = "model";
@@ -59,7 +59,13 @@ impl ServerRuntime {
                 "boolean session config options are not supported".to_string(),
             ));
         };
-        let Some(session_arc) = self.sessions.lock().await.get(&params.session_id).cloned() else {
+        let Some(session_arc) = self
+            .sessions
+            .lock()
+            .await
+            .get(&params.session_id)
+            .cloned()
+        else {
             return Err((
                 AcpErrorCode::ServerError,
                 "session does not exist".to_string(),
@@ -100,15 +106,15 @@ impl ServerRuntime {
 
                 let mut turn_config = snapshot.runtime_context.resolve_turn_config(
                     Some(value.as_str()),
-                    snapshot.summary.reasoning_effort_selection.clone(),
+                    snapshot.summary.settings.reasoning_effort.clone(),
                 );
                 turn_config.reasoning_effort_selection = current_reasoning_effort_value(
                     &turn_config.model,
-                    snapshot.summary.reasoning_effort_selection.as_deref(),
+                    snapshot.summary.settings.reasoning_effort.as_deref(),
                 );
 
                 let updated = session_arc
-                    .update_session_metadata(
+                    .update_session_model_settings(
                         Some(value.clone()),
                         None,
                         turn_config.reasoning_effort_selection.clone(),
@@ -129,8 +135,12 @@ impl ServerRuntime {
                             "session actor unavailable".to_string(),
                         )
                     })?;
-                if let Some(record) = updated_snapshot.record.as_ref()
-                    && let Err(error) = self.rollout_store.append_session_meta(record)
+                if let Some(rollout_path) = updated_snapshot.rollout_path.as_ref()
+                    && let Err(error) = self.rollout_store.append_session_meta_at(
+                        rollout_path,
+                        &updated_snapshot.summary.native,
+                        /*extras*/ None,
+                    )
                 {
                     return Err((AcpErrorCode::ServerError, error.to_string()));
                 }
@@ -177,7 +187,7 @@ impl ServerRuntime {
                 turn_config.reasoning_effort_selection = Some(value.clone());
 
                 let updated = session_arc
-                    .update_session_metadata(
+                    .update_session_model_settings(
                         Some(canonical_model_selection(&turn_config)),
                         None,
                         turn_config.reasoning_effort_selection.clone(),
@@ -198,8 +208,12 @@ impl ServerRuntime {
                             "session actor unavailable".to_string(),
                         )
                     })?;
-                if let Some(record) = updated_snapshot.record.as_ref()
-                    && let Err(error) = self.rollout_store.append_session_meta(record)
+                if let Some(rollout_path) = updated_snapshot.rollout_path.as_ref()
+                    && let Err(error) = self.rollout_store.append_session_meta_at(
+                        rollout_path,
+                        &updated_snapshot.summary.native,
+                        /*extras*/ None,
+                    )
                 {
                     return Err((AcpErrorCode::ServerError, error.to_string()));
                 }
@@ -313,7 +327,7 @@ impl ServerRuntime {
 
 fn acp_config_options_for_session(
     runtime_context: &SessionRuntimeContext,
-    summary: &SessionMetadata,
+    summary: &crate::runtime_session_summary::RuntimeSessionSummary,
     config: &SessionConfig,
 ) -> Vec<AcpSessionConfigOption> {
     let mut options = acp_model_and_reasoning_options_for_session(runtime_context, summary);
@@ -323,11 +337,11 @@ fn acp_config_options_for_session(
 
 fn acp_model_and_reasoning_options_for_session(
     runtime_context: &SessionRuntimeContext,
-    summary: &SessionMetadata,
+    summary: &crate::runtime_session_summary::RuntimeSessionSummary,
 ) -> Vec<AcpSessionConfigOption> {
     let turn_config = runtime_context.resolve_turn_config(
         session_model_selection(summary),
-        summary.reasoning_effort_selection.clone(),
+        summary.settings.reasoning_effort.clone(),
     );
     acp_model_and_reasoning_options_for_context(runtime_context, &turn_config)
 }
@@ -394,12 +408,12 @@ fn acp_mode_config_option_for_session(config: &SessionConfig) -> AcpSessionConfi
 
 fn acp_model_config_option_for_session(
     runtime_context: &SessionRuntimeContext,
-    summary: &SessionMetadata,
+    summary: &crate::runtime_session_summary::RuntimeSessionSummary,
     _config: &SessionConfig,
 ) -> AcpSessionConfigOption {
     let turn_config = runtime_context.resolve_turn_config(
         session_model_selection(summary),
-        summary.reasoning_effort_selection.clone(),
+        summary.settings.reasoning_effort.clone(),
     );
     acp_model_config_option_for_turn_config(runtime_context, &turn_config)
 }
@@ -525,11 +539,11 @@ fn canonical_model_selection(turn_config: &TurnConfig) -> String {
 
 fn acp_reasoning_effort_config_option_for_session(
     runtime_context: &SessionRuntimeContext,
-    summary: &SessionMetadata,
+    summary: &crate::runtime_session_summary::RuntimeSessionSummary,
 ) -> Option<AcpSessionConfigOption> {
     let turn_config = runtime_context.resolve_turn_config(
         session_model_selection(summary),
-        summary.reasoning_effort_selection.clone(),
+        summary.settings.reasoning_effort.clone(),
     );
     acp_reasoning_effort_config_option_for_turn_config(&turn_config)
 }

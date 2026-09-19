@@ -180,8 +180,8 @@ pub struct LoadedDeferredTools {
     by_session: HashMap<String, BTreeSet<String>>,
 }
 
-// TODO: should noted that the tool search tool is still a simple tool.
-
+/// ToolSearch is a simple lookup tool: `select:` loads exact names, and any
+/// other query ranks registered tools by name+description tokens.
 impl LoadedDeferredTools {
     pub fn mark_loaded(&mut self, session_id: &str, tool_name: &str) {
         self.by_session
@@ -298,18 +298,59 @@ pub fn execute_tool_search(
     _loaded: &mut LoadedDeferredTools,
     config: &DeferredLoadingConfig,
 ) -> Result<ToolSearchResult, String> {
-    let Some(selection) = query
-        .trim()
+    let query = query.trim();
+    if let Some(selection) = query
         .strip_prefix("select:")
-        .or_else(|| query.trim().strip_prefix("SELECT:"))
-    else {
-        return Err("Expected query format: select:<name>[,<name>...]".to_string());
-    };
+        .or_else(|| query.strip_prefix("SELECT:"))
+    {
+        return execute_select_tool_search(selection, all_tools, config);
+    }
 
+    execute_keyword_tool_search(query, all_tools, config)
+}
+
+fn execute_select_tool_search(
+    selection: &str,
+    all_tools: &[ToolDefinition],
+    config: &DeferredLoadingConfig,
+) -> Result<ToolSearchResult, String> {
     let names = selection
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty());
+    finish_tool_search(names, all_tools, config)
+}
+
+fn execute_keyword_tool_search(
+    query: &str,
+    all_tools: &[ToolDefinition],
+    config: &DeferredLoadingConfig,
+) -> Result<ToolSearchResult, String> {
+    if query.is_empty() {
+        return Err("Expected a non-empty search query".to_string());
+    }
+
+    let query_tokens = keyword_tokens(query);
+    if query_tokens.is_empty() {
+        return Err("Expected a non-empty search query".to_string());
+    }
+
+    let mut scored = all_tools
+        .iter()
+        .filter_map(|tool| {
+            let score = keyword_score(&query_tokens, tool);
+            (score > 0).then_some((score, tool.name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+    finish_tool_search(scored.into_iter().map(|(_, name)| name), all_tools, config)
+}
+
+fn finish_tool_search<'a>(
+    names: impl Iterator<Item = &'a str>,
+    all_tools: &[ToolDefinition],
+    config: &DeferredLoadingConfig,
+) -> Result<ToolSearchResult, String> {
     let registered: HashSet<_> = all_tools.iter().map(|tool| tool.name.as_str()).collect();
     let alias_map = alias_map(&registered);
     let mut result = ToolSearchResult {
@@ -328,7 +369,9 @@ pub fn execute_tool_search(
 
         match resolve_tool_policy(&canonical_name, config) {
             PromptLoadingPolicy::Preloaded | PromptLoadingPolicy::Deferred => {
-                result.already_available.push(canonical_name);
+                if !result.already_available.contains(&canonical_name) {
+                    result.already_available.push(canonical_name);
+                }
             }
             PromptLoadingPolicy::Hidden => result.not_found.push(requested_name.to_string()),
         }
@@ -339,6 +382,46 @@ pub fn execute_tool_search(
     }
 
     Ok(result)
+}
+
+fn keyword_tokens(query: &str) -> Vec<String> {
+    let tokens = tokenize(query);
+    if tokens.len() <= 1 {
+        tokens
+    } else {
+        tokens
+            .into_iter()
+            .filter(|token| token.len() >= 2)
+            .collect()
+    }
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn keyword_score(query_tokens: &[String], tool: &ToolDefinition) -> usize {
+    let name_lower = tool.name.to_ascii_lowercase();
+    let name_tokens = tokenize(&tool.name);
+    let description_lower = tool.description.to_ascii_lowercase();
+    let description_tokens = tokenize(&tool.description);
+    let mut score = 0usize;
+    for token in query_tokens {
+        if name_lower == *token || name_tokens.iter().any(|name| name == token) {
+            score += 3;
+        } else if name_lower.contains(token) || name_tokens.iter().any(|name| name.contains(token))
+        {
+            score += 2;
+        } else if description_tokens.iter().any(|part| part == token)
+            || description_lower.contains(token)
+        {
+            score += 1;
+        }
+    }
+    score
 }
 
 pub fn resolve_spec_policy(spec: &ToolSpec, config: &DeferredLoadingConfig) -> PromptLoadingPolicy {
@@ -624,6 +707,24 @@ mod tests {
         );
         assert!(!loaded.is_loaded("session-1", "web_search"));
         assert!(!loaded.is_loaded("session-1", "fetch_url"));
+    }
+
+    #[test]
+    fn tool_search_keyword_ranks_name_and_description_tokens() {
+        let config = DeferredLoadingConfig::default();
+        let mut loaded = LoadedDeferredTools::default();
+
+        let result = execute_tool_search("session-1", "read file", &tools(), &mut loaded, &config)
+            .expect("keyword search should return matching tools");
+
+        assert!(
+            result.already_available.contains(&"read".to_string()),
+            "expected read in {:?}",
+            result.already_available
+        );
+        assert!(result.loaded.is_empty());
+        assert!(result.already_loaded.is_empty());
+        assert!(!loaded.is_loaded("session-1", "read"));
     }
 
     #[test]

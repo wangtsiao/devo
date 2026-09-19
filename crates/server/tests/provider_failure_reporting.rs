@@ -9,15 +9,6 @@ mod support;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Datelike;
-use chrono::SecondsFormat;
-use devo_core::AppConfigStore;
-use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
-use devo_core::SkillsConfig;
-use devo_core::tools::ToolRegistry;
-use devo_protocol::Model;
 use devo_protocol::ModelRequest;
 use devo_protocol::ModelResponse;
 use devo_protocol::ResponseContent;
@@ -25,9 +16,9 @@ use devo_protocol::ResponseMetadata;
 use devo_protocol::SessionId;
 use devo_protocol::StopReason;
 use devo_protocol::StreamEvent;
-use devo_protocol::TurnErrorPayload;
 use devo_protocol::TurnId;
 use devo_protocol::Usage;
+use devo_protocol::native::error::AgentError;
 use devo_provider::ModelProviderSDK;
 use devo_provider::ProviderRoute;
 use devo_provider::ProviderRouter;
@@ -42,7 +33,7 @@ use tokio::time::timeout;
 
 use devo_server::ClientTransportKind;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
+use devo_server::test_support::TestRuntime;
 
 const PROVIDER_ERROR_TEXT: &str = "Internal server error";
 const FAILING_ATTEMPTS: usize = 6;
@@ -131,10 +122,11 @@ async fn exhausted_provider_retries_persist_for_history_but_do_not_enter_context
     let runtime = build_runtime(data_root.path(), router.clone())?;
     let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
     let session = start_session(&runtime, connection_id, data_root.path()).await?;
-    let session_id = SessionId::try_from(session.id.as_str())?;
+    let session_id = SessionId::from(session.id.as_str());
 
     let failed_turn_id = start_turn(&runtime, connection_id, session_id, 3).await?;
     let mut retry_statuses = Vec::new();
+    let mut query_failed = None;
     let mut failed_error = None;
     let mut failed_completion_count = 0;
     let mut failed_agent_items = Vec::new();
@@ -142,6 +134,7 @@ async fn exhausted_provider_retries_persist_for_history_but_do_not_enter_context
         while let Some(value) = notifications_rx.recv().await {
             match value.get("method").and_then(serde_json::Value::as_str) {
                 Some("model/queryRetrying") => retry_statuses.push(value["params"].clone()),
+                Some("model/queryFailed") => query_failed = Some(value["params"].clone()),
                 Some("item/started" | "item/completed")
                     if value["params"]["item"]["item"]["type"]
                         == serde_json::json!("assistantMessage") =>
@@ -153,13 +146,10 @@ async fn exhausted_provider_retries_persist_for_history_but_do_not_enter_context
                 {
                     failed_completion_count += 1;
                     let error = &value["params"]["turn"]["error"];
-                    failed_error = Some(TurnErrorPayload {
-                        code: error["errorCode"].as_str().unwrap_or_default().to_string(),
-                        message: error["message"].as_str().unwrap_or_default().to_string(),
-                        recovery_hint: error["details"]["recoveryHint"]
-                            .as_str()
-                            .map(ToString::to_string),
-                    });
+                    failed_error = Some(
+                        serde_json::from_value::<AgentError>(error.clone())
+                            .expect("turn.error is AgentError"),
+                    );
                 }
                 Some("session/statusChanged")
                     if value["params"]["status"] == serde_json::json!("idle") =>
@@ -177,15 +167,24 @@ async fn exhausted_provider_retries_persist_for_history_but_do_not_enter_context
         retry_statuses,
         expected_retry_statuses(session_id, failed_turn_id)
     );
+    let query_failed = query_failed.expect("model/queryFailed after exhausted retries");
+    assert_eq!(query_failed["attempt"], serde_json::json!(5));
+    assert_eq!(query_failed["maxAttempts"], serde_json::json!(5));
+    assert!(
+        query_failed["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains(PROVIDER_ERROR_TEXT),
+        "queryFailed message should include provider error text"
+    );
     assert_eq!(
         failed_error,
-        Some(TurnErrorPayload {
-            code: "PROVIDER_SERVER_ERROR".to_string(),
-            message: format!(
+        Some(AgentError::new(
+            "PROVIDER_SERVER_ERROR",
+            format!(
                 "model provider error: provider server error (Some(500)): {PROVIDER_ERROR_TEXT}"
             ),
-            recovery_hint: None,
-        })
+        ))
     );
     assert_eq!(failed_completion_count, 1);
     assert_eq!(failed_agent_items, Vec::<serde_json::Value>::new());
@@ -345,35 +344,12 @@ fn build_runtime(
     router: Arc<ExhaustingRouter>,
 ) -> Result<Arc<ServerRuntime>> {
     let provider: Arc<dyn ModelProviderSDK> = Arc::new(UnusedProvider);
-    let provider_router: Arc<dyn ProviderRouter> = router;
-    let db = Arc::new(devo_server::db::Database::open(
-        data_root.join("provider_failure_reporting.db"),
-    )?);
-    Ok(ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            provider,
-            provider_router,
-            Arc::new(ToolRegistry::new()),
-            devo_server::empty_mcp_manager(),
-            "default-model".to_string(),
-            Arc::new(PresetModelCatalog::new(vec![Model {
-                slug: "default-model".to_string(),
-                display_name: "Default Model".to_string(),
-                ..Model::default()
-            }])),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                ..SkillsConfig::default()
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(AppConfigStore::load(
-                data_root.to_path_buf(),
-                /*workspace_root*/ None,
-            )?)),
-        ),
-    ))
+    Ok(TestRuntime::new(provider)
+        .router(router)
+        .with_named_model("default-model", "Default Model")
+        .default_model("default-model")
+        .db_file("provider_failure_reporting.db")
+        .runtime(data_root))
 }
 
 async fn initialize_connection(
@@ -424,7 +400,7 @@ async fn start_session(
     let response: devo_server::SuccessResponse<
         devo_protocol::native::rpc_session::SessionNewResult,
     > = serde_json::from_value(response)?;
-    let session_id = response.result.session.id.clone();
+    let session_id = response.result.session.id;
     let metadata_response = runtime
         .handle_incoming(
             connection_id,
@@ -469,7 +445,7 @@ async fn start_turn(
         .context("turn/start response")?;
     let response: devo_server::SuccessResponse<devo_protocol::native::rpc_turn::TurnStartResult> =
         serde_json::from_value(response)?;
-    Ok(TurnId::try_from(response.result.turn.id.as_str())?)
+    Ok(TurnId::from(response.result.turn.id.as_str()))
 }
 
 async fn wait_for_turn_completed(
@@ -495,16 +471,9 @@ fn rollout_path(
     data_root: &std::path::Path,
     session: &devo_protocol::native::session::Session,
 ) -> std::path::PathBuf {
-    let timestamp = session
-        .created_at
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
-        .replace(':', "-");
     data_root
         .join("sessions")
-        .join(format!("{:04}", session.created_at.year()))
-        .join(format!("{:02}", session.created_at.month()))
-        .join(format!("{:02}", session.created_at.day()))
-        .join(format!("rollout-{timestamp}-{}.jsonl", session.id))
+        .join(format!("{}.jsonl", session.id))
 }
 
 fn model_response(text: &str) -> ModelResponse {
@@ -526,7 +495,7 @@ async fn continue_failed_turn_reuses_context_and_is_idempotent() -> Result<()> {
     let runtime = build_runtime(data_root.path(), router.clone())?;
     let (connection_id, mut notifications) = initialize_connection(&runtime).await?;
     let session = start_session(&runtime, connection_id, data_root.path()).await?;
-    let session_id = SessionId::try_from(session.id.as_str())?;
+    let session_id = SessionId::from(session.id.as_str());
     let turn_id = start_turn(&runtime, connection_id, session_id, 21).await?;
     let recovery = timeout(Duration::from_secs(30), async {
         while let Some(event) = notifications.recv().await {

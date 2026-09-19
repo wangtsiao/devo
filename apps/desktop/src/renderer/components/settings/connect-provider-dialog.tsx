@@ -38,6 +38,7 @@ import type {
 import { createLogger } from "../../lib/logger"
 import { PROVIDER_KEY_URLS, ZEN_PROVIDER_ID, ZEN_SIGNUP_URL } from "../../lib/providers"
 import { getBaseClient } from "../../services/connection-manager"
+import { isDesktopOAuthProvider, resolveProviderAuthMethods } from "./desktop-oauth-providers"
 import { ProviderIcon } from "./provider-icon"
 
 const log = createLogger("connect-provider-dialog")
@@ -251,7 +252,11 @@ export function ConnectProviderDialog({
 
 	// Use plugin methods if available, otherwise default to API key
 	const authMethods =
-		pluginAuthMethods && pluginAuthMethods.length > 0 ? pluginAuthMethods : DEFAULT_API_KEY_METHOD
+		provider && isDesktopOAuthProvider(provider.id)
+			? resolveProviderAuthMethods(provider.id)
+			: pluginAuthMethods && pluginAuthMethods.length > 0
+				? pluginAuthMethods
+				: DEFAULT_API_KEY_METHOD
 
 	// Reset state when dialog opens/closes
 	useEffect(() => {
@@ -848,43 +853,20 @@ function OAuthView({
 	// Start OAuth flow on mount
 	useEffect(() => {
 		let cancelled = false
+		const unsubscribe = window.devo.providerOAuth.onUpdate((update) => {
+			if (cancelled) return
+			setAuthUrl(update.url ?? null)
+			setOauthMethod("auto")
+			setAuthInstructions(update.instructions)
+			setState({ status: "idle" })
+		})
 
 		async function startOAuth() {
 			setState({ status: "loading" })
 			try {
-				const client = getBaseClient()
-				if (!client) throw new Error("Not connected to server")
-				const result = await client.provider.oauth.authorize({
-					providerID: provider.id,
-					method: methodIndex,
-				})
+				await window.devo.providerOAuth.login(provider.id)
 				if (cancelled) return
-
-					const data = result.data as unknown as
-					| {
-							url: string
-							method: "auto" | "code"
-							instructions: string
-					  }
-					| undefined
-
-				if (!data?.url) {
-					throw new Error("No authorization URL returned")
-				}
-
-				setAuthUrl(data.url)
-				setOauthMethod(data.method)
-				setAuthInstructions(data.instructions)
-
-				// Open the URL in the browser (Electron intercepts via setWindowOpenHandler)
-				window.open(data.url, "_blank")
-
-				setState({ status: "idle" })
-
-				// For auto method, start polling
-				if (data.method === "auto") {
-					pollForCompletion(client, provider.id, methodIndex, setState, onSuccess, () => cancelled)
-				}
+				onSuccess()
 			} catch (err) {
 				if (cancelled) return
 				const message = err instanceof Error ? err.message : "Failed to start OAuth"
@@ -896,6 +878,8 @@ function OAuthView({
 		startOAuth()
 		return () => {
 			cancelled = true
+			unsubscribe()
+			void window.devo.providerOAuth.cancel()
 		}
 	}, [provider.id, methodIndex, setState, onSuccess])
 
@@ -903,27 +887,9 @@ function OAuthView({
 		async (e: React.FormEvent) => {
 			e.preventDefault()
 			if (!code.trim()) return
-			setState({ status: "loading" })
-			try {
-				const client = getBaseClient()
-				if (!client) throw new Error("Not connected to server")
-				await client.provider.oauth.callback({
-					providerID: provider.id,
-					method: methodIndex,
-					code: code.trim(),
-				})
-				await client.global.dispose()
-				onSuccess()
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to complete OAuth"
-				log.error("Failed to complete OAuth callback", {
-					provider: provider.id,
-					error: err,
-				})
-				setState({ status: "error", message })
-			}
+			setState({ status: "error", message: "This OAuth flow completes in the browser." })
 		},
-		[code, provider.id, methodIndex, setState, onSuccess],
+		[code, setState],
 	)
 
 	if (oauthMethod === "code" && authUrl) {
@@ -1187,45 +1153,6 @@ function SuccessView({ provider, onDone }: { provider: CatalogProvider; onDone: 
 // ============================================================
 // Helpers
 // ============================================================
-
-async function pollForCompletion(
-	client: ReturnType<typeof getBaseClient>,
-	providerID: string,
-	methodIndex: number,
-	setState: (state: DialogState) => void,
-	onSuccess: () => void,
-	isCancelled: () => boolean,
-) {
-	if (!client) return
-
-	const maxAttempts = 60
-	const intervalMs = 2000
-
-	for (let attempt = 0; attempt < maxAttempts; attempt++) {
-		if (isCancelled()) return
-
-		await new Promise((resolve) => setTimeout(resolve, intervalMs))
-		if (isCancelled()) return
-
-		try {
-			await client.provider.oauth.callback({
-				providerID,
-				method: methodIndex,
-			})
-			// If no error, OAuth completed
-			if (isCancelled()) return
-			await client.global.dispose()
-			onSuccess()
-			return
-		} catch {
-			// Expected to fail while user hasn't completed OAuth yet
-		}
-	}
-
-	if (!isCancelled()) {
-		setState({ status: "error", message: "Authentication timed out. Please try again." })
-	}
-}
 
 function extractDeviceCode(instructions: string | null): string | null {
 	if (!instructions) return null

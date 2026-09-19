@@ -494,8 +494,8 @@ mod tests {
         ToolContext {
             output_store: None,
             tool_call_id: devo_tools::ToolCallId("test-id".to_string()),
-            session_id: "test-session".to_string(),
-            turn_id: Some("test-turn".to_string()),
+            session_id: "test-session".into(),
+            turn_id: Some("test-turn".into()),
             workspace_root: PathBuf::from("~/user/devo"),
             budgets: ToolBudgets {
                 wall_time_limit_ms: Some(6_000),
@@ -511,6 +511,11 @@ mod tests {
             network_no_proxy: None,
             sandbox_permission_overlay: None,
             sandbox_profile: None,
+            kernel: None,
+            python_cell_first_wait_ms: None,
+            python_cell_watch: None,
+            python_cell_completion: None,
+        session_dir: None,
         }
     }
 

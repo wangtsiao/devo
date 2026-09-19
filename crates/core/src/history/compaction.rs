@@ -437,7 +437,8 @@ fn estimate_item_tokens(item: &ResponseItem) -> usize {
                     devo_protocol::ContentBlock::ProviderReasoning { .. }
                     | devo_protocol::ContentBlock::ToolUse { .. }
                     | devo_protocol::ContentBlock::HostedToolUse { .. }
-                    | devo_protocol::ContentBlock::ToolResult { .. } => continue,
+                    | devo_protocol::ContentBlock::ToolResult { .. }
+                    | devo_protocol::ContentBlock::Image { .. } => continue,
                 };
                 if text_blocks > 0 {
                     bytes += 1;

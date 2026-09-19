@@ -5,7 +5,7 @@ use devo_protocol::{
     AgentInfo, AgentListParams, AgentMessageParams, AgentMessageResult, AwaitTaskParams,
     AwaitTaskResult, CancelTaskParams, CancelTaskResult, CloseAgentParams, CloseAgentResult,
     ListTasksParams, ListTasksResult, RequestUserInputArgs, RequestUserInputResponse,
-    SpawnAgentParams, SpawnAgentResult, WaitAgentParams, WaitAgentResult,
+    SessionId, SpawnAgentParams, SpawnAgentResult, TurnId, WaitAgentParams, WaitAgentResult,
 };
 use serde_json::Value;
 
@@ -72,8 +72,8 @@ pub trait AgentToolCoordinator: Send + Sync {
 
     async fn request_user_input(
         self: Arc<Self>,
-        _session_id: String,
-        _turn_id: String,
+        _session_id: SessionId,
+        _turn_id: TurnId,
         _tool_call_id: String,
         _args: RequestUserInputArgs,
     ) -> Result<RequestUserInputResponse, ToolCallError> {
@@ -84,7 +84,7 @@ pub trait AgentToolCoordinator: Send + Sync {
 
     async fn update_goal(
         self: Arc<Self>,
-        _session_id: String,
+        _session_id: SessionId,
         _status: String,
     ) -> Result<Value, ToolCallError> {
         Err(ToolCallError::ExecutionFailed(

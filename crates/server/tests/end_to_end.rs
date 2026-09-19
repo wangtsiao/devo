@@ -22,10 +22,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
 use devo_core::SkillsConfig;
-use devo_core::tools::ToolRegistry;
 use devo_protocol::ModelRequest;
 use devo_protocol::ModelResponse;
 use devo_protocol::ResponseContent;
@@ -33,9 +30,7 @@ use devo_protocol::StopReason;
 use devo_protocol::StreamEvent;
 use devo_protocol::Usage;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
-use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
+use devo_server::test_support::TestRuntime;
 use futures::stream;
 
 const STDIO_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -441,6 +436,187 @@ async fn second_stdio_server_process_extends_protocols_before_proxying() -> Resu
     Ok(())
 }
 
+
+#[tokio::test]
+async fn primary_stdio_disconnect_keeps_singleton_for_proxy_client() -> Result<()> {
+    let home_dir = TempDir::new()?;
+    write_test_config(&home_dir, &["stdio://"])?;
+    let devo_home = home_dir.path().join(".devo");
+    let first_workspace = home_dir.path().join("first-workspace");
+    let second_workspace = home_dir.path().join("second-workspace");
+    std::fs::create_dir_all(&first_workspace)?;
+    std::fs::create_dir_all(&second_workspace)?;
+    let first_cwd = first_workspace.to_string_lossy().into_owned();
+    let second_cwd = second_workspace.to_string_lossy().into_owned();
+
+    let mut first_command = devo_command()?;
+    let mut first_child = first_command
+        .arg("server")
+        .arg("--transport")
+        .arg("stdio")
+        .env("DEVO_HOME", &devo_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn first real stdio server")?;
+    let mut first_stdin = first_child.stdin.take().context("first stdin")?;
+    let first_stdout = first_child.stdout.take().context("first stdout")?;
+    let first_stderr = first_child.stderr.take().context("first stderr")?;
+    let mut first_stdout_reader = AsyncBufReader::new(first_stdout).lines();
+    let mut first_stderr_reader = AsyncBufReader::new(first_stderr);
+
+    first_stdin
+        .write_all(format!("{}\n", native_initialize_request()).as_bytes())
+        .await?;
+    first_stdin.flush().await?;
+    let first_initialize = read_stdio_line(
+        &mut first_stdout_reader,
+        "first initialize",
+        STDIO_SERVER_STARTUP_TIMEOUT,
+    )
+    .await?;
+    let first_initialize_response = parse_stdio_json_line(
+        &mut first_child,
+        &mut first_stderr_reader,
+        "first initialize",
+        &first_initialize,
+    )
+    .await?;
+    assert_eq!(first_initialize_response["id"], serde_json::json!(1));
+
+    first_stdin
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": first_cwd,
+                        "additionalDirectories": [],
+                        "mcpServers": [],
+                        "idempotencyKey": "first-session"
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await?;
+    first_stdin.flush().await?;
+    let _ = read_stdio_line(
+        &mut first_stdout_reader,
+        "first session/new",
+        STDIO_SERVER_LINE_TIMEOUT,
+    )
+    .await?;
+
+    let mut second_command = devo_command()?;
+    let mut second_child = second_command
+        .arg("server")
+        .arg("--transport")
+        .arg("stdio")
+        .env("DEVO_HOME", &devo_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn proxy stdio server")?;
+    let mut second_stdin = second_child.stdin.take().context("proxy stdin")?;
+    let second_stdout = second_child.stdout.take().context("proxy stdout")?;
+    let second_stderr = second_child.stderr.take().context("proxy stderr")?;
+    let mut second_stdout_reader = AsyncBufReader::new(second_stdout).lines();
+    let mut second_stderr_reader = AsyncBufReader::new(second_stderr);
+
+    second_stdin
+        .write_all(format!("{}\n", native_initialize_request()).as_bytes())
+        .await?;
+    second_stdin.flush().await?;
+    let second_initialize = read_stdio_line(
+        &mut second_stdout_reader,
+        "proxy initialize",
+        STDIO_SERVER_STARTUP_TIMEOUT,
+    )
+    .await?;
+    let second_initialize_response = parse_stdio_json_line(
+        &mut second_child,
+        &mut second_stderr_reader,
+        "proxy initialize",
+        &second_initialize,
+    )
+    .await?;
+    assert_eq!(second_initialize_response["id"], serde_json::json!(1));
+
+    // Close only the primary stdio connection; Real server must keep serving
+    // the proxy client.
+    drop(first_stdin);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        first_child.try_wait()?.is_none(),
+        "real server should stay alive while a proxy client remains"
+    );
+
+    second_stdin
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": second_cwd,
+                        "additionalDirectories": [],
+                        "mcpServers": [],
+                        "idempotencyKey": "second-session-after-primary-drop"
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await?;
+    second_stdin.flush().await?;
+    let mut session_new_response = None;
+    for _ in 0..6 {
+        let line = read_stdio_line(
+            &mut second_stdout_reader,
+            "proxy session/new after primary disconnect",
+            STDIO_SERVER_LINE_TIMEOUT,
+        )
+        .await?;
+        let value = parse_stdio_json_line(
+            &mut second_child,
+            &mut second_stderr_reader,
+            "proxy session/new after primary disconnect",
+            &line,
+        )
+        .await?;
+        if value.get("id") == Some(&serde_json::json!(2)) {
+            session_new_response = Some(value);
+            break;
+        }
+    }
+    let session_new_response =
+        session_new_response.context("proxy session/new after primary disconnect")?;
+    let session_id = session_new_response["result"]["session"]["id"]
+        .as_str()
+        .or_else(|| session_new_response["result"]["sessionId"].as_str());
+    assert!(
+        session_id.is_some_and(|id| !id.is_empty()),
+        "proxy client must still create sessions after primary disconnect: {session_new_response}"
+    );
+
+    drop(second_stdin);
+    second_child.kill().await.ok();
+    let _ = second_child.wait().await;
+    // After the last proxy leaves, the real server should exit on its own.
+    let _exited = timeout(Duration::from_secs(10), first_child.wait())
+        .await
+        .context("real server should exit after last proxy disconnects")??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn websocket_listener_supports_handshake_subscription_and_turn_lifecycle() -> Result<()> {
     let workspace = TempDir::new()?;
@@ -452,26 +628,10 @@ async fn websocket_listener_supports_handshake_subscription_and_turn_lifecycle()
         port
     };
     let bind_address = format!("127.0.0.1:{port}");
-    let db_path = std::env::temp_dir().join("test_end_to_end.db");
-    let db = Arc::new(devo_server::db::Database::open(db_path).expect("open test database"));
-    let provider: Arc<dyn ModelProviderSDK> = Arc::new(PendingProvider);
-    let runtime = ServerRuntime::new(
-        std::env::temp_dir(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            Arc::new(ToolRegistry::new()),
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig::default())),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(std::env::temp_dir(), None).expect("load app config store"),
-            )),
-        ),
-    );
+    let runtime = TestRuntime::new(Arc::new(PendingProvider))
+        .skills(SkillsConfig::default())
+        .db_file("test_end_to_end.db")
+        .runtime(&std::env::temp_dir());
     let listen = vec![format!("ws://{bind_address}")];
     let listener_task =
         tokio::spawn(
@@ -655,25 +815,16 @@ async fn websocket_turn_streams_final_tool_metadata_for_read_and_glob() -> Resul
     let db = Arc::new(devo_server::db::Database::open(
         db_dir.path().join("e2e.db"),
     )?);
-    let provider: Arc<dyn ModelProviderSDK> =
-        Arc::new(StreamingToolProvider::new(workspace.path().to_path_buf()));
-    let runtime = ServerRuntime::new(
+    let runtime = TestRuntime::new(Arc::new(StreamingToolProvider::new(
         workspace.path().to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            Arc::new(devo_core::tools::create_default_tool_registry()),
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig::default())),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(std::env::temp_dir(), None).expect("load app config store"),
-            )),
-        ),
-    );
+    )))
+    .registry(Arc::new(devo_core::tools::create_default_tool_registry()))
+    .skills(SkillsConfig::default())
+    .database(db)
+    .config_store(Arc::new(std::sync::Mutex::new(
+        AppConfigStore::load(std::env::temp_dir(), None).expect("load app config store"),
+    )))
+    .runtime(workspace.path());
     let listen = vec![format!("ws://{bind_address}")];
     let listener_task =
         tokio::spawn(

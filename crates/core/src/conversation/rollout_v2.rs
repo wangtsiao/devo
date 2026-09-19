@@ -1,11 +1,10 @@
-//! The versioned whole-line rollout envelope (v2) and the dual-format reader
-//! dispatch.
+//! The versioned whole-line rollout envelope (v2) and the reader dispatch.
 //!
-//! Truth source: `devo-api-design/05-migration.md` §2.2. Rollout files may
-//! freely mix legacy v1 lines (no top-level `v` key, frozen `RolloutLine`
-//! schema) and v2 lines; the write path only ever appends v2. Reading goes
-//! through [`parse_rollout_line`], which dispatches on the top-level `v` key
-//! and refuses to silently skip unknown versions.
+//! Truth source: `devo-api-design/05-migration.md` §2.2, superseded for the
+//! RLM breaking release by `L2-DES-RLM-001` DD-9: **legacy (v1) lines are
+//! rejected**. The write path only ever appends v2. Reading goes through
+//! [`parse_rollout_line`], which requires top-level `v: 2` and refuses
+//! unknown versions and pre-RLM (missing `v`) sessions.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,15 +13,13 @@ use devo_protocol::native::ids::{ItemId, SessionId, TurnId};
 use devo_protocol::native::item::{InternalEntry, ItemEnvelope};
 use devo_protocol::native::session::Session;
 use devo_protocol::native::turn::Turn;
-use devo_protocol::native::usage::UsageRecord;
+use devo_protocol::native::usage::{TurnUsage, UsageRecord};
 
 use crate::{
     MessageEditRecordedRecord, SessionContext, TurnContext, TurnSupersededRecord,
     TurnWorkspaceChangeRecordedRecord, TurnWorkspaceCheckpointRecordedRecord,
     TurnWorkspaceRestoreCompletedRecord, TurnWorkspaceRestoreStartedRecord,
 };
-
-use super::records::RolloutLine;
 
 /// The format version written by the v2 write path.
 pub const ROLLOUT_FORMAT_VERSION: u32 = 2;
@@ -46,6 +43,9 @@ pub struct SessionPersistenceExtras {
     /// Session-level permission preset override, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_preset: Option<crate::PermissionPreset>,
+    /// Relative path to the kernel dill snapshot under the session dir (RLM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_snapshot_path: Option<String>,
 }
 
 /// Persistence-only extras on the v2 Turn line, same rationale as
@@ -65,8 +65,9 @@ pub struct TurnPersistenceExtras {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_token_estimate: Option<u32>,
     /// Provider usage of the latest model query (excludes tool/retry calls).
+    /// Native end-to-end — same shape as `Turn.usage` / live runtime meters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_query_usage: Option<crate::TurnUsage>,
+    pub latest_query_usage: Option<TurnUsage>,
     /// Context-window occupancy after the latest model query in this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_occupancy: Option<devo_protocol::native::item::ContextOccupancy>,
@@ -220,6 +221,13 @@ pub enum InternalRecordV2 {
         schema_version: u32,
         goal: Option<serde_json::Value>,
     },
+    /// RLM kernel OS-fence outcome at spawn (design doc `rlm-permissions.md`
+    /// §5.3): `fenced`, `downgradedUnfenced` (loud downgrade — audit trail for
+    /// the unfenced kernel), or `notRequested`. Replay treats it as opaque.
+    KernelFence {
+        schema_version: u32,
+        state: String,
+    },
     /// One append-only model-call accounting entry. Unlike turn summary usage,
     /// this preserves failed attempts and non-turn overhead calls.
     UsageRecord { record: UsageRecord },
@@ -240,15 +248,24 @@ pub enum InternalRecordV2 {
     },
     /// Turn blocked on interactive approval; used to resume after restart.
     TurnApprovalCheckpoint(Box<crate::TurnApprovalCheckpointRecordedRecord>),
+    /// Current transcript-tree tip (last-wins). `leaf_id: None` means empty tip.
+    SessionLeaf {
+        /// Settings-style write sequence for cross-path ordering/traces.
+        epoch: u64,
+        /// Tip item id, or `None` after reset to root.
+        leaf_id: Option<devo_protocol::native::ids::ItemId>,
+    },
+    /// Durable parent pointer for one item in the transcript tree. Last edge
+    /// for a given `child_id` wins; item envelopes may also carry `parent_id`.
+    TreeEdge {
+        child_id: devo_protocol::native::ids::ItemId,
+        parent_id: Option<devo_protocol::native::ids::ItemId>,
+    },
 }
 
-/// A rollout line parsed from disk in either supported format.
+/// A rollout line parsed from disk (v2 only after the RLM breaking release).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedRolloutLine {
-    /// A frozen legacy (v1) line, to be converted via
-    /// `crate::conversation::legacy_projector::LegacyProjector`. Boxed to
-    /// keep the enum small.
-    Legacy(Box<RolloutLine>),
     /// A current v2 envelope line. Boxed to keep the enum small.
     V2(Box<RolloutLineV2>),
 }
@@ -256,12 +273,16 @@ pub enum ParsedRolloutLine {
 /// Errors from reading a single rollout line. Unknown format versions must
 /// never be silently skipped (05 §2.2); a parse failure on any non-final line
 /// marks the session damaged and stops automatic writes. Only a truncated
-/// final line is a tolerable crash tail.
+/// final line is a tolerable crash tail. Pre-RLM (v1 / missing `v`) sessions
+/// cannot be resumed (`L2-DES-RLM-001` DD-9).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RolloutLineReadError {
     /// The line declares a format version this reader does not understand.
     #[error("unsupported rollout format version {version}")]
     RolloutVersionUnsupported { version: u32 },
+    /// Pre-RLM legacy line (no top-level `v`). Resume is unsupported.
+    #[error("pre-RLM legacy rollout is unsupported (missing format version)")]
+    LegacyUnsupported,
     /// The line is neither valid legacy nor valid v2 JSON for its declared
     /// version.
     #[error("damaged rollout line: {reason}")]
@@ -273,9 +294,9 @@ pub enum RolloutLineReadError {
     TruncatedTail,
 }
 
-/// Parses one rollout JSONL line, dispatching on the top-level `v` key:
-/// absent → frozen legacy `RolloutLine`; `2` → [`RolloutLineV2`]; anything
-/// else → [`RolloutLineReadError::RolloutVersionUnsupported`].
+/// Parses one rollout JSONL line. Requires top-level `v: 2`. Missing `v`
+/// (legacy) → [`RolloutLineReadError::LegacyUnsupported`]. Other versions →
+/// [`RolloutLineReadError::RolloutVersionUnsupported`].
 ///
 /// A truncated line reports [`RolloutLineReadError::TruncatedTail`]; the
 /// caller decides whether it is the file's final line (tolerable crash tail)
@@ -291,12 +312,7 @@ pub fn parse_rollout_line(line: &str) -> Result<ParsedRolloutLine, RolloutLineRe
         }
     })?;
     let Some(version) = value.get("v") else {
-        let legacy = serde_json::from_value::<RolloutLine>(value).map_err(|error| {
-            RolloutLineReadError::Damaged {
-                reason: error.to_string(),
-            }
-        })?;
-        return Ok(ParsedRolloutLine::Legacy(Box::new(legacy)));
+        return Err(RolloutLineReadError::LegacyUnsupported);
     };
     let version = version
         .as_u64()
@@ -324,7 +340,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::conversation::{SessionTitleState, SessionTitleUpdatedLine};
     use devo_protocol::native::ids::ItemId as CanonicalItemId;
     use devo_protocol::native::item::{Item, ItemState, UserInput, UserMessageEntry};
 
@@ -352,6 +367,7 @@ mod tests {
                     }],
                     entry: UserMessageEntry::TurnStart,
                 },
+                parent_id: None,
             },
         }
     }
@@ -392,17 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_detects_legacy_line_by_missing_version() {
-        let legacy = RolloutLine::SessionTitleUpdated(SessionTitleUpdatedLine {
-            timestamp: fixed_ts(),
-            session_id: crate::conversation::SessionId::new(),
-            title: "New Title".into(),
-            title_state: SessionTitleState::Generating,
-            previous_title: Some("Old Title".into()),
-        });
-        let line = serde_json::to_string(&legacy).expect("serialize");
-        let parsed = parse_rollout_line(&line).expect("parse");
-        assert_eq!(parsed, ParsedRolloutLine::Legacy(Box::new(legacy)));
+    fn dispatch_rejects_legacy_line_missing_version() {
+        let line = r#"{"timestamp":"2026-08-01T00:00:00Z","type":"session_title_updated","session_id":"00000000-0000-0000-0000-000000000001","title":"x","title_state":"generating"}"#;
+        let error = parse_rollout_line(line).expect_err("must fail");
+        assert_eq!(error, RolloutLineReadError::LegacyUnsupported);
     }
 
     #[test]

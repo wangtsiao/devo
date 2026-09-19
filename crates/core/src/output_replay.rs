@@ -35,7 +35,6 @@ pub fn read_output_references(path: &Path) -> anyhow::Result<Vec<OutputArtifact>
                     replay.apply(&record)?;
                 }
             }
-            Ok(ParsedRolloutLine::Legacy(_)) => {}
             Err(RolloutLineReadError::TruncatedTail) => {
                 let only_blank_remain = {
                     let mut blank = true;

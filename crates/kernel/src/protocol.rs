@@ -10,7 +10,10 @@ pub const PROTOCOL_VERSION: u32 = 3;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KernelRequest {
-    Execute { id: String, code: String },
+    Execute {
+        id: String,
+        code: String,
+    },
     Interrupt {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
@@ -30,8 +33,13 @@ pub enum KernelRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         prune_oversized: Option<bool>,
     },
-    Restore { id: String, path: String },
-    ListNames { id: String },
+    Restore {
+        id: String,
+        path: String,
+    },
+    ListNames {
+        id: String,
+    },
     Shutdown {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,

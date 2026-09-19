@@ -212,7 +212,7 @@ function updateTrayTitle(
 	if (IS_MAC) {
 		// Show counts next to the tray icon
 		const busyCount = Array.from(liveSessions.values()).filter(
-			(s) => !s.parentID && (s.status === "busy" || s.status === "retry"),
+			(s) => !s.parentId && (s.status === "busy" || s.status === "retry"),
 		).length
 
 		let title = ""
@@ -226,9 +226,9 @@ function updateTrayTitle(
 	}
 
 	// Update tooltip with summary
-	const totalSessions = Array.from(liveSessions.values()).filter((s) => !s.parentID).length
+	const totalSessions = Array.from(liveSessions.values()).filter((s) => !s.parentId).length
 	const busyCount = Array.from(liveSessions.values()).filter(
-		(s) => !s.parentID && (s.status === "busy" || s.status === "retry"),
+		(s) => !s.parentId && (s.status === "busy" || s.status === "retry"),
 	).length
 
 	let tooltip = "Devo"

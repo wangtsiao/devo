@@ -10,11 +10,11 @@ use devo_protocol::GoalSetParams;
 use devo_protocol::GoalSetResult;
 use devo_protocol::GoalStatusParams;
 use devo_protocol::GoalStatusResult;
-use devo_protocol::SessionId;
 use devo_protocol::SlashCommand;
 use devo_protocol::ThreadGoal;
 use devo_protocol::ThreadGoalStatus;
 use devo_protocol::acp_available_slash_commands;
+use devo_protocol::native::ids::SessionId;
 
 use crate::ACP_SESSION_UPDATE_METHOD;
 use crate::AcpClientNotification;
@@ -25,13 +25,13 @@ use crate::AcpSessionNotification;
 use crate::AcpSessionUpdate;
 use crate::AcpStopReason;
 use crate::CollaborationMode;
-use crate::InputItem;
 use crate::SuccessResponse;
 use crate::TurnExecutionMode;
 use crate::TurnStartParams;
 use crate::TurnStartResult;
 use crate::acp_error_response;
 use crate::acp_success_response;
+use devo_protocol::native::item::UserInput;
 
 pub(super) enum AcpSlashCommandPromptResult {
     NotCommand,
@@ -218,8 +218,10 @@ impl ServerRuntime {
         let legacy_response = self
             .handle_goal_status(
                 request_id.clone(),
-                serde_json::to_value(GoalStatusParams { session_id })
-                    .expect("serialize goal status params"),
+                serde_json::to_value(GoalStatusParams {
+                    session_id,
+                })
+                .expect("serialize goal status params"),
             )
             .await;
         let Ok(response) =
@@ -321,8 +323,10 @@ impl ServerRuntime {
         let legacy_response = self
             .handle_goal_clear(
                 request_id.clone(),
-                serde_json::to_value(GoalClearParams { session_id })
-                    .expect("serialize goal clear params"),
+                serde_json::to_value(GoalClearParams {
+                    session_id,
+                })
+                .expect("serialize goal clear params"),
             )
             .await;
         let Ok(response) =
@@ -484,16 +488,16 @@ fn input_items_from_argument_slash_prompt(
     argument: &str,
     prompt: &[AcpContentBlock],
     usage: &str,
-) -> Result<Vec<InputItem>, String> {
+) -> Result<Vec<UserInput>, String> {
     let mut input = Vec::new();
     let trimmed = argument.trim();
     if !trimmed.is_empty() {
-        input.push(InputItem::Text {
+        input.push(UserInput::Text {
             text: trimmed.to_string(),
         });
     }
     for block in prompt.iter().skip(1).cloned() {
-        input.extend(block.into_input_items()?);
+        input.extend(block.into_user_inputs()?);
     }
     if input.is_empty() {
         return Err(usage.to_string());
@@ -567,10 +571,10 @@ mod tests {
         assert_eq!(
             input,
             vec![
-                InputItem::Text {
+                UserInput::Text {
                     text: "desktop slash triggers".to_string()
                 },
-                InputItem::Text {
+                UserInput::Text {
                     text: "include footer chip behavior".to_string()
                 },
             ]

@@ -17,4 +17,5 @@ pub enum ToolHandlerKind {
     ExecCommand,
     WriteStdin,
     ToolSearch,
+    Ipython,
 }

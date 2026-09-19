@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use devo_protocol::SessionId;
 use tokio_util::sync::CancellationToken;
 
 use crate::contracts::ToolCallError;
@@ -38,7 +39,7 @@ pub enum ClientTextFileWrite {
 pub trait ClientFilesystem: Send + Sync {
     async fn read_text_file(
         self: Arc<Self>,
-        _session_id: String,
+        _session_id: SessionId,
         _path: PathBuf,
         _line: Option<u64>,
         _limit: Option<u64>,
@@ -49,7 +50,7 @@ pub trait ClientFilesystem: Send + Sync {
 
     async fn write_text_file(
         self: Arc<Self>,
-        _session_id: String,
+        _session_id: SessionId,
         _path: PathBuf,
         _content: String,
         _cancel_token: CancellationToken,

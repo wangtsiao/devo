@@ -28,10 +28,7 @@ impl HarnessDigestInjector {
 
     /// Best-effort load: missing or corrupt yields empty (caller may log).
     pub fn digest_or_empty(session_dir: &Path) -> String {
-        match Self::digest_for_session_dir(session_dir) {
-            Ok(digest) => digest,
-            Err(_) => String::new(),
-        }
+        Self::digest_for_session_dir(session_dir).unwrap_or_default()
     }
 }
 

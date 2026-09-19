@@ -19,8 +19,6 @@ use tokio::time::Duration;
 use tokio::time::timeout;
 
 use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
 use devo_core::SkillsConfig;
 use devo_core::tools::ToolCallError;
 use devo_core::tools::ToolRegistry;
@@ -41,12 +39,11 @@ use devo_protocol::StopReason;
 use devo_protocol::StreamEvent;
 use devo_protocol::Usage;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
 use devo_server::ClientTransportKind;
 use devo_server::ErrorResponse;
 use devo_server::ProtocolErrorCode;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
+use devo_server::test_support::TestRuntime;
 use devo_server::SkillRecord;
 use devo_server::SkillScope;
 use devo_server::SkillSource;
@@ -149,34 +146,23 @@ fn build_runtime_with_registry(
         .map(|root| root.join(".devo").join("skills"))
         .collect::<Vec<_>>();
     write_test_config(data_root, &user_skill_root, &workspace_skill_roots);
-    let db_path = data_root.join("test_skills.db");
-    let db = Arc::new(devo_server::db::Database::open(db_path).expect("open test database"));
-    ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            registry,
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                enabled: true,
-                user_roots: vec![user_skill_root],
-                workspace_roots: workspace_skill_roots,
-                watch_for_changes: false,
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                include_instructions: Some(true),
-                config: Vec::new(),
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(data_root.to_path_buf(), workspace_root.as_deref())
-                    .expect("load app config store"),
-            )),
-        ),
-    )
+    TestRuntime::new(provider)
+        .registry(registry)
+        .skills(SkillsConfig {
+            enabled: true,
+            user_roots: vec![user_skill_root],
+            workspace_roots: workspace_skill_roots,
+            watch_for_changes: false,
+            bundled: Some(BundledSkillsConfig { enabled: false }),
+            include_instructions: Some(true),
+            config: Vec::new(),
+        })
+        .config_store(Arc::new(Mutex::new(
+            AppConfigStore::load(data_root.to_path_buf(), workspace_root.as_deref())
+                .expect("load app config store"),
+        )))
+        .db_file("test_skills.db")
+        .runtime(data_root)
 }
 
 fn write_test_config(data_root: &Path, user_skill_root: &Path, workspace_skill_roots: &[PathBuf]) {
@@ -270,7 +256,7 @@ async fn start_session(
     let result: SuccessResponse<devo_protocol::native::rpc_session::SessionNewResult> =
         serde_json::from_value(response.clone())
             .with_context(|| format!("session/new response: {response}"))?;
-    let session_id = devo_core::SessionId::try_from(result.result.session.id.as_str())?;
+    let session_id = devo_core::SessionId::from(result.result.session.id.as_str());
     let title_response = runtime
         .handle_incoming(
             connection_id,
@@ -410,7 +396,8 @@ fn all_user_request_texts(request: &ModelRequest) -> Vec<String> {
                 RequestContent::ProviderReasoning { .. }
                 | RequestContent::ToolUse { .. }
                 | RequestContent::HostedToolUse { .. }
-                | RequestContent::ToolResult { .. } => None,
+                | RequestContent::ToolResult { .. }
+                | RequestContent::Image { .. } => None,
             })
         })
         .collect()
@@ -1097,14 +1084,36 @@ async fn turn_start_rejects_missing_skill_references() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn auto_review_approval_executes_mutating_tool_without_user_prompt() -> Result<()> {
+#[derive(Clone, Copy)]
+enum AutoReviewWait {
+    TurnCompleted,
+    UserApproval,
+}
+
+struct AutoReviewOutcome {
+    _temp_dir: TempDir,
+    provider: Arc<AutoReviewProvider>,
+    tool_calls: Arc<AtomicUsize>,
+    reviewer_calls: Arc<AtomicUsize>,
+}
+
+async fn run_auto_review(
+    risk: &'static str,
+    tool_input: impl FnOnce(&Path) -> serde_json::Value,
+    completion_failures: usize,
+    wait: AutoReviewWait,
+) -> Result<AutoReviewOutcome> {
     let temp_dir = TempDir::new()?;
     let user_skill_root = temp_dir.path().join("user-skills");
     let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tool_calls = Arc::new(AtomicUsize::new(0));
     let reviewer_calls = Arc::new(AtomicUsize::new(0));
-    let provider = AutoReviewProvider::new("low", json!({}), Arc::clone(&reviewer_calls), 0);
+    let provider = AutoReviewProvider::new(
+        risk,
+        tool_input(&workspace_root),
+        Arc::clone(&reviewer_calls),
+        completion_failures,
+    );
     let runtime = build_runtime_with_registry(
         temp_dir.path(),
         user_skill_root,
@@ -1115,17 +1124,45 @@ async fn auto_review_approval_executes_mutating_tool_without_user_prompt() -> Re
     let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
     let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
     update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
     start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_turn_completed(&mut notifications_rx).await?;
+    match wait {
+        AutoReviewWait::TurnCompleted => wait_for_turn_completed(&mut notifications_rx).await?,
+        AutoReviewWait::UserApproval => {
+            wait_for_approval_request(&mut notifications_rx).await?;
+        }
+    }
+    Ok(AutoReviewOutcome {
+        _temp_dir: temp_dir,
+        provider,
+        tool_calls,
+        reviewer_calls,
+    })
+}
 
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let stream_requests = provider
+fn assert_auto_review_counts(outcome: &AutoReviewOutcome, reviewers: usize, tools: usize) {
+    assert_eq!(
+        outcome
+            .reviewer_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        reviewers
+    );
+    assert_eq!(
+        outcome.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        tools
+    );
+}
+
+#[tokio::test]
+async fn auto_review_approval_executes_mutating_tool_without_user_prompt() -> Result<()> {
+    let outcome = run_auto_review("low", |_| json!({}), 0, AutoReviewWait::TurnCompleted).await?;
+    assert_auto_review_counts(&outcome, 1, 1);
+    let stream_requests = outcome
+        .provider
         .stream_requests
         .lock()
         .expect("stream request lock");
-    let completion_requests = provider
+    let completion_requests = outcome
+        .provider
         .completion_requests
         .lock()
         .expect("completion request lock");
@@ -1158,185 +1195,81 @@ async fn auto_review_approval_executes_mutating_tool_without_user_prompt() -> Re
 }
 
 /// Trace: L2-DES-SAFETY-002
-/// Verifies: explicit full sandbox escalation is routed through AutoReview.
 #[tokio::test]
-async fn auto_review_approval_executes_full_sandbox_escalation() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let user_skill_root = temp_dir.path().join("user-skills");
-    let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reviewer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runtime = build_runtime_with_registry(
-        temp_dir.path(),
-        user_skill_root,
-        Some(workspace_root.clone()),
-        AutoReviewProvider::new(
-            "medium",
-            json!({
-                "sandbox_permissions": "require_escalated"
-            }),
-            Arc::clone(&reviewer_calls),
-            0,
-        ),
-        auto_review_registry(Arc::clone(&tool_calls)),
-    );
-    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
-    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
-    update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
-    start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_turn_completed(&mut notifications_rx).await?;
-
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    Ok(())
-}
-
-/// Trace: L2-DES-SAFETY-002
-/// Verifies: Tier1 additional permissions are routed through AutoReview.
-#[tokio::test]
-async fn auto_review_approval_executes_additional_permissions_request() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let user_skill_root = temp_dir.path().join("user-skills");
-    let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reviewer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runtime = build_runtime_with_registry(
-        temp_dir.path(),
-        user_skill_root,
-        Some(workspace_root.clone()),
-        AutoReviewProvider::new(
-            "low",
-            json!({
-                "sandbox_permissions": "with_additional_permissions",
-                "additional_permissions": {
-                    "file_system": {
-                        "read": [workspace_root.join("external-input").display().to_string()]
-                    }
+async fn auto_review_executes_or_falls_back_by_risk() -> Result<()> {
+    struct Case {
+        risk: &'static str,
+        input: fn(&Path) -> serde_json::Value,
+        failures: usize,
+        wait: AutoReviewWait,
+        reviewers: usize,
+        tools: usize,
+    }
+    let empty = |_: &Path| json!({});
+    let escalated = |_: &Path| json!({ "sandbox_permissions": "require_escalated" });
+    let additional = |workspace: &Path| {
+        json!({
+            "sandbox_permissions": "with_additional_permissions",
+            "additional_permissions": {
+                "file_system": {
+                    "read": [workspace.join("external-input").display().to_string()]
                 }
-            }),
-            Arc::clone(&reviewer_calls),
-            0,
-        ),
-        auto_review_registry(Arc::clone(&tool_calls)),
-    );
-    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
-    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
-    update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
-    start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_turn_completed(&mut notifications_rx).await?;
-
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    Ok(())
-}
-
-#[tokio::test]
-async fn auto_review_high_risk_falls_back_to_user_approval() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let user_skill_root = temp_dir.path().join("user-skills");
-    let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reviewer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runtime = build_runtime_with_registry(
-        temp_dir.path(),
-        user_skill_root,
-        Some(workspace_root.clone()),
-        AutoReviewProvider::new("high", json!({}), Arc::clone(&reviewer_calls), 0),
-        auto_review_registry(Arc::clone(&tool_calls)),
-    );
-    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
-    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
-    update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
-    start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_approval_request(&mut notifications_rx).await?;
-
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn auto_review_medium_risk_executes_mutating_tool_without_user_prompt() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let user_skill_root = temp_dir.path().join("user-skills");
-    let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reviewer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runtime = build_runtime_with_registry(
-        temp_dir.path(),
-        user_skill_root,
-        Some(workspace_root.clone()),
-        AutoReviewProvider::new("medium", json!({}), Arc::clone(&reviewer_calls), 0),
-        auto_review_registry(Arc::clone(&tool_calls)),
-    );
-    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
-    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
-    update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
-    start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_turn_completed(&mut notifications_rx).await?;
-
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    Ok(())
-}
-
-/// Trace: L2-DES-SAFETY-002
-/// Verifies: provider failures retry once, then fall back to user approval.
-#[tokio::test]
-async fn auto_review_provider_failure_retries_once_then_falls_back() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let user_skill_root = temp_dir.path().join("user-skills");
-    let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reviewer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runtime = build_runtime_with_registry(
-        temp_dir.path(),
-        user_skill_root,
-        Some(workspace_root.clone()),
-        AutoReviewProvider::new("low", json!({}), Arc::clone(&reviewer_calls), 2),
-        auto_review_registry(Arc::clone(&tool_calls)),
-    );
-    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
-    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
-    update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
-    start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_approval_request(&mut notifications_rx).await?;
-
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    Ok(())
-}
-
-/// Trace: L2-DES-SAFETY-002
-/// Verifies: invalid reviewer output falls back to user approval.
-#[tokio::test]
-async fn auto_review_invalid_output_falls_back_to_user_approval() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let user_skill_root = temp_dir.path().join("user-skills");
-    let workspace_root = temp_dir.path().join("workspace");
-    let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reviewer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runtime = build_runtime_with_registry(
-        temp_dir.path(),
-        user_skill_root,
-        Some(workspace_root.clone()),
-        AutoReviewProvider::new("invalid", json!({}), Arc::clone(&reviewer_calls), 0),
-        auto_review_registry(Arc::clone(&tool_calls)),
-    );
-    let (connection_id, mut notifications_rx) = initialize_connection(&runtime).await?;
-    let session_id = start_session(&runtime, connection_id, &workspace_root).await?;
-    update_permissions_to_auto_review(&runtime, connection_id, session_id).await?;
-
-    start_auto_review_turn(&runtime, connection_id, session_id).await?;
-    wait_for_approval_request(&mut notifications_rx).await?;
-
-    assert_eq!(reviewer_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        })
+    };
+    for case in [
+        Case {
+            risk: "medium",
+            input: escalated,
+            failures: 0,
+            wait: AutoReviewWait::TurnCompleted,
+            reviewers: 1,
+            tools: 1,
+        },
+        Case {
+            risk: "low",
+            input: additional,
+            failures: 0,
+            wait: AutoReviewWait::TurnCompleted,
+            reviewers: 1,
+            tools: 1,
+        },
+        Case {
+            risk: "high",
+            input: empty,
+            failures: 0,
+            wait: AutoReviewWait::UserApproval,
+            reviewers: 1,
+            tools: 0,
+        },
+        Case {
+            risk: "medium",
+            input: empty,
+            failures: 0,
+            wait: AutoReviewWait::TurnCompleted,
+            reviewers: 1,
+            tools: 1,
+        },
+        Case {
+            risk: "low",
+            input: empty,
+            failures: 2,
+            wait: AutoReviewWait::UserApproval,
+            reviewers: 2,
+            tools: 0,
+        },
+        Case {
+            risk: "invalid",
+            input: empty,
+            failures: 0,
+            wait: AutoReviewWait::UserApproval,
+            reviewers: 1,
+            tools: 0,
+        },
+    ] {
+        let outcome = run_auto_review(case.risk, case.input, case.failures, case.wait).await?;
+        assert_auto_review_counts(&outcome, case.reviewers, case.tools);
+    }
     Ok(())
 }
 
@@ -1416,53 +1349,34 @@ async fn turn_steer_injects_resolved_skill_into_next_model_request() -> Result<(
         .await
         .context("timed out waiting for blocking tool to start")?;
 
-    // Native flow: push the input onto the busy session queue, then
-    // promote the queued entry into the running turn as a steer.
-    let push_response = runtime
-        .handle_incoming(
-            connection_id,
-            serde_json::json!({
-                "id": 9,
-                "method": "session/queue/push",
-                "params": {
-                    "sessionId": session_id,
-                    "input": [
-                        { "type": "text", "text": "Apply this steer now." },
-                        { "type": "skill", "name": "steer-rust" }
-                    ],
-                    "idempotencyKey": "steer-skill-push"
-                }
-            }),
-        )
-        .await
-        .context("session/queue/push response")?;
-    let push_result: SuccessResponse<devo_protocol::native::rpc_turn::SessionQueuePushResult> =
-        serde_json::from_value(push_response.clone())
-            .with_context(|| format!("push_response: {push_response}"))?;
-    let devo_protocol::native::rpc_turn::SessionQueuePushResult::Queued { entry } =
-        push_result.result
-    else {
-        panic!("busy push must queue");
-    };
-
+    // Native flow: inject steer input directly into the running turn.
     let steer_response = runtime
         .handle_incoming(
             connection_id,
             serde_json::json!({
                 "id": 10,
-                "method": "session/queue/steer",
+                "method": "turn/steer",
                 "params": {
                     "sessionId": session_id,
-                    "queueItemId": entry.queue_item_id.as_str(),
-                    "expectedTurnId": start_turn_id.to_string()
+                    "expectedTurnId": start_turn_id.to_string(),
+                    "input": [
+                        { "type": "text", "text": "Apply this steer now." },
+                        { "type": "skill", "name": "steer-rust" }
+                    ],
+                    "idempotencyKey": "steer-skill"
                 }
             }),
         )
         .await
-        .context("session/queue/steer response")?;
-    let steer_result: SuccessResponse<devo_protocol::native::rpc_turn::SessionQueueSteerResult> =
+        .context("turn/steer response")?;
+    let steer_result: SuccessResponse<devo_protocol::native::rpc_turn::TurnSteerResult> =
         serde_json::from_value(steer_response)?;
-    assert!(!steer_result.result.item_id.as_str().is_empty());
+    let devo_protocol::native::rpc_turn::TurnSteerResult::Injected { item_id } =
+        steer_result.result
+    else {
+        panic!("expected Injected steer");
+    };
+    assert!(!item_id.as_str().is_empty());
 
     release.notify_one();
     wait_for_turn_completed(&mut notifications_rx).await?;

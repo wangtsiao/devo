@@ -424,7 +424,8 @@ async fn wait_agent_preserves_full_child_report_for_parent_model() -> Result<()>
             | devo_protocol::RequestContent::Reasoning { .. }
             | devo_protocol::RequestContent::ProviderReasoning { .. }
             | devo_protocol::RequestContent::ToolUse { .. }
-            | devo_protocol::RequestContent::HostedToolUse { .. } => None,
+            | devo_protocol::RequestContent::HostedToolUse { .. }
+            | devo_protocol::RequestContent::Image { .. } => None,
         })
         .context("expected wait_agent tool result in parent follow-up request")?;
 

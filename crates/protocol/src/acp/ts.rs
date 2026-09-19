@@ -179,19 +179,18 @@ pub fn generate_protocol_typescript() -> String {
     push_decl::<SessionId>(&cfg, &mut output);
     push_decl::<TurnId>(&cfg, &mut output);
     push_decl::<ItemId>(&cfg, &mut output);
-    push_decl::<PendingInputId>(&cfg, &mut output);
+    push_decl::<QueueItemId>(&cfg, &mut output);
 
     push_decl::<SessionTitleState>(&cfg, &mut output);
     push_decl::<SessionTitleFinalSource>(&cfg, &mut output);
     push_decl::<TurnStatus>(&cfg, &mut output);
     push_decl::<TurnUsage>(&cfg, &mut output);
-    push_decl::<ProviderRetryPhase>(&cfg, &mut output);
-    push_decl::<TurnProviderRetryStatusPayload>(&cfg, &mut output);
-    push_decl::<TurnErrorPayload>(&cfg, &mut output);
+    push_decl::<crate::native::event::ModelQueryRetryPhase>(&cfg, &mut output);
     push_decl::<TurnFailedPayload>(&cfg, &mut output);
     push_decl::<StopReason>(&cfg, &mut output);
     push_decl::<ParsedCommand>(&cfg, &mut output);
-    push_decl::<FileChange>(&cfg, &mut output);
+    push_decl::<native::item::FileChangeEntry>(&cfg, &mut output);
+    push_decl::<native::item::FileChangeKind>(&cfg, &mut output);
 
     push_decl::<ReasoningEffort>(&cfg, &mut output);
     push_decl::<crate::ReasoningLevelChoice>(&cfg, &mut output);
@@ -200,18 +199,11 @@ pub fn generate_protocol_typescript() -> String {
     push_decl::<ReasoningVariantConfig>(&cfg, &mut output);
     push_decl::<ReasoningVariant>(&cfg, &mut output);
 
-    push_decl::<SessionRuntimeStatus>(&cfg, &mut output);
-    push_decl::<SessionMetadata>(&cfg, &mut output);
     push_decl::<SessionStartParams>(&cfg, &mut output);
     push_decl::<SessionStartResult>(&cfg, &mut output);
     push_decl::<SessionResumeParams>(&cfg, &mut output);
     push_decl::<SessionResumeResult>(&cfg, &mut output);
-    push_decl::<SessionHistoryItemKind>(&cfg, &mut output);
-    push_decl::<SessionPlanStepStatus>(&cfg, &mut output);
-    push_decl::<SessionPlanStep>(&cfg, &mut output);
-    push_decl::<SessionHistoryMetadata>(&cfg, &mut output);
-    push_decl::<SessionHistoryToolIo>(&cfg, &mut output);
-    push_decl::<SessionHistoryItem>(&cfg, &mut output);
+    push_decl::<SessionHistoryEntry>(&cfg, &mut output);
     push_decl::<native::rpc_session::SessionForkCut>(&cfg, &mut output);
     push_decl::<native::model::ModelBinding>(&cfg, &mut output);
     push_decl::<native::model::PermissionProfile>(&cfg, &mut output);
@@ -246,9 +238,9 @@ export type SubscriptionUpdateParams = { subscriptionId: SubscriptionId, selecto
 export type SubscriptionAckParams = { subscriptionId: SubscriptionId, cursors: Array<EventCursor>, };\n\n\
 export type SubscriptionUnsubscribeParams = { subscriptionId: SubscriptionId, };\n\n",
     );
-    push_decl::<TurnMetadata>(&cfg, &mut output);
     push_decl::<TurnFailureReason>(&cfg, &mut output);
-    push_decl::<InputItem>(&cfg, &mut output);
+    push_decl::<native::item::UserInput>(&cfg, &mut output);
+    push_decl::<native::item::ImageDetail>(&cfg, &mut output);
     push_decl::<CollaborationMode>(&cfg, &mut output);
     push_decl::<TurnExecutionMode>(&cfg, &mut output);
     push_decl::<TurnStartParams>(&cfg, &mut output);
@@ -283,15 +275,15 @@ export type SubscriptionUnsubscribeParams = { subscriptionId: SubscriptionId, };
     push_decl::<WorkspaceChangedFile>(&cfg, &mut output);
     push_decl::<WorkspaceChangeStats>(&cfg, &mut output);
     push_decl::<WorkspaceChangeView>(&cfg, &mut output);
-    push_decl::<WorkspaceChangesReadParams>(&cfg, &mut output);
-    push_decl::<WorkspaceChangesReadResult>(&cfg, &mut output);
-    push_decl::<WorkspaceChangesUpdatedPayload>(&cfg, &mut output);
+    push_decl::<native::rpc_workspace::WorkspaceChangesReadParams>(&cfg, &mut output);
+    push_decl::<native::rpc_workspace::WorkspaceChangesReadResult>(&cfg, &mut output);
+    push_decl::<native::event::WorkspaceChangeStatsNotification>(&cfg, &mut output);
+    push_decl::<native::event::WorkspaceChangesUpdatedNotification>(&cfg, &mut output);
 
     push_decl::<ApprovalResponseParams>(&cfg, &mut output);
     push_decl::<ApprovalDecisionValue>(&cfg, &mut output);
     push_decl::<ApprovalScopeValue>(&cfg, &mut output);
     push_decl::<PermissionPreset>(&cfg, &mut output);
-    push_decl::<SessionEffectiveContextWindowUpdatedPayload>(&cfg, &mut output);
 
     push_decl::<SkillRecord>(&cfg, &mut output);
     push_decl::<SkillSource>(&cfg, &mut output);
@@ -362,6 +354,7 @@ export type SubscriptionUnsubscribeParams = { subscriptionId: SubscriptionId, };
     push_decl::<native::rpc_search::SearchSnapshot>(&cfg, &mut output);
     push_decl::<native::rpc_search::SearchResult>(&cfg, &mut output);
     push_decl::<native::rpc_search::SearchResultKind>(&cfg, &mut output);
+    push_decl::<native::rpc_search::SearchFailedPayload>(&cfg, &mut output);
 
     push_decl::<AgentToolPolicy>(&cfg, &mut output);
     push_decl::<SpawnAgentParams>(&cfg, &mut output);
@@ -876,7 +869,6 @@ fn register_devo_protocol_schemas(
 ) {
     schema::<SessionStartParams>(schemas);
     schema::<SessionStartResult>(schemas);
-    schema::<SessionEffectiveContextWindowUpdatedPayload>(schemas);
     schema::<SessionResumeParams>(schemas);
     schema::<SessionResumeResult>(schemas);
     schema::<native::rpc_session::SessionForkCut>(schemas);
@@ -916,9 +908,10 @@ fn register_devo_protocol_schemas(
     schema::<native::rpc_session::SessionInterruptScope>(schemas);
     schema::<native::rpc_session::SessionInterruptParams>(schemas);
     schema::<native::rpc_session::SessionInterruptResult>(schemas);
-    schema::<WorkspaceChangesReadParams>(schemas);
-    schema::<WorkspaceChangesReadResult>(schemas);
-    schema::<WorkspaceChangesUpdatedPayload>(schemas);
+    schema::<native::rpc_workspace::WorkspaceChangesReadParams>(schemas);
+    schema::<native::rpc_workspace::WorkspaceChangesReadResult>(schemas);
+    schema::<native::event::WorkspaceChangeStatsNotification>(schemas);
+    schema::<native::event::WorkspaceChangesUpdatedNotification>(schemas);
     schema::<native::item::Item>(schemas);
     schema::<native::methods::UserInputRespondParams>(schemas);
     schema::<native::rpc_search::SearchStartParams>(schemas);
@@ -930,6 +923,7 @@ fn register_devo_protocol_schemas(
     schema::<native::rpc_search::SearchSnapshot>(schemas);
     schema::<native::rpc_search::SearchResult>(schemas);
     schema::<native::rpc_search::SearchResultKind>(schemas);
+    schema::<native::rpc_search::SearchFailedPayload>(schemas);
     schema::<SpawnAgentParams>(schemas);
     schema::<SpawnAgentResult>(schemas);
     schema::<AgentMessageParams>(schemas);
@@ -977,14 +971,6 @@ fn register_devo_protocol_schemas(
             ..MethodSchemaBinding::default()
         },
     );
-    method(
-        methods,
-        "session/effective_context_window/updated",
-        MethodSchemaBinding {
-            incoming_notification: Some("SessionEffectiveContextWindowUpdatedPayload"),
-            ..MethodSchemaBinding::default()
-        },
-    );
     native_method::<SessionResumeParams, SessionResumeResult>(methods, "session/resume");
     native_method::<native::rpc_session::SessionForkParams, native::rpc_session::SessionForkResult>(
         methods,
@@ -1016,15 +1002,15 @@ fn register_devo_protocol_schemas(
         native::rpc_session::SessionInterruptParams,
         native::rpc_session::SessionInterruptResult,
     >(methods, "session/interrupt");
-    native_method::<WorkspaceChangesReadParams, WorkspaceChangesReadResult>(
-        methods,
-        "workspace/changes/read",
-    );
+    native_method::<
+        native::rpc_workspace::WorkspaceChangesReadParams,
+        native::rpc_workspace::WorkspaceChangesReadResult,
+    >(methods, "workspace/changes/read");
     method(
         methods,
         "workspace/changes/updated",
         MethodSchemaBinding {
-            incoming_notification: Some("WorkspaceChangesUpdatedPayload"),
+            incoming_notification: Some("WorkspaceChangesUpdatedNotification"),
             ..MethodSchemaBinding::default()
         },
     );

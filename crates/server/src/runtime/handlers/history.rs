@@ -134,24 +134,23 @@ impl ServerRuntime {
         &self,
         session_id: &devo_protocol::native::ids::SessionId,
     ) -> Option<PathBuf> {
-        let legacy_id = SessionId::try_from(session_id.as_str()).ok()?;
-        if let Ok(Some(index)) = self.deps.db.get_session_index(&legacy_id)
+        if let Ok(Some(index)) = self.deps.db.get_session_index(session_id)
             && let Some(path) = index.rollout_path
         {
             return Some(path);
         }
         if let Some(path) = self
             .rollout_store
-            .find_rollout_by_session_id(&legacy_id)
+            .find_rollout_by_session_id(session_id)
             .ok()
             .flatten()
         {
             return Some(path);
         }
-        if let Some(handle) = self.session(legacy_id).await
-            && let Some(record) = handle.record().await.flatten()
+        if let Some(handle) = self.session(*session_id).await
+            && let Some(path) = handle.rollout_path().await.flatten()
         {
-            return Some(record.rollout_path);
+            return Some(path);
         }
         None
     }

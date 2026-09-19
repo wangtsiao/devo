@@ -6,9 +6,10 @@
 //! crash recovery only ever *re-derives* the same rows (idempotent by source
 //! fact) — a crash may delay an event, never lose or duplicate it.
 //!
-//! Only v2 lines produce events: legacy lines are first projected forward by
-//! `LegacyProjector` during hydration/reconciliation, so all log rows come
-//! from v2 facts.
+//! Only v2 lines produce events: migrate/fixture tooling may project legacy
+//! lines forward via [`super::legacy_rollout_migrate::project_legacy_line`]
+//! (using [`super::RolloutWriteState`]); the live path appends Native v2 and
+//! observes — all log rows come from v2 facts.
 
 use sha2::Digest;
 use sha2::Sha256;
@@ -111,7 +112,7 @@ pub fn events_from_v2_line(line: &RolloutLineV2) -> Vec<DerivedEvent> {
         RolloutLineV2::Turn { turn, .. } => {
             let stream_id = session_stream_id(&turn.session_id);
             let (event_kind, notification) = match turn.status {
-                TurnStatus::InProgress => (
+                TurnStatus::InProgress | TurnStatus::WaitingApproval => (
                     "turn/started",
                     ServerNotification::TurnStarted {
                         turn: Box::new(turn.clone()),
@@ -232,6 +233,7 @@ mod tests {
                 }],
                 entry: UserMessageEntry::TurnStart,
             },
+            parent_id: None,
         }
     }
 

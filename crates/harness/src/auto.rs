@@ -40,8 +40,7 @@ pub fn should_auto_refine(
         return false;
     }
     let interval = settings.turn_interval.max(1);
-    successful_user_visible_turns_since > 0
-        && successful_user_visible_turns_since % interval == 0
+    successful_user_visible_turns_since > 0 && successful_user_visible_turns_since.is_multiple_of(interval)
 }
 
 #[cfg(test)]

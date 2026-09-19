@@ -20,9 +20,9 @@ static PENDING_COMPACTS: LazyLock<Mutex<HashMap<String, PendingCompact>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by post-MergeTurn compact-before-refine (next wire-up)
 pub(crate) struct PendingCompact {
     pub instructions: Option<String>,
+    #[allow(dead_code)] // telemetry / future digest strip timing
     pub requested_at: chrono::DateTime<Utc>,
 }
 
@@ -78,9 +78,8 @@ pub fn compact_status_from_occupancy(
         };
     };
     let tokens = Some(occupancy.total_tokens);
-    let percent = context_window.map(|window| {
-        (occupancy.total_tokens as f64 / window as f64) * 100.0
-    });
+    let percent =
+        context_window.map(|window| (occupancy.total_tokens as f64 / window as f64) * 100.0);
     CompactStatus {
         tokens,
         context_window,
@@ -106,7 +105,6 @@ pub(crate) fn peek_pending_compact(session_id: &SessionId) -> bool {
         .contains_key(session_id.as_str())
 }
 
-#[allow(dead_code)] // turn-end consumer
 pub(crate) fn take_pending_compact(session_id: &SessionId) -> Option<PendingCompact> {
     PENDING_COMPACTS
         .lock()
@@ -134,8 +132,7 @@ pub fn schedule_compact_run(
             scheduled: false,
             note: None,
             reason: Some(
-                "no active turn; compaction can only be requested while a turn is running"
-                    .into(),
+                "no active turn; compaction can only be requested while a turn is running".into(),
             ),
         };
     }
@@ -182,12 +179,8 @@ mod tests {
     #[test]
     fn status_shape_from_occupancy() {
         let occupancy = ContextOccupancy::from_category_tokens(
-            /*context_window_tokens*/ 100_000,
-            /*base*/ 10_000,
-            /*skills*/ 0,
-            /*tools_builtin*/ 0,
-            /*tools_mcp*/ 0,
-            /*conversation*/ 40_000,
+            /*context_window_tokens*/ 100_000, /*base*/ 10_000, /*skills*/ 0,
+            /*tools_builtin*/ 0, /*tools_mcp*/ 0, /*conversation*/ 40_000,
         );
         let status = compact_status_from_occupancy(Some(&occupancy), false, true);
         assert_eq!(

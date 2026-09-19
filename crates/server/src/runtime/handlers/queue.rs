@@ -7,26 +7,19 @@
 
 use std::collections::VecDeque;
 
-use devo_core::{
-    CollaborationMode, InputItem, PendingInputId, PendingInputItem, PendingInputKind,
-    TurnExecutionMode,
-};
+use devo_core::{CollaborationMode, PendingInputItem, PendingInputKind, TurnExecutionMode};
 use devo_protocol::native::event::ServerNotification;
 use devo_protocol::native::ids::{
-    ItemId as NativeItemId, QueueItemId, SessionId as NativeSessionId, TurnId as NativeTurnId,
+    QueueItemId, SessionId as NativeSessionId, TurnId as NativeTurnId,
 };
 use devo_protocol::native::item::UserInput;
-use devo_protocol::native::model::ModelBinding;
 use devo_protocol::native::queue::{QueueChange, QueueEntry};
 use devo_protocol::native::rpc_turn::{
     SessionQueueListResult, SessionQueuePushParams, SessionQueuePushResult,
-    SessionQueueRemoveResult, SessionQueueSteerParams, SessionQueueSteerResult,
-    SessionQueueUpdateParams, SessionQueueUpdateResult,
+    SessionQueueRemoveResult, SessionQueueUpdateParams, SessionQueueUpdateResult, TurnSteerParams,
+    TurnSteerResult,
 };
-use devo_protocol::native::turn::{
-    Turn as NativeTurn, TurnKind as NativeTurnKind, TurnStatus as NativeTurnStatus,
-};
-use uuid::Uuid;
+use devo_protocol::native::turn::Turn as NativeTurn;
 
 use super::super::*;
 
@@ -47,7 +40,7 @@ impl ServerRuntime {
                 );
             }
         };
-        let input_items = match legacy_input_items(&params.input) {
+        let input_items = match normalize_user_inputs(&params.input) {
             Ok(items) => items,
             Err(message) => {
                 return self.error_response(request_id, ProtocolErrorCode::InvalidParams, message);
@@ -60,13 +53,7 @@ impl ServerRuntime {
                 "queue push input is empty",
             );
         }
-        let Ok(legacy_session_id) = SessionId::try_from(params.session_id.as_str()) else {
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::InvalidParams,
-                "invalid session id",
-            );
-        };
+        let legacy_session_id = params.session_id;
 
         // Idle vs busy is decided by the shared admission path: it starts a
         // new turn when the session is idle and queues otherwise. The
@@ -143,9 +130,7 @@ impl ServerRuntime {
                 // queue truth immediately after). `enqueued_at` is
                 // approximate.
                 let entry = QueueEntry {
-                    queue_item_id: QueueItemId::from_legacy_uuid(
-                        Uuid::parse_str(&queued_id).expect("queued_input_id is a uuid"),
-                    ),
+                    queue_item_id: QueueItemId::from_string(queued_id.clone()),
                     position,
                     input: params.input.clone(),
                     preview: params
@@ -168,7 +153,7 @@ impl ServerRuntime {
                 self.broadcast_queue_updated(
                     legacy_session_id,
                     QueueChange::Added,
-                    entry.queue_item_id.clone(),
+                    entry.queue_item_id,
                     None,
                 )
                 .await;
@@ -204,13 +189,7 @@ impl ServerRuntime {
                     );
                 }
             };
-        let Ok(legacy_session_id) = SessionId::try_from(params.session_id.as_str()) else {
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::InvalidParams,
-                "invalid session id",
-            );
-        };
+        let legacy_session_id = params.session_id;
         let Some(reservation) = self
             .session_turn_reservation_snapshot(legacy_session_id)
             .await
@@ -249,13 +228,7 @@ impl ServerRuntime {
                 );
             }
         };
-        let Ok(legacy_session_id) = SessionId::try_from(params.session_id.as_str()) else {
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::InvalidParams,
-                "invalid session id",
-            );
-        };
+        let legacy_session_id = params.session_id;
         let Some(reservation) = self
             .session_turn_reservation_snapshot(legacy_session_id)
             .await
@@ -266,23 +239,13 @@ impl ServerRuntime {
                 "session does not exist",
             );
         };
-        let queue_item_uuid = match Uuid::parse_str(params.queue_item_id.as_str()) {
-            Ok(uuid) => uuid,
-            Err(_) => {
-                return self.error_response(
-                    request_id,
-                    ProtocolErrorCode::InvalidParams,
-                    "invalid queueItemId",
-                );
-            }
-        };
-        let pending_id = PendingInputId::from(queue_item_uuid);
+        let pending_id = params.queue_item_id;
 
         // Resolve the replacement input up front (skill resolution can
         // fail before any state changes).
         let new_kind = match &params.input {
             Some(input) => {
-                let input_items = match legacy_input_items(input) {
+                let input_items = match normalize_user_inputs(input) {
                     Ok(items) => items,
                     Err(message) => {
                         return self.error_response(
@@ -327,6 +290,7 @@ impl ServerRuntime {
                     display_text,
                     prompt_text: resolved.prompt_text,
                     prompt_messages: resolved.prompt_messages,
+                    prompt_images: resolved.images,
                 })
             }
             None => None,
@@ -384,7 +348,7 @@ impl ServerRuntime {
                 );
             }
             if params.position.is_some() {
-                let ordered_ids: Vec<PendingInputId> = ordered.iter().map(|item| item.id).collect();
+                let ordered_ids: Vec<QueueItemId> = ordered.iter().map(|item| item.id).collect();
                 if let Err(error) = self.deps.db.set_pending_positions(
                     &legacy_session_id,
                     QueueType::Turn,
@@ -402,7 +366,7 @@ impl ServerRuntime {
         self.broadcast_queue_updated(
             legacy_session_id,
             QueueChange::Updated,
-            entry.queue_item_id.clone(),
+            entry.queue_item_id,
             None,
         )
         .await;
@@ -429,24 +393,8 @@ impl ServerRuntime {
                     );
                 }
             };
-        let Ok(legacy_session_id) = SessionId::try_from(params.session_id.as_str()) else {
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::InvalidParams,
-                "invalid session id",
-            );
-        };
-        let queue_item_uuid = match Uuid::parse_str(params.queue_item_id.as_str()) {
-            Ok(uuid) => uuid,
-            Err(_) => {
-                return self.error_response(
-                    request_id,
-                    ProtocolErrorCode::InvalidParams,
-                    "invalid queueItemId",
-                );
-            }
-        };
-        let pending_id = PendingInputId::from(queue_item_uuid);
+        let legacy_session_id = params.session_id;
+        let pending_id = params.queue_item_id;
         // Remove through the shared queue mutex (01 §4.3 last-write-wins),
         // not an actor command: queue ops must stay zero-hop at decision points.
         let Some(reservation) = self
@@ -495,7 +443,7 @@ impl ServerRuntime {
         self.broadcast_queue_updated(
             legacy_session_id,
             QueueChange::Removed,
-            params.queue_item_id.clone(),
+            params.queue_item_id,
             None,
         )
         .await;
@@ -506,40 +454,46 @@ impl ServerRuntime {
         .expect("serialize session/queue/remove response")
     }
 
-    pub(crate) async fn handle_session_queue_steer(
+    /// Native `turn/steer`: inject raw input into the active turn. If the turn
+    /// ended before admission, degrade into `pending_turn_queue` (never lose
+    /// the message) and return `DegradedToQueue`.
+    pub(crate) async fn handle_turn_steer(
         self: &Arc<Self>,
         connection_id: u64,
         request_id: serde_json::Value,
         params: serde_json::Value,
     ) -> serde_json::Value {
-        let params: SessionQueueSteerParams = match serde_json::from_value(params) {
+        let params: TurnSteerParams = match serde_json::from_value(params) {
             Ok(params) => params,
             Err(error) => {
                 return self.error_response(
                     request_id,
                     ProtocolErrorCode::InvalidParams,
-                    format!("invalid session/queue/steer params: {error}"),
+                    format!("invalid turn/steer params: {error}"),
                 );
             }
         };
-        let Ok(legacy_session_id) = SessionId::try_from(params.session_id.as_str()) else {
+        let input_items = match normalize_user_inputs(&params.input) {
+            Ok(items) => items,
+            Err(message) => {
+                return self.error_response(request_id, ProtocolErrorCode::InvalidParams, message);
+            }
+        };
+        if input_items.is_empty() {
             return self.error_response(
                 request_id,
-                ProtocolErrorCode::InvalidParams,
-                "invalid session id",
+                ProtocolErrorCode::EmptyInput,
+                "turn/steer input is empty",
+            );
+        }
+        let Some(display_input) = crate::runtime::items::render_input_items(&input_items) else {
+            return self.error_response(
+                request_id,
+                ProtocolErrorCode::EmptyInput,
+                "turn/steer input is empty",
             );
         };
-        let queue_item_uuid = match Uuid::parse_str(params.queue_item_id.as_str()) {
-            Ok(uuid) => uuid,
-            Err(_) => {
-                return self.error_response(
-                    request_id,
-                    ProtocolErrorCode::InvalidParams,
-                    "invalid queueItemId",
-                );
-            }
-        };
-        let pending_id = PendingInputId::from(queue_item_uuid);
+        let legacy_session_id = params.session_id;
         let Some(reservation) = self
             .session_turn_reservation_snapshot(legacy_session_id)
             .await
@@ -550,76 +504,88 @@ impl ServerRuntime {
                 "session does not exist",
             );
         };
-        let Some(active_turn) = reservation.active_turn.as_ref() else {
-            // The race-safe outcome: the turn is over, the entry simply
-            // stays queued — the message is never lost.
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::ActiveTurnNotSteerable,
-                "turn already ended; the entry remains queued",
-            );
+        let workspace_root = reservation.summary.cwd.clone();
+        let resolved_input = match reservation
+            .runtime_context
+            .resolve_input_items(&input_items, Some(workspace_root.as_path()))
+        {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return self.error_response(
+                    request_id,
+                    ProtocolErrorCode::EmptyInput,
+                    "turn/steer input is empty",
+                );
+            }
+            Err(error) => {
+                let code = match error {
+                    devo_core::SkillError::SkillNotFound { .. }
+                    | devo_core::SkillError::AmbiguousSkillName { .. }
+                    | devo_core::SkillError::SkillDisabled { .. } => {
+                        ProtocolErrorCode::InvalidParams
+                    }
+                    devo_core::SkillError::SkillParseFailed { .. }
+                    | devo_core::SkillError::SkillRootUnavailable { .. }
+                    | devo_core::SkillError::DuplicateSkillId { .. } => {
+                        ProtocolErrorCode::InternalError
+                    }
+                };
+                return self.error_response(
+                    request_id,
+                    code,
+                    format!("failed to resolve turn/steer input: {error}"),
+                );
+            }
         };
-        if active_turn.turn_id.to_string() != params.expected_turn_id.as_str() {
+
+        let now = chrono::Utc::now();
+        let item = PendingInputItem::new(
+            PendingInputKind::UserInput {
+                input: input_items.clone(),
+                display_text: display_input.clone(),
+                prompt_text: resolved_input.prompt_text.clone(),
+                prompt_messages: resolved_input.prompt_messages.clone(),
+                prompt_images: resolved_input.images.clone(),
+            },
+            None,
+            now,
+        );
+
+        let Some(active_turn) = reservation.active_turn.as_ref() else {
+            return self
+                .degrade_steer_to_queue(
+                    request_id,
+                    legacy_session_id,
+                    &reservation,
+                    item,
+                    reservation.ephemeral,
+                )
+                .await;
+        };
+        if active_turn.turn_id().to_string() != params.expected_turn_id.as_str() {
             return self.error_response(
                 request_id,
                 ProtocolErrorCode::ExpectedTurnMismatch,
                 "active turn did not match expectedTurnId",
             );
         }
-        if active_turn.kind != devo_core::TurnKind::Regular {
+        if active_turn.native.kind != devo_protocol::native::turn::TurnKind::Regular {
             return self.error_response(
                 request_id,
                 ProtocolErrorCode::ActiveTurnNotSteerable,
                 "cannot steer a non-regular turn",
             );
         }
-        let turn_id = active_turn.turn_id;
-
-        let (display_input, item) = {
-            let mut queue = reservation
-                .pending_turn_queue
-                .lock()
-                .expect("pending turn queue mutex should not be poisoned");
-            let Some(index) = queue.iter().position(|item| item.id == pending_id) else {
-                return self.error_response(
-                    request_id,
-                    ProtocolErrorCode::QueueItemNotFound,
-                    "queue item is no longer queued",
-                );
-            };
-            let display_input = match &queue[index].kind {
-                PendingInputKind::UserText { text } => text.clone(),
-                PendingInputKind::UserInput { display_text, .. } => display_text.clone(),
-                _ => {
-                    return self.error_response(
-                        request_id,
-                        ProtocolErrorCode::InvalidParams,
-                        "queued input cannot be steered",
-                    );
-                }
-            };
-            let item = queue.remove(index).expect("index just validated");
-            (display_input, item)
-        };
+        let native_session_id = reservation.summary.native.id;
+        let native_turn_id = *active_turn.native_turn_id();
 
         reservation
             .steer_input_queue
             .lock()
             .expect("steer input queue mutex should not be poisoned")
             .push_back(item.clone());
-        if !reservation.ephemeral {
-            if let Err(error) =
-                self.deps
-                    .db
-                    .remove_pending_by_id(&legacy_session_id, QueueType::Turn, &pending_id)
-            {
-                tracing::warn!(
-                    session_id = %legacy_session_id,
-                    error = %error,
-                    "failed to remove promoted entry from database"
-                );
-            }
-            if let Err(error) =
+        if !reservation.ephemeral
+            && let Err(error) =
                 self.deps
                     .db
                     .push_pending(&legacy_session_id, QueueType::Steer, &item)
@@ -627,58 +593,119 @@ impl ServerRuntime {
                 tracing::warn!(
                     session_id = %legacy_session_id,
                     error = %error,
-                    "failed to persist promoted entry to database"
+                    "failed to persist steer input to database"
                 );
             }
-        }
 
-        // Materialize the user message with entry=steer (the legacy
-        // SteerInput payload carries that through the projectors).
+        let native_item = crate::runtime::items::native_user_message_item(
+            display_input,
+            &[],
+            devo_protocol::native::item::UserMessageEntry::Steer,
+        );
         let (item_id, item_seq) = self
-            .start_item(
-                legacy_session_id,
-                turn_id,
-                ItemKind::UserMessage,
-                serde_json::json!({ "title": "You", "text": display_input.clone() }),
-            )
+            .start_native_item(native_session_id, native_turn_id, native_item.clone())
             .await;
-        self.complete_item(
-            legacy_session_id,
-            turn_id,
+        self.complete_native_item(
+            native_session_id,
+            native_turn_id,
             item_id,
             item_seq,
-            ItemKind::UserMessage,
-            TurnItem::SteerInput(TextItem {
-                text: display_input.clone(),
-            }),
-            serde_json::json!({ "title": "You", "text": display_input }),
+            native_item,
         )
         .await;
 
-        self.broadcast_queue_updated(
-            legacy_session_id,
-            QueueChange::Promoted,
-            params.queue_item_id.clone(),
-            None,
-        )
-        .await;
-        self.emit_to_connection(
+        self.emit_notification_to_connection(
             connection_id,
-            "serverRequest/resolved",
-            ServerEvent::ServerRequestResolved(ServerRequestResolvedPayload {
+            ServerNotification::ServerRequestResolved {
                 session_id: legacy_session_id,
-                request_id: "queued-steer-accepted".into(),
-                turn_id: Some(turn_id),
-            }),
+                request_id: "turn-steer-accepted".to_string(),
+                turn_id: Some(native_turn_id),
+            },
         )
         .await;
         serde_json::to_value(SuccessResponse {
             id: request_id,
-            result: SessionQueueSteerResult {
-                item_id: NativeItemId::from_legacy_uuid(Uuid::from(item_id)),
-            },
+            result: TurnSteerResult::Injected { item_id },
         })
-        .expect("serialize session/queue/steer response")
+        .expect("serialize turn/steer response")
+    }
+
+    async fn degrade_steer_to_queue(
+        &self,
+        request_id: serde_json::Value,
+        legacy_session_id: SessionId,
+        reservation: &crate::runtime::session_actor::snapshots::TurnReservationSnapshot,
+        item: PendingInputItem,
+        ephemeral: bool,
+    ) -> serde_json::Value {
+        reservation
+            .pending_turn_queue
+            .lock()
+            .expect("pending turn queue mutex should not be poisoned")
+            .push_back(item.clone());
+        if !ephemeral
+            && let Err(error) =
+                self.deps
+                    .db
+                    .push_pending(&legacy_session_id, QueueType::Turn, &item)
+            {
+                tracing::warn!(
+                    session_id = %legacy_session_id,
+                    error = %error,
+                    "failed to persist degraded steer to database"
+                );
+            }
+        let entries = native_queue_entries(
+            &reservation
+                .pending_turn_queue
+                .lock()
+                .expect("pending turn queue mutex should not be poisoned"),
+        );
+        let entry = entries
+            .iter()
+            .find(|entry| entry.queue_item_id == item.id)
+            .cloned()
+            .unwrap_or_else(|| QueueEntry {
+                queue_item_id: item.id,
+                position: entries.len().max(1) as u32,
+                input: match &item.kind {
+                    PendingInputKind::UserInput { input, .. } => input.clone(),
+                    PendingInputKind::UserText { text } => {
+                        vec![UserInput::Text { text: text.clone() }]
+                    }
+                    _ => Vec::new(),
+                },
+                preview: match &item.kind {
+                    PendingInputKind::UserInput { display_text, .. } => display_text
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(80)
+                        .collect(),
+                    PendingInputKind::UserText { text } => text
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(80)
+                        .collect(),
+                    _ => String::new(),
+                },
+                enqueued_at: item.created_at,
+            });
+        self.broadcast_queue_updated(
+            legacy_session_id,
+            QueueChange::Added,
+            entry.queue_item_id,
+            None,
+        )
+        .await;
+        serde_json::to_value(SuccessResponse {
+            id: request_id,
+            result: TurnSteerResult::DegradedToQueue { entry },
+        })
+        .expect("serialize turn/steer degraded response")
     }
 
     /// Broadcasts one canonical `queue/updated` notification to connections
@@ -755,10 +782,7 @@ impl ServerRuntime {
         queued_id: &str,
         client_user_message_id: &str,
     ) {
-        let Ok(uuid) = Uuid::parse_str(queued_id) else {
-            return;
-        };
-        let pending_id = PendingInputId::from(uuid);
+        let pending_id = QueueItemId::from_string(queued_id.to_string());
         if let Err(error) = self.deps.db.set_pending_metadata_field(
             &session_id,
             QueueType::Turn,
@@ -778,51 +802,36 @@ impl ServerRuntime {
     async fn active_native_turn(&self, session_id: SessionId) -> Option<NativeTurn> {
         let reservation = self.session_turn_reservation_snapshot(session_id).await?;
         let turn = reservation.active_turn.as_ref()?;
-        Some(native_turn_from_metadata(turn))
+        Some(turn.native.clone())
     }
 }
 
-/// Converts one canonical `UserInput` into the legacy `InputItem` the turn
-/// machinery consumes. Image/audio modalities have no legacy counterpart
-/// and are rejected (the design's `UNSUPPORTED_MODALITY` case).
-pub(crate) fn legacy_input_items(input: &[UserInput]) -> Result<Vec<InputItem>, String> {
-    let mut items = Vec::new();
+/// Normalize Native `UserInput` for turn/queue admission: decode Image
+/// data-URIs to LocalImage temp paths; reject unsupported audio.
+pub(crate) fn normalize_user_inputs(input: &[UserInput]) -> Result<Vec<UserInput>, String> {
+    let mut items = Vec::with_capacity(input.len());
     for part in input {
         let item = match part {
-            UserInput::Text { text } => InputItem::Text { text: text.clone() },
-            UserInput::Skill { name } => InputItem::Skill {
-                name: name.clone(),
-                // Native skill input carries no path; an empty path keeps
-                // resolution name-based (a non-empty path would switch
-                // `find_skill` to exact path matching and never match).
-                path: std::path::PathBuf::new(),
-            },
-            UserInput::LocalImage { path, .. } => InputItem::LocalImage { path: path.clone() },
-            UserInput::Mention { uri } => InputItem::Mention {
-                path: uri.clone(),
-                name: None,
-            },
-            UserInput::Image { uri, .. } | UserInput::Audio { uri, .. } => {
+            UserInput::Image {
+                uri,
+                mime_type,
+                detail,
+            } => {
+                let path =
+                    super::image_input::write_data_uri_image_to_temp(uri, mime_type.as_deref())?;
+                UserInput::LocalImage {
+                    path,
+                    detail: *detail,
+                }
+            }
+            UserInput::Audio { uri, .. } => {
                 return Err(format!("unsupported input modality for queue: {uri}"));
             }
+            other => other.clone(),
         };
         items.push(item);
     }
     Ok(items)
-}
-
-/// Maps one legacy `InputItem` back to the canonical `UserInput` part
-/// (queue/list; fixes the text-only placeholder from the P4b snapshot).
-pub(crate) fn native_user_input_from_input_item(item: &InputItem) -> UserInput {
-    match item {
-        InputItem::Text { text } => UserInput::Text { text: text.clone() },
-        InputItem::Skill { name, .. } => UserInput::Skill { name: name.clone() },
-        InputItem::LocalImage { path } => UserInput::LocalImage {
-            path: path.clone(),
-            detail: None,
-        },
-        InputItem::Mention { path, .. } => UserInput::Mention { uri: path.clone() },
-    }
 }
 
 /// Builds the canonical queue view from the session's in-memory turn queue.
@@ -835,10 +844,7 @@ pub(crate) fn native_queue_entries(queue: &VecDeque<PendingInputItem>) -> Vec<Qu
         .map(|(index, item)| {
             let input: Vec<UserInput> = match &item.kind {
                 PendingInputKind::UserText { text } => vec![UserInput::Text { text: text.clone() }],
-                PendingInputKind::UserInput { input, .. } => input
-                    .iter()
-                    .map(native_user_input_from_input_item)
-                    .collect(),
+                PendingInputKind::UserInput { input, .. } => input.clone(),
                 _ => Vec::new(),
             };
             let display_text = match &item.kind {
@@ -847,7 +853,7 @@ pub(crate) fn native_queue_entries(queue: &VecDeque<PendingInputItem>) -> Vec<Qu
                 _ => "",
             };
             QueueEntry {
-                queue_item_id: QueueItemId::from_legacy_uuid(Uuid::from(item.id)),
+                queue_item_id: item.id,
                 position: (index + 1) as u32,
                 input,
                 preview: display_text
@@ -861,51 +867,4 @@ pub(crate) fn native_queue_entries(queue: &VecDeque<PendingInputItem>) -> Vec<Qu
             }
         })
         .collect()
-}
-
-/// Converts runtime turn metadata into the canonical `Turn` snapshot used
-/// by `session/queue/push`'s `Started` outcome.
-pub(crate) fn native_turn_from_metadata(turn: &crate::turn::TurnMetadata) -> NativeTurn {
-    let kind = match &turn.kind {
-        devo_core::TurnKind::Regular
-        | devo_core::TurnKind::Review
-        | devo_core::TurnKind::Other(_) => NativeTurnKind::Regular,
-        devo_core::TurnKind::ManualCompaction => NativeTurnKind::Compaction,
-    };
-    let status = match turn.status {
-        TurnStatus::Pending | TurnStatus::Running | TurnStatus::WaitingApproval => {
-            NativeTurnStatus::InProgress
-        }
-        TurnStatus::Completed => NativeTurnStatus::Completed,
-        TurnStatus::Interrupted => NativeTurnStatus::Interrupted,
-        TurnStatus::Failed => NativeTurnStatus::Failed,
-    };
-    NativeTurn {
-        id: NativeTurnId::from_legacy_uuid(Uuid::from(turn.turn_id)),
-        session_id: NativeSessionId::from_legacy_uuid(Uuid::from(turn.session_id)),
-        sequence: turn.sequence,
-        kind,
-        status,
-        model: ModelBinding {
-            provider: turn
-                .model_binding_id
-                .clone()
-                .unwrap_or_else(|| "unknown".into()),
-            model: if turn.request_model.is_empty() {
-                turn.model.clone()
-            } else {
-                turn.request_model.clone()
-            },
-            variant: None,
-            reasoning_effort: turn
-                .reasoning_effort_selection
-                .as_deref()
-                .and_then(|selection| selection.parse().ok()),
-        },
-        collaboration_mode: None,
-        started_at: turn.started_at,
-        completed_at: turn.completed_at,
-        error: None,
-        usage: None,
-    }
 }

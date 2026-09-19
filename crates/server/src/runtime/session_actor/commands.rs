@@ -17,9 +17,9 @@ use super::state::{ApprovalCacheSnapshot, DeferredItems, SessionActorState, Spaw
 use crate::execution::PendingApproval;
 use crate::execution::PersistedTurnItem;
 use crate::runtime::subagent_usage::ParentUsageSnapshot;
-use crate::session::SessionHistoryItem;
-use crate::session::SessionMetadata;
-use crate::turn::TurnMetadata;
+use crate::runtime_session_summary::RuntimeSessionSummary;
+use crate::session::SessionHistoryEntry;
+use crate::turn::RuntimeTurn;
 use devo_core::TurnConfig;
 
 use super::turn_working::TurnWorkingSet;
@@ -34,7 +34,7 @@ pub(crate) struct ApprovalCheckpointSnapshot {
 pub(crate) enum SessionCommand {
     /// Short: clone turn-owned state and install `TurnInlineState` on the shared stream.
     CheckoutTurnWorkingSet {
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         reply: oneshot::Sender<TurnWorkingSet>,
     },
     /// Short: install turn-owned fields after the spawned turn task finishes.
@@ -43,7 +43,10 @@ pub(crate) enum SessionCommand {
         reply: oneshot::Sender<()>,
     },
     GetSummary {
-        reply: oneshot::Sender<SessionMetadata>,
+        reply: oneshot::Sender<RuntimeSessionSummary>,
+    },
+    GetNativeSession {
+        reply: oneshot::Sender<devo_protocol::native::session::Session>,
     },
     GetSpawnSnapshot {
         reply: oneshot::Sender<SpawnSnapshot>,
@@ -91,10 +94,10 @@ pub(crate) enum SessionCommand {
     },
     MarkActiveTurnWaitingApproval {
         turn_id: TurnId,
-        reply: oneshot::Sender<Option<TurnMetadata>>,
+        reply: oneshot::Sender<Option<RuntimeTurn>>,
     },
-    GetRecord {
-        reply: oneshot::Sender<Option<devo_core::SessionRecord>>,
+    GetRolloutPath {
+        reply: oneshot::Sender<Option<std::path::PathBuf>>,
     },
     PreparePersistItem {
         turn_id: TurnId,
@@ -110,7 +113,7 @@ pub(crate) enum SessionCommand {
         item: PersistedTurnItem,
     },
     AppendHistoryItem {
-        item: SessionHistoryItem,
+        item: SessionHistoryEntry,
     },
     TakeDeferredItems {
         reply: oneshot::Sender<DeferredItems>,
@@ -121,7 +124,7 @@ pub(crate) enum SessionCommand {
         pending: PendingApproval,
     },
     UpdateSummary {
-        summary: SessionMetadata,
+        summary: RuntimeSessionSummary,
     },
     SetFirstUserInputIfUnset {
         text: String,
@@ -130,10 +133,10 @@ pub(crate) enum SessionCommand {
     UpdateTitle {
         title: String,
         title_state: SessionTitleState,
-        reply: oneshot::Sender<Option<SessionMetadata>>,
+        reply: oneshot::Sender<Option<RuntimeSessionSummary>>,
     },
     BeginActiveTurn {
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         turn_config: TurnConfig,
     },
     ClearActiveTurnIfMatches {
@@ -141,10 +144,10 @@ pub(crate) enum SessionCommand {
         reply: oneshot::Sender<bool>,
     },
     SetSessionIdle {
-        latest_turn: Option<TurnMetadata>,
+        latest_turn: Option<RuntimeTurn>,
     },
     ActivateQueuedTurn {
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         turn_config: TurnConfig,
     },
     UpdateCorePermissionMode {
@@ -154,14 +157,19 @@ pub(crate) enum SessionCommand {
         goal: Option<ThreadGoal>,
     },
     #[cfg_attr(not(test), allow(dead_code))]
-    UpdateRecordRolloutPath {
+    UpdateRolloutPath {
         rollout_path: std::path::PathBuf,
+    },
+    /// Move the in-session transcript tip after `session/tree/navigate`.
+    SetTranscriptLeaf {
+        leaf_id: Option<devo_protocol::native::ids::ItemId>,
+        epoch: u64,
     },
     ApplyParentUsageSnapshot {
         snapshot: ParentUsageSnapshot,
     },
     InterruptActiveTurn {
-        reply: oneshot::Sender<Option<TurnMetadata>>,
+        reply: oneshot::Sender<Option<RuntimeTurn>>,
     },
     ExportRuntimeSession {
         reply: oneshot::Sender<crate::execution::RuntimeSession>,
@@ -170,12 +178,16 @@ pub(crate) enum SessionCommand {
         cwd: std::path::PathBuf,
         runtime_context: Arc<crate::session_context::SessionRuntimeContext>,
     },
-    UpdateSessionMetadata {
+    SetArchived {
+        archived: bool,
+        reply: oneshot::Sender<devo_protocol::native::session::Session>,
+    },
+    UpdateSessionModelSettings {
         model: Option<String>,
         model_binding_id: Option<String>,
         reasoning_effort_selection: Option<String>,
         collaboration_mode: Option<CollaborationMode>,
-        reply: oneshot::Sender<SessionMetadata>,
+        reply: oneshot::Sender<RuntimeSessionSummary>,
     },
     ApplyPermissionProfile {
         profile: devo_safety::RuntimePermissionProfile,
@@ -191,7 +203,7 @@ pub(crate) enum SessionCommand {
     },
     SetSessionTitleUserRename {
         title: String,
-        reply: oneshot::Sender<SessionMetadata>,
+        reply: oneshot::Sender<RuntimeSessionSummary>,
     },
     SetToolRegistry {
         tool_registry: Option<Arc<devo_core::tools::ToolRegistry>>,
@@ -204,7 +216,7 @@ pub(crate) enum SessionCommand {
         reply: oneshot::Sender<super::snapshots::SessionResumeSnapshot>,
     },
     TryBeginActiveTurn {
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         turn_config: TurnConfig,
         reply: oneshot::Sender<bool>,
     },
@@ -214,7 +226,7 @@ pub(crate) enum SessionCommand {
     },
     PersistTurnLine {
         runtime: Arc<crate::runtime::ServerRuntime>,
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     Shutdown {

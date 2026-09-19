@@ -59,6 +59,9 @@ pub struct WindowsSandboxRequest {
     pub writable_roots: Vec<PathBuf>,
     pub deny_read: Vec<PathBuf>,
     pub restrict_network: bool,
+    /// Per-session credential SID (design doc §9, P2); `None` for plain
+    /// per-command sandboxing. See `credential_delivery`.
+    pub session_credential_sid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +86,17 @@ pub fn prepare_windows_sandbox_launch(
         let _ = req;
         Ok(None)
     }
+}
+
+/// Direct-argv sandbox launch for non-shell callers (e.g. the RLM kernel host
+/// execs `python -m rlm.repl`). Shell-shaped fields of `req` are ignored;
+/// `inner_command` is the exact argv executed inside the sandbox.
+#[cfg(windows)]
+pub fn prepare_windows_sandbox_launch_for_argv(
+    req: &WindowsSandboxRequest,
+    inner_command: Vec<String>,
+) -> anyhow::Result<WindowsSandboxLaunch> {
+    launch::prepare_direct_argv_launch(req, inner_command)
 }
 
 /// CLI early-dispatch hook: if argv requests the Windows sandbox wrapper, run it
@@ -133,6 +147,8 @@ mod cap;
 mod capture_stub;
 #[cfg(windows)]
 mod conpty;
+#[cfg(windows)]
+mod credential_delivery;
 #[cfg(windows)]
 mod deny_read_acl;
 mod deny_read_resolver;
@@ -230,6 +246,10 @@ pub use acl::path_mask_allows;
 pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(windows)]
 pub use cap::load_or_create_cap_sids;
+#[cfg(windows)]
+pub use credential_delivery::SessionCredentialAuthority;
+#[cfg(windows)]
+pub use credential_delivery::sweep_orphaned_sessions;
 #[cfg(windows)]
 pub use cap::workspace_cap_sid_for_cwd;
 #[cfg(windows)]
@@ -378,6 +398,8 @@ pub use token::convert_string_sid_to_sid;
 pub use token::create_readonly_token_with_cap_from;
 #[cfg(windows)]
 pub use token::create_readonly_token_with_caps_and_user_from;
+#[cfg(windows)]
+pub use token::create_readonly_token_with_caps_user_and_additional_restrictions_from;
 #[cfg(windows)]
 pub use token::create_readonly_token_with_caps_from;
 #[cfg(windows)]

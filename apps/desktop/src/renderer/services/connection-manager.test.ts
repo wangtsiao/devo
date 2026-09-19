@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import type { DevoClient } from "@devo-ai/sdk/v2/client"
 import type { Event, Session } from "../lib/types"
 import { discoveryAtom } from "../atoms/discovery"
-import { partsFamily, partStorageKey } from "../atoms/parts"
+import { itemsFamily } from "../atoms/messages"
 import { projectPaginationFamily, sessionFamily, upsertSessionAtom } from "../atoms/sessions"
 import { appStore } from "../atoms/store"
 
@@ -116,7 +116,7 @@ describe("connection manager project event bridge", () => {
 		streamFor(directory).push({
 			type: "session.status",
 			properties: {
-				sessionID: session.id,
+				sessionId: session.id,
 				status: { type: "busy" },
 			},
 		})
@@ -141,26 +141,34 @@ describe("connection manager project event bridge", () => {
 		expect(manager.getProjectClient(directory)).not.toBeNull()
 
 		streamFor(directory).push({
-			type: "message.part.updated",
+			type: "item.updated",
 			properties: {
-				part: {
-					id: "assistant-message-text",
-					sessionID: session.id,
-					messageID: "assistant-message",
-					type: "text",
-					text: "hello from project stream",
+				info: {
+					id: "assistant-message",
+					sessionId: session.id,
+					turnId: "turn-1",
+					seq: 1,
+					revision: 1,
+					createdAt: "2026-01-01T00:00:01.000Z",
+					updatedAt: "2026-01-01T00:00:01.000Z",
+					state: "running",
+					item: { type: "assistantMessage", text: "hello from project stream" },
 				},
 			},
 		})
 		await new Promise((resolve) => setTimeout(resolve, 5))
 
-		expect(appStore.get(partsFamily(partStorageKey(session.id, "assistant-message")))).toEqual([
+		expect(appStore.get(itemsFamily(session.id))).toEqual([
 			{
-				id: "assistant-message-text",
-				sessionID: session.id,
-				messageID: "assistant-message",
-				type: "text",
-				text: "hello from project stream",
+				id: "assistant-message",
+				sessionId: session.id,
+				turnId: "turn-1",
+				seq: 1,
+				revision: 1,
+				createdAt: "2026-01-01T00:00:01.000Z",
+				updatedAt: "2026-01-01T00:00:01.000Z",
+				state: "running",
+				item: { type: "assistantMessage", text: "hello from project stream" },
 			},
 		])
 	})

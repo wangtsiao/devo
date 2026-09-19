@@ -47,6 +47,7 @@ const WIRE_API_OPTIONS: Array<{ value: CatalogWireApi; label: string }> = [
 	{ value: "openai_chat_completions", label: "OpenAI Chat Completions" },
 	{ value: "openai_responses", label: "OpenAI Responses" },
 	{ value: "anthropic_messages", label: "Anthropic Messages" },
+	{ value: "google_generative_ai", label: "Google Generative AI" },
 ]
 
 const MODALITY_OPTIONS: InputModality[] = ["text", "image"]
@@ -155,6 +156,7 @@ function parseEffortEncoding(encoding: EffortEncodingDraft): ProviderModelVarian
 		nextHeaders[key] = header.value
 	}
 	return {
+		disabled: false,
 		requestModel: encoding.requestModel.trim() || undefined,
 		request: parseJsonObject(encoding.requestBody),
 		headers: Object.keys(nextHeaders).length > 0 ? nextHeaders : undefined,
@@ -184,14 +186,14 @@ function formatJsonValue(value: unknown): string {
 }
 
 /** Empty string clears the field; otherwise require a JSON object. */
-function parseJsonObject(raw: string): unknown | undefined {
+function parseJsonObject(raw: string): CatalogModelInfo["request"] {
 	const trimmed = raw.trim()
 	if (!trimmed) return undefined
 	const parsed: unknown = JSON.parse(trimmed)
 	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error("Request body must be a JSON object")
 	}
-	return parsed
+	return parsed as Exclude<CatalogModelInfo["request"], undefined>
 }
 
 export function effectiveWireApi(
@@ -339,8 +341,8 @@ export function ModelEditDialog({
 			return
 		}
 
-		let parsedRequest: unknown | undefined
-		let parsedOptions: unknown | undefined
+		let parsedRequest: CatalogModelInfo["request"]
+		let parsedOptions: CatalogModelInfo["options"]
 		try {
 			parsedRequest = parseJsonObject(requestBody)
 			parsedOptions = parseJsonObject(optionsBody)

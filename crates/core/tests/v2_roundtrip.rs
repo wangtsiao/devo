@@ -1,10 +1,11 @@
-//! Round-trip property tests (P3a): legacy `RolloutLine` → `LegacyProjector`
-//! → v2 JSON → `parse_rollout_line` → `V2InverseProjector` → legacy
-//! `RolloutLine` must replay equivalently to the original.
+//! Round-trip property tests (P3a): legacy `RolloutLine` →
+//! `project_legacy_line` (`RolloutWriteState`) → v2 JSON →
+//! `parse_rollout_line` → Native replay record adapters → legacy replay
+//! records must remain equivalent to the original.
 //!
 //! Equivalence is full-object equality after `normalize_expected` applies
 //! the documented allow-list of unrecoverable fields (see the comments in
-//! `v2_inverse.rs` and the normalize function below) and reshapes packed
+//! `native_replay.rs` and the normalize function below) and reshapes packed
 //! records the way the one-record-one-item v2 writer does.
 
 use std::collections::HashMap;
@@ -13,9 +14,12 @@ use std::path::PathBuf;
 use chrono::{DateTime, TimeZone, Utc};
 use devo_core::{
     ApprovalDecisionItem, ApprovalRequestItem, CommandExecutionItem, ItemId, ItemLine, ItemRecord,
-    LegacyProjector, ParsedRolloutLine, RolloutLine, RolloutLineV2, SessionRecord,
-    SessionTitleFinalSource, SessionTitleState, TextItem, ToolCallItem, ToolResultItem, TurnItem,
-    TurnKind, TurnRecord, TurnStatus, V2InverseError, V2InverseProjector, parse_rollout_line,
+    NativeReplayError, ParsedRolloutLine, RolloutLine, RolloutLineReadError, RolloutLineV2,
+    RolloutWriteState, SessionRecord, SessionTitleFinalSource, SessionTitleState, TextItem,
+    ToolCallItem, ToolResultItem, TurnItem, TurnKind, TurnRecord, TurnStatus,
+    item_record_from_native, legacy_compaction_line_from_native, legacy_lines_from_internal,
+    legacy_rollback_line_from_native, legacy_title_line_from_native, parse_rollout_line,
+    project_legacy_line, session_record_from_native, turn_record_from_native,
 };
 use pretty_assertions::assert_eq;
 use uuid::Uuid;
@@ -25,7 +29,7 @@ use uuid::Uuid;
 /// records, expanded packed payloads). The comparator skips id equality
 /// there.
 fn sentinel_id() -> ItemId {
-    ItemId::from(Uuid::nil())
+    ItemId::from_legacy_uuid(Uuid::nil())
 }
 
 fn ts(second: u32) -> DateTime<Utc> {
@@ -38,31 +42,126 @@ fn fixture_lines(name: &str) -> Vec<RolloutLine> {
     std::fs::read_to_string(&path)
         .expect("read fixture")
         .lines()
-        .map(
-            |line| match parse_rollout_line(line).expect("fixture line parses") {
-                ParsedRolloutLine::Legacy(line) => *line,
-                ParsedRolloutLine::V2(_) => panic!("fixture {name} must contain only legacy lines"),
-            },
-        )
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("fixture {name} legacy line must deserialize as RolloutLine: {e}")
+            })
+        })
         .collect()
 }
 
 /// The full round-trip: forward project, serialize to v2 JSONL, re-parse
 /// through the version dispatch (proving the v2 output is well-formed), then
-/// inverse project back to legacy lines.
+/// map back into the retained replay records.
 fn round_trip(lines: &[RolloutLine]) -> Vec<RolloutLine> {
-    let mut forward = LegacyProjector::new();
-    let inverse = V2InverseProjector::new();
+    let mut forward = RolloutWriteState::new();
     let mut out = Vec::new();
     for line in lines {
-        let v2_lines = forward.project_line(line).expect("forward projection");
+        let v2_lines = project_legacy_line(&mut forward, line).expect("forward projection");
         for v2 in &v2_lines {
             let raw = serde_json::to_string(v2).expect("serialize v2 line");
-            let parsed = match parse_rollout_line(&raw).expect("v2 line re-parses") {
-                ParsedRolloutLine::V2(parsed) => *parsed,
-                ParsedRolloutLine::Legacy(_) => panic!("v2 line parsed as legacy"),
-            };
-            out.extend(inverse.project_line(&parsed).expect("inverse projection"));
+            let ParsedRolloutLine::V2(parsed) =
+                parse_rollout_line(&raw).expect("v2 line re-parses");
+            match *parsed {
+                RolloutLineV2::SessionMeta {
+                    timestamp,
+                    session,
+                    extras,
+                    ..
+                } => out.push(RolloutLine::SessionMeta(Box::new(
+                    devo_core::SessionMetaLine {
+                        timestamp,
+                        session: session_record_from_native(&session, extras.as_deref())
+                            .expect("session replay mapping"),
+                    },
+                ))),
+                RolloutLineV2::Turn {
+                    timestamp,
+                    turn,
+                    extras,
+                    ..
+                } => out.push(RolloutLine::Turn(Box::new(devo_core::TurnLine {
+                    timestamp,
+                    turn: turn_record_from_native(&turn, extras.as_deref())
+                        .expect("turn replay mapping"),
+                }))),
+                RolloutLineV2::Item { item, .. } => {
+                    if let Some(item) = item_record_from_native(&item).expect("item replay mapping")
+                    {
+                        out.push(RolloutLine::Item(Box::new(ItemLine {
+                            timestamp: item.timestamp,
+                            item,
+                        })));
+                    }
+                }
+                RolloutLineV2::Internal {
+                    timestamp,
+                    session_id,
+                    turn_id,
+                    seq,
+                    entry,
+                    ..
+                } => out.extend(
+                    legacy_lines_from_internal(
+                        timestamp,
+                        &session_id,
+                        turn_id.as_ref(),
+                        seq,
+                        &entry,
+                    )
+                    .expect("internal inverse projection"),
+                ),
+                RolloutLineV2::SessionTitleUpdated {
+                    timestamp,
+                    session_id,
+                    title,
+                    previous_title,
+                    ..
+                } => out.push(
+                    legacy_title_line_from_native(timestamp, &session_id, title, previous_title)
+                        .expect("title inverse projection"),
+                ),
+                RolloutLineV2::CompactionSnapshot {
+                    timestamp,
+                    session_id,
+                    turn_id,
+                    summary_item_id,
+                    preserved_item_ids,
+                    context_occupancy,
+                    ..
+                } => out.push(
+                    legacy_compaction_line_from_native(
+                        timestamp,
+                        &session_id,
+                        &turn_id,
+                        &summary_item_id,
+                        &preserved_item_ids,
+                        context_occupancy,
+                    )
+                    .expect("compaction inverse projection"),
+                ),
+                RolloutLineV2::SessionRollback {
+                    timestamp,
+                    session_id,
+                    retained_turn_ids,
+                    retained_item_ids,
+                    latest_turn_id,
+                    ..
+                } => out.push(
+                    legacy_rollback_line_from_native(
+                        timestamp,
+                        &session_id,
+                        &retained_turn_ids,
+                        &retained_item_ids,
+                        latest_turn_id.as_ref(),
+                    )
+                    .expect("rollback inverse projection"),
+                ),
+                RolloutLineV2::WorkspaceCheckpoint { .. }
+                | RolloutLineV2::WorkspaceChange { .. }
+                | RolloutLineV2::WorkspaceRestoreStarted { .. }
+                | RolloutLineV2::WorkspaceRestoreCompleted { .. } => {}
+            }
         }
     }
     out
@@ -261,7 +360,7 @@ fn normalize_scope_string(scope: &str) -> String {
 }
 
 /// SessionRecord fields the canonical model does not carry (the allow-list,
-/// each with its justification in `v2_inverse.rs`).
+/// each with its justification in `native_replay.rs`).
 fn normalize_session(session: &SessionRecord) -> SessionRecord {
     let last_activity_at = session.last_activity_at.unwrap_or(session.updated_at);
     SessionRecord {
@@ -300,6 +399,23 @@ fn normalize_session(session: &SessionRecord) -> SessionRecord {
 /// Aggregate `usage` is replaced by `latest_query_usage` when that field is
 /// present: the forward projector prefers the latest query for canonical
 /// `Turn.usage`, so the inverse cannot recover a distinct aggregate.
+///
+/// Zero optional cache/reasoning counters become `None` after Native migrate
+/// round-trip (`to_native` / `from_native`).
+fn normalize_usage(usage: &devo_core::TurnUsage) -> devo_core::TurnUsage {
+    devo_core::TurnUsage {
+        cache_creation_input_tokens: usage.cache_creation_input_tokens.filter(|v| *v > 0),
+        cache_read_input_tokens: usage.cache_read_input_tokens.filter(|v| *v > 0),
+        reasoning_output_tokens: usage.reasoning_output_tokens.filter(|v| *v > 0),
+        total_tokens: Some(
+            usage
+                .total_tokens
+                .unwrap_or(usage.input_tokens + usage.output_tokens),
+        ),
+        ..usage.clone()
+    }
+}
+
 fn normalize_turn(turn: &TurnRecord) -> TurnRecord {
     let usage_source = turn.latest_query_usage.as_ref().or(turn.usage.as_ref());
     TurnRecord {
@@ -318,17 +434,8 @@ fn normalize_turn(turn: &TurnRecord) -> TurnRecord {
         } else {
             turn.request_model.clone()
         },
-        usage: usage_source.map(|usage| devo_core::TurnUsage {
-            cache_creation_input_tokens: usage.cache_creation_input_tokens.filter(|v| *v > 0),
-            cache_read_input_tokens: usage.cache_read_input_tokens.filter(|v| *v > 0),
-            reasoning_output_tokens: usage.reasoning_output_tokens.filter(|v| *v > 0),
-            total_tokens: Some(
-                usage
-                    .total_tokens
-                    .unwrap_or(usage.input_tokens + usage.output_tokens),
-            ),
-            ..usage.clone()
-        }),
+        usage: usage_source.map(normalize_usage),
+        latest_query_usage: turn.latest_query_usage.as_ref().map(normalize_usage),
         schema_version: 4,
         ..turn.clone()
     }
@@ -480,12 +587,7 @@ fn live_write_lines() -> Vec<RolloutLine> {
                 schema_version: 4,
             },
         })),
-        item(
-            1,
-            TurnItem::UserMessage(TextItem {
-                text: "hello".into(),
-            }),
-        ),
+        item(1, TurnItem::UserMessage(TextItem::text("hello"))),
         item(
             2,
             TurnItem::ToolCall(ToolCallItem {
@@ -518,12 +620,7 @@ fn live_write_lines() -> Vec<RolloutLine> {
                 decision_source: None,
             }),
         ),
-        item(
-            5,
-            TurnItem::HookPrompt(TextItem {
-                text: "hook".into(),
-            }),
-        ),
+        item(5, TurnItem::HookPrompt(TextItem::text("hook"))),
     ]
 }
 
@@ -534,41 +631,31 @@ fn live_write_shapes_round_trips_through_v2() {
     assert_lines_equivalent(&round_trip(&original), &expected);
 }
 
+/// Trace: L2-DES-RLM-001
+/// Verifies: missing `v` lines are rejected (no dual-read).
 #[test]
-fn mixed_v1_v2_file_dispatches_per_line() {
+fn pre_rlm_legacy_lines_are_rejected() {
     let original = fixture_lines("basic_session.jsonl");
-    let mut forward = LegacyProjector::new();
-    let mut raw_lines = Vec::new();
-    for line in &original[..2] {
-        raw_lines.push(serde_json::to_string(line).expect("serialize legacy"));
-    }
-    for line in &original[2..4] {
-        for v2 in forward.project_line(line).expect("forward projection") {
-            raw_lines.push(serde_json::to_string(&v2).expect("serialize v2"));
-        }
-    }
-
-    let kinds: Vec<&'static str> = raw_lines
-        .iter()
-        .map(|raw| match parse_rollout_line(raw).expect("line parses") {
-            ParsedRolloutLine::Legacy(_) => "legacy",
-            ParsedRolloutLine::V2(_) => "v2",
-        })
-        .collect();
-    // Two legacy lines, then the two item records expand to 3 + 2 v2 lines.
-    assert_eq!(
-        kinds,
-        vec!["legacy", "legacy", "v2", "v2", "v2", "v2", "v2"]
-    );
+    let raw = serde_json::to_string(&original[0]).expect("serialize legacy");
+    let err = parse_rollout_line(&raw).expect_err("legacy must fail");
+    assert_eq!(err, RolloutLineReadError::LegacyUnsupported);
 }
 
+/// Trace: L2-DES-RLM-001
+/// Verifies: prefixed native opaque ids (`ses_`/`turn_`/`item_`) round-trip
+/// through native→legacy replay by stripping the prefix.
 #[test]
-fn inverse_rejects_prefixed_canonical_ids() {
+fn native_replay_accepts_prefixed_canonical_ids() {
+    let session_id = devo_protocol::native::ids::SessionId::new();
+    assert!(
+        session_id.as_str().starts_with("ses_"),
+        "fixture must use a prefixed opaque id"
+    );
     let line = RolloutLineV2::SessionMeta {
         v: devo_core::ROLLOUT_FORMAT_VERSION,
         timestamp: ts(0),
         session: Box::new(devo_protocol::native::session::Session {
-            id: devo_protocol::native::ids::SessionId::new(),
+            id: session_id,
             version: 1,
             cwd: PathBuf::from("/tmp"),
             additional_directories: Vec::new(),
@@ -580,6 +667,7 @@ fn inverse_rejects_prefixed_canonical_ids() {
             status: devo_protocol::native::session::SessionStatus::Idle,
             flags: Vec::new(),
             archived: false,
+            activity: devo_protocol::native::session::SessionActivity::Idle,
             active_turn_id: None,
             queued_count: 0,
             title: None,
@@ -596,11 +684,17 @@ fn inverse_rejects_prefixed_canonical_ids() {
                 mode: None,
                 sandbox_profile: None,
                 effective_context_window: None,
+                auto_refine_enabled: None,
+                auto_refine_turn_interval: None,
+                python_cell_first_wait_ms: None,
             },
             git_info: None,
             preview: String::new(),
             last_activity_at: ts(0),
             transcript_size_bytes: None,
+            message_count: None,
+            summary: None,
+            task_state: None,
             usage: devo_protocol::native::usage::SessionUsage {
                 total: devo_protocol::native::usage::UsageTotals::default(),
                 by_purpose: Vec::new(),
@@ -610,15 +704,19 @@ fn inverse_rejects_prefixed_canonical_ids() {
         }),
         extras: None,
     };
-    let inverse = V2InverseProjector::new();
-    let error = inverse
-        .project_line(&line)
-        .expect_err("prefixed id must fail");
-    assert!(matches!(error, V2InverseError::NonLegacyId(_)));
+    let RolloutLineV2::SessionMeta {
+        session, extras, ..
+    } = line
+    else {
+        unreachable!();
+    };
+    let record = session_record_from_native(&session, extras.as_deref())
+        .expect("prefixed opaque ids must replay without conversion");
+    assert_eq!(record.id, session_id);
 }
 
 #[test]
-fn inverse_rejects_turn_scoped_internal_line_without_turn_id() {
+fn native_replay_rejects_turn_scoped_internal_line_without_turn_id() {
     let line = RolloutLineV2::Internal {
         v: devo_core::ROLLOUT_FORMAT_VERSION,
         timestamp: ts(0),
@@ -629,9 +727,20 @@ fn inverse_rejects_turn_scoped_internal_line_without_turn_id() {
             entry: devo_protocol::native::item::InternalEntry::TurnSummary { text: "1".into() },
         },
     };
-    let inverse = V2InverseProjector::new();
-    let error = inverse.project_line(&line).expect_err("missing turn id");
-    assert_eq!(error, V2InverseError::MissingTurnId);
+    let RolloutLineV2::Internal {
+        timestamp,
+        session_id,
+        turn_id,
+        seq,
+        entry,
+        ..
+    } = line
+    else {
+        unreachable!();
+    };
+    let error = legacy_lines_from_internal(timestamp, &session_id, turn_id.as_ref(), seq, &entry)
+        .expect_err("missing turn id");
+    assert_eq!(error, NativeReplayError::MissingTurnId);
 }
 
 /// A toggle-keyword effort selection ("enabled") must survive the v1→v2→v1

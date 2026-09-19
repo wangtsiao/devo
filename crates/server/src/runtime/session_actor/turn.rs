@@ -9,7 +9,6 @@ use crate::runtime::turn_exec::{
     ExecuteTurnRequest, FinalizeTurnParams, QUERY_EVENT_CHANNEL_CAPACITY, TurnModelQueryParams,
     spawn_turn_event_stream,
 };
-use devo_core::TurnStatus;
 
 /// Runs one turn on the caller's task using a checked-out [`TurnWorkingSet`].
 ///
@@ -28,13 +27,17 @@ pub(crate) async fn execute_turn_task(
         display_input,
         input,
         input_messages,
+        input_images,
+        input_image_paths,
         collaboration_mode,
         input_mode,
+        user_message_already_emitted,
     } = request;
 
     let spawn_snapshot = Arc::new(working.state.spawn_snapshot());
+    let turn_id = turn.turn_id();
     runtime
-        .register_turn_spawn_snapshot(session_id, turn.turn_id, Arc::clone(&spawn_snapshot))
+        .register_turn_spawn_snapshot(session_id, turn_id, Arc::clone(&spawn_snapshot))
         .await;
 
     runtime
@@ -46,7 +49,8 @@ pub(crate) async fn execute_turn_task(
             &mut working.state,
             &turn,
             &display_input,
-            input_mode.emits_user_message(),
+            &input_image_paths,
+            input_mode.emits_user_message() && !user_message_already_emitted,
         )
         .await;
 
@@ -60,7 +64,7 @@ pub(crate) async fn execute_turn_task(
         runtime
             .begin_parent_usage_turn_with_base(
                 session_id,
-                turn.turn_id,
+                turn_id,
                 UsageTotals::from_session_summary(&working.state.summary),
                 usage_context_window,
             )
@@ -83,19 +87,19 @@ pub(crate) async fn execute_turn_task(
     let query_outcome = runtime
         .run_turn_model_query(TurnModelQueryParams {
             state: &mut working.state,
-            turn_id: turn.turn_id,
+            turn_id,
             turn_config: &turn_config,
             input: &input,
             input_messages: &input_messages,
+            input_images: &input_images,
             collaboration_mode,
             input_mode,
-            usage_parent_session_id,
+            usage_parent_session_id: usage_parent_session_id.as_ref().map(|id| *id),
             event_tx,
         })
         .await;
     let event_summary = event_task.await.ok();
 
-    let turn_id = turn.turn_id;
     runtime
         .finalize_executed_turn(FinalizeTurnParams {
             state: &mut working.state,
@@ -103,7 +107,7 @@ pub(crate) async fn execute_turn_task(
             turn,
             query_outcome,
             event_summary,
-            usage_parent_session_id,
+            usage_parent_session_id: usage_parent_session_id.as_ref().map(|id| *id),
         })
         .await;
 
@@ -118,22 +122,28 @@ pub(crate) async fn execute_turn_task(
         inline.merge_into(&mut working.state);
     }
 
-    let should_auto_continue_goal = working
-        .state
-        .latest_turn
-        .as_ref()
-        .is_some_and(|turn| matches!(turn.status, TurnStatus::Completed | TurnStatus::Failed));
+    let should_auto_continue_goal = working.state.latest_turn.as_ref().is_some_and(|turn| {
+        matches!(
+            turn.native.status,
+            devo_protocol::native::turn::TurnStatus::Completed
+                | devo_protocol::native::turn::TurnStatus::Failed
+        )
+    });
 
     if let Some(handle) = runtime.session(session_id).await {
         handle.merge_turn(working).await;
     }
 
-    runtime.clear_turn_spawn_snapshot(session_id, turn_id).await;
+    runtime
+        .clear_turn_spawn_snapshot(session_id, turn_id)
+        .await;
     runtime.unregister_active_stream(session_id).await;
     runtime
         .clear_active_turn_interrupt_handles(session_id)
         .await;
-    runtime.clear_active_turn_runtime_handles(session_id).await;
+    runtime
+        .clear_active_turn_runtime_handles(session_id)
+        .await;
     runtime.broadcast_recovery_state(session_id).await;
 
     should_auto_continue_goal

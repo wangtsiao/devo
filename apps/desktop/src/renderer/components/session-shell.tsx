@@ -94,7 +94,6 @@ function SessionTranscriptPanel({
 			isReverted={controller.isReverted}
 			onForkFromTurn={controller.handleForkFromTurn}
 			onEditUserMessage={controller.handleEditUserMessage}
-			onDeletePart={controller.handleDeletePart}
 			parentSessionName={controller.parentSessionName}
 			reviewPanelOpen={reviewPanelOpen}
 			isActive={isActive}

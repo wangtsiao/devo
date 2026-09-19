@@ -14,7 +14,7 @@ use reqwest_eventsource::{Event, EventSource};
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::error::ProviderError;
+use crate::error::stream_error;
 use crate::hosted_tools::append_openai_responses_hosted_tools;
 use crate::http::invalid_status_error;
 use crate::text_normalization::{TaggedTextFragment, TaggedTextParser, split_tagged_text};
@@ -23,7 +23,7 @@ use crate::{ModelProviderSDK, ProviderHttpOptions, merge_extra_body};
 use super::capabilities::{OpenAITransport, resolve_request_profile};
 use super::{
     OpenAIRole,
-    shared::{request_role, tool_definitions},
+    shared::{request_role, responses_tool_definitions},
 };
 
 /// OpenAI Responses API provider.
@@ -118,7 +118,7 @@ fn build_request(request: &ModelRequest, stream: bool) -> Value {
     });
 
     if let Some(tools) = &request.tools {
-        root["tools"] = tool_definitions(tools);
+        root["tools"] = responses_tool_definitions(tools);
     }
 
     if profile.supports_temperature
@@ -168,53 +168,118 @@ fn build_input(request: &ModelRequest) -> Vec<Value> {
 
     for message in &request.messages {
         let role = request_role(&message.role);
-        if let Some(message) = build_input_message(role, &message.content) {
-            input.push(message);
-        }
+        append_input_items(&mut input, role, &message.content);
     }
 
     input
 }
 
-fn build_input_message(role: OpenAIRole, content: &[RequestContent]) -> Option<Value> {
-    let mut content_blocks = Vec::with_capacity(content.len());
+fn append_input_items(input: &mut Vec<Value>, role: OpenAIRole, content: &[RequestContent]) {
+    let mut message_blocks = Vec::new();
+    let flush_message = |input: &mut Vec<Value>, blocks: &mut Vec<Value>| {
+        if blocks.is_empty() {
+            return;
+        }
+        input.push(json!({
+            "type": "message",
+            "role": role,
+            "content": std::mem::take(blocks),
+        }));
+    };
+
     for block in content {
         match block {
-            RequestContent::Text { text } => content_blocks.push(json!({
-                "type": "input_text",
-                "text": text,
-            })),
-            RequestContent::Reasoning { text } => content_blocks.push(json!({
-                "type": "reasoning",
-                "text": text,
-            })),
-            RequestContent::ProviderReasoning { .. } | RequestContent::HostedToolUse { .. } => {}
-            RequestContent::ToolUse { id, name, input } => content_blocks.push(json!({
-                "type": "tool_call",
-                "id": id,
-                "name": name,
-                "input": input,
-            })),
+            RequestContent::Text { text } => {
+                // Responses message content: user/system use input_text;
+                // assistant replay uses output_text (DeepSeek/OpenAI).
+                let block_type = match role {
+                    OpenAIRole::Assistant => "output_text",
+                    _ => "input_text",
+                };
+                message_blocks.push(json!({
+                    "type": block_type,
+                    "text": text,
+                }));
+            }
+            RequestContent::Reasoning { .. } => {
+                // Message content only accepts input_text / output_text /
+                // input_image / input_file. Nested `type: "reasoning"` causes
+                // 400s on DeepSeek (and is not valid OpenAI message content).
+                // Prior reasoning is omitted unless carried as a provider
+                // reasoning item with a stable id (ProviderReasoning).
+            }
+            RequestContent::ProviderReasoning { .. } => {}
+            RequestContent::Image {
+                mime_type,
+                data_base64,
+            } => {
+                message_blocks.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{mime_type};base64,{data_base64}"),
+                }));
+            }
+            RequestContent::ToolUse { id, name, input: args } => {
+                flush_message(input, &mut message_blocks);
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
+                }));
+            }
             RequestContent::ToolResult {
                 tool_use_id,
                 content,
-                is_error,
-            } => content_blocks.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_use_id,
-                "output": content,
-                "is_error": is_error,
-            })),
+                is_error: _,
+            } => {
+                flush_message(input, &mut message_blocks);
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": content,
+                }));
+            }
+            RequestContent::HostedToolUse {
+                id,
+                name,
+                input: hosted_input,
+                output,
+                status,
+            } => {
+                flush_message(input, &mut message_blocks);
+                // DeepSeek / OpenAI Responses expect hosted calls as top-level
+                // items that are passed back as-is (not nested message content).
+                let item_type = match name.as_str() {
+                    "web_search" => "web_search_call",
+                    "web_fetch" => "web_fetch_call",
+                    other => other,
+                };
+                let mut item = json!({
+                    "type": item_type,
+                    "id": id,
+                    "status": status.clone().unwrap_or_else(|| "completed".to_string()),
+                });
+                if name == "web_search" {
+                    if let Some(query) = hosted_input.get("query") {
+                        item["action"] = json!({
+                            "type": "search",
+                            "query": query,
+                        });
+                    } else if let Some(action) = hosted_input.get("action") {
+                        item["action"] = action.clone();
+                    }
+                } else if !hosted_input.is_null() {
+                    item["action"] = hosted_input.clone();
+                }
+                if let Some(output) = output {
+                    item["output"] = output.clone();
+                }
+                input.push(item);
+            }
         }
     }
 
-    (!content_blocks.is_empty()).then(|| {
-        json!({
-            "type": "message",
-            "role": role,
-            "content": content_blocks,
-        })
-    })
+    flush_message(input, &mut message_blocks);
 }
 
 fn parse_response(value: Value) -> Result<ModelResponse> {
@@ -367,22 +432,42 @@ fn parse_function_call_arguments_json(arguments_json: &str) -> Value {
     serde_json::from_str(arguments_json).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
 }
 
-fn parse_hosted_web_search_call(item: &Value) -> ResponseContent {
+fn hosted_tool_call_id(item: &Value) -> String {
+    item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn hosted_tool_status(item: &Value) -> Option<String> {
+    item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn hosted_tool_output(item: &Value) -> Option<Value> {
+    item.get("output")
+        .or_else(|| item.get("results"))
+        .or_else(|| item.get("result"))
+        .or_else(|| item.get("content"))
+        .cloned()
+}
+
+fn parse_hosted_tool_call(item: &Value, name: &str, input: Value) -> ResponseContent {
     ResponseContent::HostedToolUse {
-        id: item
-            .get("call_id")
-            .or_else(|| item.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        name: "web_search".to_string(),
-        input: hosted_web_search_input(item),
-        output: hosted_web_search_output(item),
-        status: item
-            .get("status")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+        id: hosted_tool_call_id(item),
+        name: name.to_string(),
+        input,
+        output: hosted_tool_output(item),
+        status: hosted_tool_status(item),
     }
+}
+
+fn parse_hosted_web_search_call(item: &Value) -> ResponseContent {
+    parse_hosted_tool_call(item, "web_search", hosted_web_search_input(item))
 }
 
 fn hosted_web_search_input(item: &Value) -> Value {
@@ -401,29 +486,8 @@ fn hosted_web_search_input(item: &Value) -> Value {
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
 }
 
-fn hosted_web_search_output(item: &Value) -> Option<Value> {
-    item.get("results")
-        .or_else(|| item.get("result"))
-        .or_else(|| item.get("content"))
-        .cloned()
-}
-
 fn parse_hosted_web_fetch_call(item: &Value) -> ResponseContent {
-    ResponseContent::HostedToolUse {
-        id: item
-            .get("call_id")
-            .or_else(|| item.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        name: "web_fetch".to_string(),
-        input: hosted_web_fetch_input(item),
-        output: hosted_web_fetch_output(item),
-        status: item
-            .get("status")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-    }
+    parse_hosted_tool_call(item, "web_fetch", hosted_web_fetch_input(item))
 }
 
 fn hosted_web_fetch_input(item: &Value) -> Value {
@@ -447,21 +511,6 @@ fn hosted_web_fetch_input(item: &Value) -> Value {
     item.get("action")
         .cloned()
         .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
-}
-
-fn hosted_web_fetch_output(item: &Value) -> Option<Value> {
-    item.get("output")
-        .or_else(|| item.get("results"))
-        .or_else(|| item.get("result"))
-        .or_else(|| item.get("content"))
-        .cloned()
-}
-
-fn stream_error(message: String) -> ProviderError {
-    ProviderError::StreamError {
-        message,
-        bytes_received: None,
-    }
 }
 
 fn parse_usage(value: &Value) -> Option<Usage> {
@@ -1048,7 +1097,62 @@ mod tests {
         assert_eq!(body["top_p"], json!(0.7));
         assert!(body.get("top_k").is_none());
         assert_eq!(body["tools"][0]["type"], json!("function"));
+        assert_eq!(body["tools"][0]["name"], json!("get_weather"));
+        assert!(body["tools"][0].get("function").is_none());
         assert_eq!(body["input"][0]["role"], json!("system"));
+    }
+
+    #[test]
+    fn build_request_omits_nested_reasoning_and_uses_output_text_for_assistant() {
+        let request = ModelRequest {
+            model_slug: devo_protocol::ModelProfileKey::CatalogSlug("deepseek-v4-flash".to_string()),
+            model: "deepseek-v4-flash".to_string(),
+            system: None,
+            messages: vec![
+                RequestMessage {
+                    role: "user".to_string(),
+                    content: vec![RequestContent::Text {
+                        text: "hi".to_string(),
+                    }],
+                },
+                RequestMessage {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        RequestContent::Reasoning {
+                            text: "secret thoughts".to_string(),
+                        },
+                        RequestContent::Text {
+                            text: "hello".to_string(),
+                        },
+                    ],
+                },
+            ],
+            max_tokens: 64,
+            tools: None,
+            hosted_tools: Vec::new(),
+            sampling: SamplingControls {
+                temperature: None,
+                top_p: None,
+                top_k: None,
+            },
+            request_thinking: None,
+            reasoning_effort: None,
+            extra_body: None,
+        };
+
+        let body = build_request(&request, false);
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["content"][0]["type"], json!("input_text"));
+        assert_eq!(input[1]["role"], json!("assistant"));
+        assert_eq!(input[1]["content"].as_array().map(|c| c.len()), Some(1));
+        assert_eq!(input[1]["content"][0]["type"], json!("output_text"));
+        assert_eq!(input[1]["content"][0]["text"], json!("hello"));
+        let serialized = body.to_string();
+        assert!(
+            !serialized.contains("\"type\":\"reasoning\""),
+            "nested reasoning content must not appear in Responses input: {serialized}"
+        );
     }
 
     #[test]
@@ -1104,12 +1208,14 @@ mod tests {
 
         let body = build_request(&request, false);
 
-        assert_eq!(body["input"].as_array().map(Vec::len), Some(2));
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(4));
         assert_eq!(body["input"][0]["role"], json!("user"));
-        assert_eq!(body["input"][1]["role"], json!("user"));
+        assert_eq!(body["input"][1]["type"], json!("web_search_call"));
+        assert_eq!(body["input"][2]["type"], json!("web_search_call"));
+        assert_eq!(body["input"][3]["role"], json!("user"));
         let serialized = serde_json::to_string(&body).expect("serialize request body");
         assert!(!serialized.contains("hosted_tool_use"));
-        assert!(!serialized.contains("web_search_tool_result"));
+        assert!(!serialized.contains("\"type\":\"tool_call\""));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use devo_protocol::SessionId;
+use devo_protocol::native::ids::SessionId;
 
 use crate::execution::RuntimeSession;
 use crate::runtime::ServerRuntime;
@@ -67,10 +67,6 @@ impl Drop for SessionLoadPermit {
 pub(crate) enum LoadSessionError {
     #[error("session not found")]
     SessionNotFound,
-    #[error(
-        "subagent sessions cannot be resumed directly; resume the parent session {parent_session_id} instead"
-    )]
-    SubagentNotResumable { parent_session_id: SessionId },
     #[error("session metadata exists but rollout file is missing; session cannot be restored")]
     RolloutMissing,
     #[error("failed to restore session: {0}")]
@@ -92,12 +88,12 @@ impl ParentSessionLru {
     }
 
     pub(crate) fn touch(&mut self, session_id: SessionId) {
-        self.order.retain(|id| *id != session_id);
+        self.order.retain(|id| id != &session_id);
         self.order.push_front(session_id);
     }
 
-    pub(crate) fn remove(&mut self, session_id: SessionId) {
-        self.order.retain(|id| *id != session_id);
+    pub(crate) fn remove(&mut self, session_id: &SessionId) {
+        self.order.retain(|id| id != session_id);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -111,7 +107,7 @@ impl ServerRuntime {
         session_id: SessionId,
     ) -> Result<SessionHandle, LoadSessionError> {
         if let Some(handle) = self.session(session_id).await {
-            self.touch_parent_session_lru(session_id).await;
+            self.touch_root_session_lru_if_needed(&handle).await;
             return Ok(handle);
         }
 
@@ -122,7 +118,7 @@ impl ServerRuntime {
         let _metadata_write_permit = self.session_metadata_write_gate.acquire(session_id).await;
         let _load_permit = self.parent_session_load_gate.acquire(session_id).await;
         if let Some(handle) = self.session(session_id).await {
-            self.touch_parent_session_lru(session_id).await;
+            self.touch_root_session_lru_if_needed(&handle).await;
             return Ok(handle);
         }
 
@@ -132,14 +128,7 @@ impl ServerRuntime {
             .get_session_index(&session_id)
             .map_err(|error| LoadSessionError::RestoreFailed(error.to_string()))?
             .ok_or(LoadSessionError::SessionNotFound)?;
-
-        if index.metadata.agent_path.is_some() {
-            let parent_session_id = index
-                .metadata
-                .parent_session_id
-                .ok_or(LoadSessionError::SessionNotFound)?;
-            return Err(LoadSessionError::SubagentNotResumable { parent_session_id });
-        }
+        let is_subagent = index.session.agent_path.is_some();
 
         let stored_rollout_path = index.rollout_path.clone();
         let rollout_path = match stored_rollout_path {
@@ -156,7 +145,7 @@ impl ServerRuntime {
             && let Err(error) = self
                 .deps
                 .db
-                .upsert_rollout_index_session(&index.metadata, Some(rollout_path.as_path()))
+                .upsert_rollout_index_session(index.session.clone(), Some(rollout_path.as_path()))
         {
             tracing::warn!(
                 session_id = %session_id,
@@ -169,14 +158,43 @@ impl ServerRuntime {
             .hydrate_runtime_session(session_id, &rollout_path)
             .await
             .map_err(|error| LoadSessionError::RestoreFailed(error.to_string()))?;
-        self.insert_root_session_actor(runtime_session).await
+        // Subagents have their own rollouts and must be openable from Agents
+        // View, but stay off the root LRU so eviction still keys off top-level
+        // sessions.
+        let handle = if is_subagent {
+            self.insert_session_actor(SessionActorState::from_runtime_session(runtime_session))
+                .await
+        } else {
+            self.insert_root_session_actor(runtime_session).await?
+        };
+        if let Err(error) = self
+            .materialize_abandoned_turn_recovery_if_needed(session_id)
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to materialize abandoned-turn recovery after hydrate"
+            );
+        }
+        Ok(handle)
+    }
+
+    async fn touch_root_session_lru_if_needed(&self, handle: &SessionHandle) {
+        let Some(summary) = handle.summary().await else {
+            return;
+        };
+        if summary.agent_path.is_some() {
+            return;
+        }
+        self.touch_parent_session_lru(summary.session_id()).await;
     }
 
     pub(crate) async fn insert_root_session_actor(
         self: &Arc<Self>,
         runtime_session: RuntimeSession,
     ) -> Result<SessionHandle, LoadSessionError> {
-        let session_id = runtime_session.summary.session_id;
+        let session_id = runtime_session.summary.session_id();
         let handle = self
             .insert_session_actor(SessionActorState::from_runtime_session(runtime_session))
             .await;
@@ -202,10 +220,10 @@ impl ServerRuntime {
             if lru.len() <= lru.capacity {
                 return;
             }
-            lru.order.iter().rev().copied().collect()
+            lru.order.iter().rev().cloned().collect()
         };
         for session_id in candidates {
-            if exclude == Some(session_id) {
+            if exclude.as_ref() == Some(&session_id) {
                 continue;
             }
             if self.is_parent_session_pinned(session_id).await {
@@ -225,7 +243,7 @@ impl ServerRuntime {
             if connection
                 .subscriptions
                 .iter()
-                .any(|subscription| subscription.session_id == Some(session_id))
+                .any(|subscription| subscription.session_id.as_ref() == Some(&session_id))
             {
                 return true;
             }
@@ -238,7 +256,7 @@ impl ServerRuntime {
             let registries = self.agent_registries.lock().await;
             registries
                 .get(&parent_session_id)
-                .map(|registry| registry.children_of(parent_session_id))
+                .map(|registry| registry.children_of(&parent_session_id))
                 .unwrap_or_default()
         };
 
@@ -253,7 +271,7 @@ impl ServerRuntime {
             handle.shutdown().await;
         }
         self.goal_stores.lock().await.remove(&parent_session_id);
-        self.session_lru.lock().await.remove(parent_session_id);
+        self.session_lru.lock().await.remove(&parent_session_id);
         self.agent_registries
             .lock()
             .await

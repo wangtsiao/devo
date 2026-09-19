@@ -48,6 +48,10 @@ pub struct ItemEnvelope {
     pub updated_at: DateTime<Utc>,
     pub state: ItemState,
     pub item: Item,
+    /// Parent in the session transcript tree (`None` = root). Legacy lines
+    /// omit the field; readers infer a linear chain by `seq` when missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<ItemId>,
 }
 
 /// Common delivery lifecycle of an item, owned by the envelope. Variants must
@@ -92,8 +96,6 @@ pub enum Item {
     },
     AssistantMessage {
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        phase: Option<AssistantPhase>,
     },
     /// The provider's encrypted reasoning payload is stored by reference and
     /// re-attached when building outbound context.
@@ -299,6 +301,12 @@ pub enum Item {
         #[ts(rename = "exitCode")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        /// User `!` shell command text when `task_kind` is `Shell`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// Retained stdout/stderr tail for resume / task reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
 
     // ── System ──
@@ -338,6 +346,13 @@ pub enum Item {
         code: String,
         message: String,
         retryable: bool,
+    },
+    /// Summary of an abandoned branch after in-session tree navigate
+    /// (Prime `branch_summary` parity). Tree-visible; parent is the new leaf.
+    BranchSummary {
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<String>,
     },
 }
 
@@ -386,7 +401,7 @@ pub enum InternalEntry {
 // ---------------------------------------------------------------------------
 
 /// One submission = one `UserMessage` item whose content is a list of parts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -445,13 +460,6 @@ pub enum UserMessageEntry {
     Queue,
     /// Injected into a running turn (including promotion from the queue).
     Steer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-pub enum AssistantPhase {
-    Commentary,
-    Final,
 }
 
 // ---------------------------------------------------------------------------

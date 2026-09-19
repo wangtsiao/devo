@@ -1,16 +1,14 @@
 //! `context/usage/read` RPC handler and mid-turn occupancy broadcasts.
 
 use devo_core::RawContextBreakdown;
-use devo_core::SessionId;
 use devo_protocol::SuccessResponse;
+use devo_protocol::native::ids::SessionId;
 use devo_protocol::native::item::ContextOccupancy;
 use devo_protocol::native::rpc_admin::ContextUsageReadParams;
 use devo_protocol::native::rpc_admin::ContextUsageReadResult;
 
 use super::ServerRuntime;
-use crate::ContextUsageUpdatedPayload;
 use crate::ProtocolErrorCode;
-use crate::ServerEvent;
 
 impl ServerRuntime {
     /// Publish a live context occupancy snapshot during an in-flight turn.
@@ -31,20 +29,30 @@ impl ServerRuntime {
             .max(1);
         let occupancy =
             super::context_occupancy::occupancy_from_raw(window, raw, anchor_total.max(1));
+        let mut native_session_id = None;
         if let Some(stream) = self.active_stream_state(session_id).await {
             let mut stream = stream.lock().await;
             if let Some(inline) = stream.turn_inline.as_mut() {
                 inline.summary.last_query_total_tokens = occupancy.total_tokens as usize;
                 inline.summary.last_context_occupancy = Some(occupancy.clone());
                 inline.hook_context.summary = inline.summary.clone();
+                native_session_id = Some(inline.summary.native.id);
             }
         }
-        self.broadcast_event(ServerEvent::ContextUsageUpdated(
-            ContextUsageUpdatedPayload {
-                session_id,
+        let native_session_id = if let Some(native_session_id) = native_session_id {
+            native_session_id
+        } else if let Some(summary) = self.session_summary_snapshot(session_id).await {
+            summary.native.id
+        } else {
+            // boundary: legacy session id when summary unavailable
+            session_id
+        };
+        self.broadcast_notification(
+            devo_protocol::native::event::ServerNotification::ContextUsageUpdated {
+                session_id: native_session_id,
                 occupancy,
             },
-        ))
+        )
         .await;
     }
 
@@ -58,14 +66,12 @@ impl ServerRuntime {
             if let Some(inline) = stream.turn_inline.as_ref() {
                 let model = inline
                     .summary
-                    .model
-                    .as_deref()
+                    .model_name()
                     .and_then(|slug| self.deps.model_catalog.get(slug))
                     .or_else(|| {
                         inline
                             .summary
-                            .model_binding_id
-                            .as_deref()
+                            .model_binding_id()
                             .and_then(|binding| self.deps.model_catalog.get(binding))
                     });
                 return super::context_occupancy::occupancy_window_tokens(model);
@@ -74,13 +80,11 @@ impl ServerRuntime {
 
         if let Some(summary) = self.session_summary_snapshot(session_id).await {
             let model = summary
-                .model
-                .as_deref()
+                .model_name()
                 .and_then(|slug| self.deps.model_catalog.get(slug))
                 .or_else(|| {
                     summary
-                        .model_binding_id
-                        .as_deref()
+                        .model_binding_id()
                         .and_then(|binding| self.deps.model_catalog.get(binding))
                 });
             if let Some(occupancy) = summary.last_context_occupancy.as_ref()
@@ -111,13 +115,7 @@ impl ServerRuntime {
             }
         };
 
-        let Ok(session_id) = SessionId::try_from(params.session_id.as_str()) else {
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::InvalidParams,
-                format!("invalid session id: {}", params.session_id),
-            );
-        };
+        let session_id = params.session_id;
 
         let Some(summary) = self.session_summary_snapshot(session_id).await else {
             return self.error_response(
@@ -131,13 +129,11 @@ impl ServerRuntime {
             occupancy
         } else {
             let model = summary
-                .model
-                .as_deref()
+                .model_name()
                 .and_then(|slug| self.deps.model_catalog.get(slug))
                 .or_else(|| {
                     summary
-                        .model_binding_id
-                        .as_deref()
+                        .model_binding_id()
                         .and_then(|binding| self.deps.model_catalog.get(binding))
                 });
             let window = model

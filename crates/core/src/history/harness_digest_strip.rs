@@ -113,7 +113,9 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         match &filtered[0] {
             ResponseItem::Message(msg) => {
-                assert!(matches!(&msg.content[0], ContentBlock::Text { text } if text == "real work"));
+                assert!(
+                    matches!(&msg.content[0], ContentBlock::Text { text } if text == "real work")
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

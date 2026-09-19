@@ -52,6 +52,8 @@ pub struct ToolPlanConfig {
     pub web_fetch: bool,
     pub network_proxy: Option<String>,
     pub network_no_proxy: Option<String>,
+    /// Spike/dev gate. Release builds must use Rlm only.
+    pub execution_surface: devo_kernel::ExecutionSurface,
 }
 
 impl ToolPlanConfig {
@@ -83,6 +85,9 @@ impl Default for ToolPlanConfig {
             web_fetch: true,
             network_proxy: None,
             network_no_proxy: None,
+            // Discrete when no kernel; turns with a live kernel flip to Rlm
+            // (ipython + bash + MCP) once the host_request table is installed.
+            execution_surface: devo_kernel::ExecutionSurface::Discrete,
         }
     }
 }
@@ -626,6 +631,11 @@ fn invalid_schema() -> JsonSchema {
 
 pub fn build_tool_registry_plan(config: &ToolPlanConfig) -> ToolRegistryPlan {
     config.validate();
+
+    if config.execution_surface == devo_kernel::ExecutionSurface::Rlm {
+        return build_rlm_registry_plan();
+    }
+
     let mut plan = ToolRegistryPlan::new();
 
     if config.use_shell_command {
@@ -899,6 +909,43 @@ pub fn build_tool_registry_plan(config: &ToolPlanConfig) -> ToolRegistryPlan {
     plan
 }
 
+/// RLM model-facing registry: `ipython` + `bash`.
+///
+/// MCP tools are layered on afterward via `build_registry_from_plan_with_mcp`.
+/// Hosted `web_search` is attached at ModelRequest time for anthropic/responses
+/// wires only — not as a discrete registry tool.
+pub fn build_rlm_registry_plan() -> ToolRegistryPlan {
+    let mut plan = ToolRegistryPlan::new();
+    plan.push(
+        ToolSpec {
+            name: "ipython".to_string(),
+            description: "Execute Python code in the session RLM kernel. Namespace persists across cells and turns.".to_string(),
+            input_schema: JsonSchema::object(
+                BTreeMap::from([(
+                    "code".to_string(),
+                    JsonSchema::string(Some("Python source to execute")),
+                )]),
+                Some(vec!["code".to_string()]),
+                None,
+            ),
+            output_mode: ToolOutputMode::Mixed,
+            execution_mode: ToolExecutionMode::Mutating,
+            capability_tags: vec![],
+            supports_parallel: false,
+            preparation_feedback: ToolPreparationFeedback::None,
+            display_name: Some("ipython".into()),
+            supports_cancellation: Some(true),
+            supports_streaming: Some(true),
+        },
+        ToolHandlerKind::Ipython,
+    );
+    plan.push(
+        shell_command_tool_spec("bash"),
+        ToolHandlerKind::ShellCommand,
+    );
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,5 +1126,57 @@ mod tests {
 
         assert!(!spec_names.contains(&"code_search"));
         assert!(!handler_names.contains(&"code_search"));
+    }
+
+    /// Trace: L2-DES-RLM-001
+    /// Verifies: RLM registry exposes ipython and bash (MCP is layered later).
+    #[test]
+    fn rlm_plan_includes_ipython_and_bash() {
+        let plan = build_rlm_registry_plan();
+        let names: Vec<&str> = plan.specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["ipython", "bash"]);
+        assert!(
+            plan.handlers
+                .iter()
+                .any(|(kind, name)| *kind == ToolHandlerKind::Ipython && name == "ipython")
+        );
+        assert!(
+            plan.handlers
+                .iter()
+                .any(|(kind, name)| *kind == ToolHandlerKind::ShellCommand && name == "bash")
+        );
+    }
+
+    /// Trace: L2-DES-RLM-001
+    /// Verifies: discrete surface (spike default) still registers classic tools, not only ipython.
+    #[test]
+    fn discrete_plan_keeps_classic_tools() {
+        let config = ToolPlanConfig {
+            execution_surface: devo_kernel::ExecutionSurface::Discrete,
+            ..ToolPlanConfig::default()
+        };
+        let plan = build_tool_registry_plan(&config);
+        let names: Vec<&str> = plan.specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"read") || names.contains(&"shell_command") || names.len() > 1,
+            "discrete registry must retain classic tools, got {names:?}"
+        );
+        assert!(
+            !names.iter().all(|n| *n == "ipython"),
+            "discrete must not collapse to ipython-only"
+        );
+    }
+
+    /// Trace: L2-DES-RLM-001
+    /// Verifies: Rlm execution_surface selects the RLM root plan.
+    #[test]
+    fn rlm_surface_selects_rlm_root_plan() {
+        let config = ToolPlanConfig {
+            execution_surface: devo_kernel::ExecutionSurface::Rlm,
+            ..ToolPlanConfig::default()
+        };
+        let plan = build_tool_registry_plan(&config);
+        let names: Vec<&str> = plan.specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["ipython", "bash"]);
     }
 }

@@ -229,6 +229,11 @@ fn resolve_local_web_search(
             base_url: provider.base_url.clone(),
             max_results: provider.max_results,
         }),
+        AuthCredentialKind::Oauth => Err(ProviderConfigError::Validation {
+            message: format!(
+                "web search local provider `{provider_id}` requires an api_key credential, found oauth"
+            ),
+        }),
     }
 }
 
@@ -256,6 +261,11 @@ mod tests {
                 AuthCredentialConfig {
                     kind: AuthCredentialKind::ApiKey,
                     value: "secret".to_string(),
+                    access: None,
+                    refresh: None,
+                    expires_at: None,
+                    account_id: None,
+                    enterprise_url: None,
                 },
             )]),
             ..UserAuthConfigFile::default()

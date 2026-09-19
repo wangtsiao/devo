@@ -2,17 +2,19 @@
 
 use std::sync::Arc;
 
+use devo_core::tools::handlers::ensure_kernel;
+use devo_core::tools::registry_plan::ToolPlanConfig;
 use devo_core::tools::{
     AgentToolCoordinator, ClientFilesystem, PermissionChecker, ToolAgentScope, ToolCall,
     ToolExecutionOptions, ToolRuntime, ToolRuntimeContext,
 };
 use devo_core::{
-    ContentBlock, ItemId, Message, Role, TurnApprovalCheckpointRecordedRecord, TurnConfig, TurnId,
-    TurnStatus,
+    ContentBlock, Message, Role, TurnApprovalCheckpointRecordedRecord, TurnConfig, TurnId,
 };
 use devo_protocol::native::item::Item;
 use devo_protocol::{ApprovalDecisionValue, CollaborationMode, SessionId};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::super::ServerRuntime;
 use super::super::approval::{
@@ -23,7 +25,6 @@ use super::super::approval_checkpoint::{
     collaboration_mode_from_checkpoint, host_session_id_from_checkpoint,
     permission_request_from_messages, tool_permission_request_from_checkpoint,
 };
-use super::super::interaction_items::core_item_id_from_native;
 use super::tool_display::without_agent_coordination_tools;
 use super::tool_results::emit_tool_result_item;
 use super::{
@@ -136,11 +137,11 @@ impl ServerRuntime {
         approval_id: &str,
     ) -> Option<PersistedLivingItem> {
         let handle = self.session(owner_session_id).await?;
-        let record = handle.record().await??;
-        let history = devo_core::read_canonical_history(&record.rollout_path).ok()?;
+        let rollout_path = handle.rollout_path().await??;
+        let history = devo_core::read_canonical_history(&rollout_path).ok()?;
         let checkpoints =
             super::super::approval_checkpoint::latest_approval_checkpoints_for_rollout(
-                &record.rollout_path,
+                &rollout_path,
             );
         let recovered =
             super::super::interaction_items::latest_waiting_approvals(&history.items, &checkpoints)
@@ -159,11 +160,9 @@ impl ServerRuntime {
         approval_id: &str,
     ) -> Option<TurnApprovalCheckpointRecordedRecord> {
         let handle = self.session(session_id).await?;
-        let record = handle.record().await??;
-        super::super::approval_checkpoint::latest_approval_checkpoints_for_rollout(
-            &record.rollout_path,
-        )
-        .remove(approval_id)
+        let rollout_path = handle.rollout_path().await??;
+        super::super::approval_checkpoint::latest_approval_checkpoints_for_rollout(&rollout_path)
+            .remove(approval_id)
     }
 
     /// Handles an approval decision from a restored or live interactive lane.
@@ -193,9 +192,12 @@ impl ServerRuntime {
                 devo_protocol::native::item::ApprovalDecisionKind::Cancelled
             }
         };
+        let (native_session_id, native_turn_id) = self
+            .native_session_turn_ids(owner_session_id, turn_id)
+            .await;
         self.persist_resolved_approval_item(
-            owner_session_id,
-            turn_id,
+            native_session_id,
+            native_turn_id,
             request,
             available_scopes,
             native_decision,
@@ -204,19 +206,10 @@ impl ServerRuntime {
             persisted,
         )
         .await;
-        let item_id = core_item_id_from_native(&persisted.item_id).unwrap_or_else(|| {
-            tracing::warn!(
-                session_id = %owner_session_id,
-                approval_id,
-                item_id = %persisted.item_id.as_str(),
-                "failed to map native approval item id; emitting completion with new id"
-            );
-            ItemId::new()
-        });
         self.emit_native_item_completed(
-            owner_session_id,
-            turn_id,
-            item_id,
+            native_session_id,
+            native_turn_id,
+            persisted.item_id,
             Some(persisted.seq),
             native_decided_approval_item(
                 approval_id,
@@ -348,15 +341,15 @@ impl ServerRuntime {
                 .ok_or_else(|| "turn reservation snapshot unavailable".to_string())?;
             reservation
                 .active_turn
-                .filter(|turn| turn.turn_id == checkpoint.turn_id)
+                .filter(|turn| turn.turn_id() == checkpoint.turn_id)
                 .or_else(|| {
                     reservation
                         .latest_turn
-                        .filter(|turn| turn.turn_id == checkpoint.turn_id)
+                        .filter(|turn| turn.turn_id() == checkpoint.turn_id)
                 })
                 .ok_or_else(|| "turn metadata not found".to_string())?
         };
-        if turn.status == TurnStatus::Completed {
+        if turn.native.status == devo_protocol::native::turn::TurnStatus::Completed {
             return Ok(());
         }
         let collaboration_mode = collaboration_mode_from_checkpoint(&checkpoint);
@@ -365,20 +358,21 @@ impl ServerRuntime {
             .await?;
         if !self
             .active_turns
-            .try_claim_session(session_id, turn.clone())
+            .try_claim_session(session_id, turn.native.clone())
             .await
         {
             return Err("turn already active".to_string());
         }
         let cancel_token = self
-            .register_active_turn_execution(session_id, turn.clone(), None)
+            .register_active_runtime_turn_execution(session_id, turn.clone(), None)
             .await;
         let began = handle
-            .try_begin_active_turn(turn.clone(), turn_config.clone())
+            .try_begin_runtime_turn(turn.clone(), turn_config.clone())
             .await
             .unwrap_or(false);
         if !began {
-            self.clear_active_turn_runtime_handles(session_id).await;
+            self.clear_active_turn_runtime_handles(session_id)
+                .await;
             return Err("failed to begin active turn".to_string());
         }
         let turn_id = checkpoint.turn_id;
@@ -398,10 +392,13 @@ impl ServerRuntime {
         if continuation_result.is_err() {
             let _ = handle.interrupt_active_turn().await;
         }
-        self.clear_turn_spawn_snapshot(session_id, turn_id).await;
+        self.clear_turn_spawn_snapshot(session_id, turn_id)
+            .await;
         self.unregister_active_stream(session_id).await;
-        self.clear_active_turn_interrupt_handles(session_id).await;
-        self.clear_active_turn_runtime_handles(session_id).await;
+        self.clear_active_turn_interrupt_handles(session_id)
+            .await;
+        self.clear_active_turn_runtime_handles(session_id)
+            .await;
         cancel_token.cancel();
         continuation_result
     }
@@ -411,7 +408,7 @@ impl ServerRuntime {
         self: &Arc<Self>,
         _host_session_id: SessionId,
         session_id: SessionId,
-        turn: crate::TurnMetadata,
+        turn: crate::turn::RuntimeTurn,
         checkpoint: TurnApprovalCheckpointRecordedRecord,
         request: &devo_core::tools::ToolPermissionRequest,
         approval_id: &str,
@@ -428,19 +425,23 @@ impl ServerRuntime {
         working.state.summary.collaboration_mode = collaboration_mode;
 
         let spawn_snapshot = Arc::new(working.state.spawn_snapshot());
-        self.register_turn_spawn_snapshot(session_id, turn.turn_id, Arc::clone(&spawn_snapshot))
-            .await;
+        self.register_turn_spawn_snapshot(
+            session_id,
+            turn.turn_id(),
+            Arc::clone(&spawn_snapshot),
+        )
+        .await;
         self.register_active_stream(session_id, Arc::clone(&working.state.stream))
             .await;
 
         if !self
-            .turn_has_tool_result(session_id, turn.turn_id, approval_id)
+            .turn_has_tool_result(session_id, turn.turn_id(), approval_id)
             .await
         {
             Self::execute_approved_tool_for_resume(
                 Arc::clone(self),
                 session_id,
-                turn.turn_id,
+                &turn,
                 &turn_config,
                 collaboration_mode,
                 request,
@@ -450,7 +451,7 @@ impl ServerRuntime {
         }
 
         let (event_tx, event_rx) = mpsc::channel(QUERY_EVENT_CHANNEL_CAPACITY);
-        let event_tool_registry = if working.state.summary.parent_session_id.is_some() {
+        let event_tool_registry = if working.state.summary.parent_session_id().is_some() {
             Arc::new(without_agent_coordination_tools(
                 &self.tool_registry_for_actor_state(&working.state),
             ))
@@ -476,13 +477,14 @@ impl ServerRuntime {
         let query_outcome = self
             .run_turn_model_query(TurnModelQueryParams {
                 state: &mut working.state,
-                turn_id: turn.turn_id,
+                turn_id: turn.turn_id(),
                 turn_config: &turn_config,
                 input: "",
                 input_messages: &[],
+                input_images: &[],
                 collaboration_mode,
                 input_mode: TurnInputMode::ApprovalResume,
-                usage_parent_session_id,
+                usage_parent_session_id: usage_parent_session_id.as_ref().map(|id| *id),
                 event_tx,
             })
             .await;
@@ -493,7 +495,7 @@ impl ServerRuntime {
             turn,
             query_outcome,
             event_summary,
-            usage_parent_session_id,
+            usage_parent_session_id: usage_parent_session_id.as_ref().map(|id| *id),
         })
         .await;
         let inline = {
@@ -503,14 +505,21 @@ impl ServerRuntime {
         if let Some(inline) = inline {
             inline.merge_into(&mut working.state);
         }
-        let should_auto_continue_goal =
-            working.state.latest_turn.as_ref().is_some_and(|turn| {
-                matches!(turn.status, TurnStatus::Completed | TurnStatus::Failed)
-            });
+        let should_auto_continue_goal = working.state.latest_turn.as_ref().is_some_and(|turn| {
+            matches!(
+                turn.native.status,
+                devo_protocol::native::turn::TurnStatus::Completed
+                    | devo_protocol::native::turn::TurnStatus::Failed
+            )
+        });
         if let Some(handle) = self.session(session_id).await {
             handle.merge_turn(working).await;
         }
-        spawn_post_turn_scheduling(Arc::clone(self), session_id, should_auto_continue_goal);
+        spawn_post_turn_scheduling(
+            Arc::clone(self),
+            session_id,
+            should_auto_continue_goal,
+        );
         Ok(())
     }
 
@@ -533,14 +542,14 @@ impl ServerRuntime {
                     .get("modelSlug")
                     .and_then(|value| value.as_str())
             })
-            .or(snapshot.summary.model_binding_id.as_deref())
-            .or(snapshot.summary.model.as_deref());
+            .or(snapshot.summary.model_binding_id())
+            .or(snapshot.summary.model_name());
         let reasoning_effort = checkpoint
             .turn_config
             .get("reasoningEffortSelection")
             .and_then(|value| value.as_str())
             .map(str::to_string)
-            .or(snapshot.summary.reasoning_effort_selection.clone());
+            .or(snapshot.summary.settings.reasoning_effort.clone());
         Ok(snapshot
             .runtime_context
             .resolve_turn_config(requested_model, reasoning_effort))
@@ -556,11 +565,11 @@ impl ServerRuntime {
             Some(handle) => handle,
             None => return false,
         };
-        let record = match handle.record().await {
-            Some(Some(record)) => record,
+        let rollout_path = match handle.rollout_path().await {
+            Some(Some(path)) => path,
             _ => return false,
         };
-        let Ok(history) = devo_core::read_canonical_history(&record.rollout_path) else {
+        let Ok(history) = devo_core::read_canonical_history(&rollout_path) else {
             return false;
         };
         let turn_id = turn_id.to_string();
@@ -578,13 +587,14 @@ impl ServerRuntime {
     async fn execute_approved_tool_for_resume(
         runtime: Arc<Self>,
         session_id: SessionId,
-        turn_id: TurnId,
+        turn: &crate::turn::RuntimeTurn,
         turn_config: &TurnConfig,
         collaboration_mode: CollaborationMode,
         request: &devo_core::tools::ToolPermissionRequest,
         working: &mut super::super::session_actor::TurnWorkingSet,
     ) -> Result<(), String> {
-        let agent_scope = if working.state.summary.parent_session_id.is_some() {
+        let turn_id = turn.turn_id();
+        let agent_scope = if working.state.summary.parent_session_id().is_some() {
             ToolAgentScope::Subagent
         } else {
             ToolAgentScope::Parent
@@ -604,12 +614,92 @@ impl ServerRuntime {
                 }
             })
         });
+        let session_dir =
+            working.state.rollout_path.as_ref().and_then(|path| {
+                crate::persistence::RolloutStore::rlm_session_dir_for_rollout(path)
+            });
+        let kernel = match ensure_kernel(
+            &working.state.kernel,
+            &working.state.core.cwd,
+            session_dir.as_deref(),
+        )
+        .await
+        {
+            Ok(arc) => {
+                working.state.kernel = Some(Arc::clone(&arc));
+                Some(arc)
+            }
+            Err(err) => {
+                tracing::debug!(%err, "RLM kernel not available for approval resume");
+                working.state.kernel.as_ref().map(Arc::clone)
+            }
+        };
+        let host_cancel_token = runtime
+            .active_turns
+            .cancel_token(session_id)
+            .await
+            .unwrap_or_else(CancellationToken::new);
+        let host_permission = runtime.build_permission_checker(
+            session_id,
+            turn_id,
+            working.state.core.config.permission_mode,
+            working.state.core.config.permission_profile.clone(),
+        );
+        if let Some(ref kernel) = kernel {
+            let host_bridge = Arc::new(super::super::kernel_host_bridge::HostBridge {
+                session_id,
+                turn_id: Some(turn_id),
+                cwd: working.state.core.cwd.clone(),
+                session_dir: session_dir.clone(),
+                collaboration_mode,
+                permission: host_permission,
+                client_filesystem: Some(Arc::clone(&runtime) as Arc<dyn ClientFilesystem>),
+                file_read_ledger: Arc::clone(&working.state.file_read_ledger),
+                sandbox_profile: working.state.core.config.sandbox_profile.clone(),
+                cancel_token: host_cancel_token.clone(),
+                mcp_manager: Some(Arc::clone(&working.state.runtime_context.mcp_manager)),
+                agent_scope,
+                local_web_search: match &turn_config.web_search {
+                    devo_core::ResolvedWebSearchConfig::Local(config) => {
+                        serde_json::to_value(config).ok()
+                    }
+                    devo_core::ResolvedWebSearchConfig::Disabled
+                    | devo_core::ResolvedWebSearchConfig::Provider => None,
+                },
+                network_proxy: None,
+                network_no_proxy: None,
+                runtime: Arc::downgrade(&runtime),
+                model_id: Some(turn_config.model.slug.clone()),
+                input_modalities: turn_config.model.input_modalities.clone(),
+                context_window: Some(turn_config.model.context_window),
+            });
+            kernel
+                .set_host_handler(Some(super::super::kernel_host::host_handler_for_bridge(
+                    host_bridge,
+                )))
+                .await;
+        }
+        let registry = if kernel.is_some() {
+            let plan = ToolPlanConfig {
+                execution_surface: devo_kernel::ExecutionSurface::Rlm,
+                ..Default::default()
+            };
+            Arc::new(
+                devo_core::tools::handlers::build_registry_from_plan_with_mcp(
+                    &plan,
+                    Arc::clone(&working.state.runtime_context.mcp_manager),
+                )
+                .await,
+            )
+        } else {
+            registry
+        };
         let tool_runtime = ToolRuntime::new_with_context_and_options(
             registry,
             preapproved_checker,
             ToolRuntimeContext {
-                session_id: session_id.to_string(),
-                turn_id: Some(turn_id.to_string()),
+                session_id,
+                turn_id: Some(turn_id),
                 cwd: working.state.core.cwd.clone(),
                 agent_scope,
                 collaboration_mode,
@@ -621,13 +711,39 @@ impl ServerRuntime {
                     devo_core::ResolvedWebSearchConfig::Disabled
                     | devo_core::ResolvedWebSearchConfig::Provider => None,
                 },
-                hooks: ServerRuntime::hook_context_from_actor_state(&working.state, session_id),
+                hooks: ServerRuntime::hook_context_from_actor_state(
+                    &working.state,
+                    session_id,
+                ),
                 network_proxy: None,
                 network_no_proxy: None,
                 sandbox_profile: working.state.core.config.sandbox_profile.clone(),
                 sandbox_profile_live: None,
+                kernel,
+                python_cell_first_wait_ms: working
+                    .state
+                    .summary
+                    .settings
+                    .python_cell_first_wait_ms,
+                live_turn_settings: None,
+                python_cell_watch: Some(Arc::new(
+                    crate::runtime::python_cell_watch::ServerPythonCellWatch::new(
+                        Arc::clone(&runtime),
+                        session_id,
+                        turn_id,
+                    ),
+                )),
+                python_cell_completion: Some(Arc::new(
+                    crate::runtime::python_cell_watch::ServerPythonCellCompletionHook::new(Arc::clone(
+                        &runtime,
+                    )),
+                )),
+                session_dir: session_dir.clone(),
             },
-            ToolExecutionOptions::default(),
+            ToolExecutionOptions {
+                cancel_token: host_cancel_token,
+                ..ToolExecutionOptions::default()
+            },
         );
         let call = ToolCall {
             id: request.tool_call_id.clone(),
@@ -653,8 +769,8 @@ impl ServerRuntime {
         });
         emit_tool_result_item(
             &runtime,
-            session_id,
-            turn_id,
+            turn.native.session_id,
+            turn.native.id,
             result.tool_use_id,
             Some(request.tool_name.clone()),
             None,

@@ -183,6 +183,72 @@ pub async fn run_server_process(
     let singleton_metadata =
         real_server_guard.publish_endpoint(internal_proxy.endpoint().to_string())?;
 
+    if let Err(error) =
+        devo_core::migrate_session_defaults_to_config_toml(&resolver.user_config_dir())
+    {
+        tracing::warn!(
+            error = %error,
+            "failed to migrate session defaults into config.toml"
+        );
+    }
+    // Align on-disk providers.json with pi/prime overlay semantics before load.
+    if let Err(error) =
+        devo_core::migrate_user_provider_catalog_overlays(&resolver.user_config_dir())
+    {
+        tracing::warn!(
+            error = %error,
+            "failed to sparsify user provider catalog overlays"
+        );
+    }
+    if let Ok(builtin) = devo_core::builtin_provider_config()
+        && let Err(error) =
+            devo_core::migrate_custom_providers_file(&resolver.user_config_dir(), &builtin)
+    {
+        tracing::warn!(
+            error = %error,
+            "failed to split custom providers into custom-providers.json"
+        );
+    }
+
+    // Refresh models.dev cache (or local dump) before building the catalog.
+    {
+        let early_store = AppConfigStore::load(
+            resolver.user_config_dir(),
+            /*workspace_root*/ None,
+        );
+        if let Ok(store) = early_store {
+            let catalog_cfg = store.effective_config().catalog.clone();
+            match devo_core::refresh_remote_catalog(&resolver.user_config_dir(), &catalog_cfg).await
+            {
+                devo_core::CatalogRefreshOutcome::Updated { providers, models } => {
+                    tracing::info!(
+                        providers,
+                        models,
+                        "refreshed models.dev provider catalog cache"
+                    );
+                }
+                devo_core::CatalogRefreshOutcome::CacheFresh
+                | devo_core::CatalogRefreshOutcome::SkippedOffline
+                | devo_core::CatalogRefreshOutcome::SkippedStartupDisabled => {}
+                devo_core::CatalogRefreshOutcome::Failed { stage, message } => {
+                    tracing::warn!(
+                        ?stage,
+                        error = %message,
+                        "models.dev catalog refresh failed; using embedded/cache catalog"
+                    );
+                }
+            }
+        }
+    }
+
+    // Migrate legacy auth.json envelope → provider-keyed AuthStorage shape.
+    let auth_path = resolver
+        .user_config_dir()
+        .join(devo_core::AUTH_CONFIG_FILE_NAME);
+    if let Err(error) = devo_core::read_user_auth_config(&auth_path) {
+        tracing::warn!(error = %error, "failed to migrate user auth.json");
+    }
+
     let config_store = Arc::new(std::sync::Mutex::new(AppConfigStore::load(
         resolver.user_config_dir(),
         /*workspace_root*/ None,
@@ -227,9 +293,10 @@ pub async fn run_server_process(
     let registry =
         handlers::build_registry_from_plan_with_mcp(&tool_plan, Arc::clone(&mcp_manager)).await;
     let model_catalog: Arc<dyn ModelCatalog> = Arc::new(
-        PresetModelCatalog::load_from_provider_config_with_overrides(
+        PresetModelCatalog::load_from_provider_config_with_home(
             &config.provider_catalog_config(),
             &config.provider.model_overrides,
+            Some(resolver.user_config_dir().as_path()),
         )?,
     );
     let default_model = model_catalog.resolve_for_turn(None)?.slug.clone();
@@ -242,7 +309,8 @@ pub async fn run_server_process(
         &config,
         Some(default_model.as_str()),
         &resolver.user_config_dir(),
-    )?;
+    )
+    .await?;
     let skill_catalog = Box::new(FileSystemSkillCatalog::with_devo_home(
         config.skills.clone(),
         resolver.user_config_dir(),
@@ -256,23 +324,23 @@ pub async fn run_server_process(
 
     let registry = Arc::new(registry);
     let provider_router = Arc::clone(&provider.provider_router);
+    let process_context = Arc::new(crate::session_context::SessionRuntimeContext::from_parts(
+        provider.provider,
+        provider_router,
+        Arc::clone(&registry),
+        mcp_manager,
+        provider.default_model,
+        model_catalog,
+        Arc::new(std::sync::Mutex::new(skill_catalog)),
+        AgentsMdConfig {
+            project_root_markers: config.project_root_markers.clone(),
+            ..AgentsMdConfig::default()
+        },
+        config_store,
+    ));
     let runtime = ServerRuntime::with_protocols(
         resolver.user_config_dir(),
-        ServerRuntimeDependencies::new(
-            provider.provider,
-            provider_router,
-            Arc::clone(&registry),
-            mcp_manager,
-            provider.default_model,
-            model_catalog,
-            skill_catalog,
-            AgentsMdConfig {
-                project_root_markers: config.project_root_markers.clone(),
-                ..AgentsMdConfig::default()
-            },
-            db,
-            config_store,
-        ),
+        ServerRuntimeDependencies::new(process_context, db),
         args.protocols.clone(),
     );
     runtime
@@ -281,8 +349,18 @@ pub async fn run_server_process(
             serde_json::Map::from_iter([("trigger".to_string(), serde_json::json!("init"))]),
         )
         .await;
-    if runtime.backfill_session_index_if_required()? {
-        tracing::info!("rollout metadata index backfill completed");
+    // Rebuild SQLite session index from on-disk SessionMeta headers. Always
+    // refresh: empty DBs with pre-seeded rollouts (restore / stress corpora)
+    // otherwise stay invisible to session/list and session/resume.
+    {
+        let rollout_store = runtime.rollout_store();
+        let db = runtime.deps_db();
+        tokio::task::spawn_blocking(move || match rollout_store.index_rollout_metadata(&db) {
+            Ok(()) => tracing::info!("rollout metadata index refresh completed"),
+            Err(error) => {
+                tracing::warn!(%error, "rollout metadata index refresh failed");
+            }
+        });
     }
     // Delivery-log reconciliation (08 §7): backfill event_log rows a crash
     // prevented the append path from writing. Runs in the background;

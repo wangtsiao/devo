@@ -125,7 +125,33 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::resolve_small_model;
-    use crate::{InMemoryModelCatalog, Model, ProviderModelVariantConfig, ProviderWireApi};
+    use crate::{Model, ModelCatalog, ModelError, ProviderModelVariantConfig, ProviderWireApi};
+
+    struct TestCatalog {
+        models: Vec<Model>,
+    }
+
+    impl ModelCatalog for TestCatalog {
+        fn list_visible(&self) -> Vec<&Model> {
+            self.models.iter().collect()
+        }
+
+        fn get(&self, slug: &str) -> Option<&Model> {
+            self.models.iter().find(|model| model.slug == slug)
+        }
+
+        fn resolve_for_turn(&self, requested: Option<&str>) -> Result<&Model, ModelError> {
+            if let Some(slug) = requested {
+                return self.get(slug).ok_or_else(|| ModelError::ModelNotFound {
+                    slug: slug.to_string(),
+                });
+            }
+            self.list_visible()
+                .into_iter()
+                .next()
+                .ok_or(ModelError::NoVisibleModels)
+        }
+    }
 
     fn model(slug: &str) -> Model {
         Model {
@@ -138,11 +164,13 @@ mod tests {
 
     #[test]
     fn selects_a_lightweight_model_from_the_primary_provider() {
-        let catalog = InMemoryModelCatalog::new(vec![
-            model("qwen/qwen3.8-max"),
-            model("qwen/qwen3.8-flash"),
-            model("qwen/qwen3:4b"),
-        ]);
+        let catalog = TestCatalog {
+            models: vec![
+                model("qwen/qwen3.8-max"),
+                model("qwen/qwen3.8-flash"),
+                model("qwen/qwen3:4b"),
+            ],
+        };
 
         assert_eq!(
             resolve_small_model(&catalog, "qwen/qwen3.8-max"),
@@ -152,11 +180,13 @@ mod tests {
 
     #[test]
     fn does_not_cross_provider_boundaries_or_select_the_primary_model() {
-        let catalog = InMemoryModelCatalog::new(vec![
-            model("openai/gpt-5.5"),
-            model("openai/gpt-5.5-mini"),
-            model("ollama/qwen3:4b"),
-        ]);
+        let catalog = TestCatalog {
+            models: vec![
+                model("openai/gpt-5.5"),
+                model("openai/gpt-5.5-mini"),
+                model("ollama/qwen3:4b"),
+            ],
+        };
 
         assert_eq!(resolve_small_model(&catalog, "openai/gpt-5.5-mini"), None);
     }

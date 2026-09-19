@@ -214,10 +214,23 @@ pub struct TurnRecord {
 }
 
 /// Carries a simple text payload for lightweight item kinds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TextItem {
     /// The textual payload for the item.
     pub text: String,
+    /// Local image paths attached to a user/steer message. Empty for other kinds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_image_paths: Vec<PathBuf>,
+}
+
+impl TextItem {
+    /// Text-only item with no attached local images.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            local_image_paths: Vec::new(),
+        }
+    }
 }
 
 /// Stores one tool-call request as a persisted item payload.
@@ -539,6 +552,8 @@ pub enum SessionSettingsField {
     AutoRefineEnabled,
     /// Root auto-refine turn interval (`SessionSettings.auto_refine_turn_interval`).
     AutoRefineTurnInterval,
+    /// Python cell first foreground wait (`SessionSettings.python_cell_first_wait_ms`).
+    PythonCellFirstWaitMs,
 }
 
 /// Stores one field-level session settings change in the rollout file.
@@ -895,9 +910,7 @@ mod tests {
                 tool_name: "shell_command".into(),
                 input: serde_json::json!({"command":"pwd"}),
             })],
-            output_items: vec![TurnItem::AgentMessage(TextItem {
-                text: "running".into(),
-            })],
+            output_items: vec![TurnItem::AgentMessage(TextItem::text("running"))],
             worklog: None,
             error: None,
             schema_version: 1,
@@ -949,18 +962,10 @@ mod tests {
     #[test]
     fn turn_item_all_variants_roundtrip() {
         let variants = vec![
-            TurnItem::UserMessage(TextItem {
-                text: "hello".into(),
-            }),
-            TurnItem::SteerInput(TextItem {
-                text: "steer".into(),
-            }),
-            TurnItem::AgentMessage(TextItem {
-                text: "response".into(),
-            }),
-            TurnItem::Reasoning(TextItem {
-                text: "think".into(),
-            }),
+            TurnItem::UserMessage(TextItem::text("hello")),
+            TurnItem::SteerInput(TextItem::text("steer")),
+            TurnItem::AgentMessage(TextItem::text("response")),
+            TurnItem::Reasoning(TextItem::text("think")),
             TurnItem::ToolCall(ToolCallItem {
                 tool_call_id: "t1".into(),
                 tool_name: "read".into(),
@@ -999,17 +1004,11 @@ mod tests {
                 scope: "Once".into(),
                 decision_source: None,
             }),
-            TurnItem::Plan(TextItem { text: "[]".into() }),
-            TurnItem::ContextCompaction(TextItem {
-                text: "summary".into(),
-            }),
-            TurnItem::TurnSummary(TextItem { text: "0".into() }),
-            TurnItem::WebSearch(TextItem {
-                text: "results".into(),
-            }),
-            TurnItem::HookPrompt(TextItem {
-                text: "hook".into(),
-            }),
+            TurnItem::Plan(TextItem::text("[]")),
+            TurnItem::ContextCompaction(TextItem::text("summary")),
+            TurnItem::TurnSummary(TextItem::text("0")),
+            TurnItem::WebSearch(TextItem::text("results")),
+            TurnItem::HookPrompt(TextItem::text("hook")),
         ];
 
         for variant in variants {
@@ -1387,10 +1386,8 @@ mod tests {
             attempt_placement: None,
             turn_status: Some(TurnStatus::Running),
             sibling_turn_ids: Vec::new(),
-            input_items: vec![TurnItem::UserMessage(TextItem {
-                text: "test".into(),
-            })],
-            output_items: vec![TurnItem::AgentMessage(TextItem { text: "ok".into() })],
+            input_items: vec![TurnItem::UserMessage(TextItem::text("test"))],
+            output_items: vec![TurnItem::AgentMessage(TextItem::text("ok"))],
             worklog: None,
             error: None,
             schema_version: 1,

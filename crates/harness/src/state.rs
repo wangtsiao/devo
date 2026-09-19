@@ -104,17 +104,15 @@ impl HarnessState {
         let mut file = fs::File::open(path)?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)?;
-        let value: serde_json::Value = serde_json::from_str(&buf).map_err(|e| {
-            HarnessStateError::Corrupt(format!("invalid JSON: {e}"))
-        })?;
+        let value: serde_json::Value = serde_json::from_str(&buf)
+            .map_err(|e| HarnessStateError::Corrupt(format!("invalid JSON: {e}")))?;
         if !value.is_object() {
             return Err(HarnessStateError::Corrupt(
                 "root must be a JSON object".into(),
             ));
         }
-        let state: Self = serde_json::from_value(value).map_err(|e| {
-            HarnessStateError::Corrupt(format!("schema parse failed: {e}"))
-        })?;
+        let state: Self = serde_json::from_value(value)
+            .map_err(|e| HarnessStateError::Corrupt(format!("schema parse failed: {e}")))?;
         Ok(state)
     }
 
@@ -191,9 +189,6 @@ mod tests {
         );
         state.save_atomic(&path).unwrap();
         let loaded = HarnessState::load(&path).unwrap();
-        assert_eq!(
-            loaded.entries["memory"]["m1"].content,
-            "hello"
-        );
+        assert_eq!(loaded.entries["memory"]["m1"].content, "hello");
     }
 }

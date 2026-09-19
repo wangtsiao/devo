@@ -7,6 +7,7 @@
 pub mod anthropic;
 mod dsml;
 pub mod error;
+pub mod google;
 mod hosted_tools;
 mod http;
 pub mod openai;

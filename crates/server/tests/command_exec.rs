@@ -10,13 +10,6 @@ use async_trait::async_trait;
 use base64::Engine;
 #[cfg(unix)]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use devo_core::AgentsMdConfig;
-use devo_core::AppConfigStore;
-use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
-use devo_core::SkillsConfig;
-use devo_core::tools::ToolRegistry;
 #[cfg(unix)]
 use devo_protocol::CommandExecResult;
 use devo_protocol::ModelRequest;
@@ -25,11 +18,9 @@ use devo_protocol::ModelResponse;
 use devo_protocol::SessionId;
 use devo_protocol::StreamEvent;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
 use devo_server::ClientTransportKind;
 use devo_server::ProtocolErrorCode;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
 use futures::Stream;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -267,31 +258,11 @@ async fn session_bound_command_exec_resolves_session_cwd() -> Result<()> {
 }
 
 fn build_runtime(data_root: &std::path::Path) -> Result<Arc<ServerRuntime>> {
-    let provider: Arc<dyn ModelProviderSDK> = Arc::new(UnusedProvider);
-    let db = Arc::new(devo_server::db::Database::open(
-        data_root.join("command_exec.db"),
-    )?);
-    Ok(ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            Arc::new(ToolRegistry::new()),
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                ..SkillsConfig::default()
-            })),
-            AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(AppConfigStore::load(
-                data_root.to_path_buf(),
-                /*workspace_root*/ None,
-            )?)),
-        ),
-    ))
+    Ok(
+        devo_server::test_support::TestRuntime::new(Arc::new(UnusedProvider))
+            .db_file("command_exec.db")
+            .runtime(data_root),
+    )
 }
 
 async fn initialize_connection(
@@ -353,7 +324,7 @@ async fn start_session(
     let response: devo_server::SuccessResponse<
         devo_protocol::native::rpc_session::SessionNewResult,
     > = serde_json::from_value(response)?;
-    Ok(SessionId::try_from(response.result.session.id.as_str())?)
+    Ok(SessionId::from(response.result.session.id.as_str()))
 }
 
 #[cfg(unix)]

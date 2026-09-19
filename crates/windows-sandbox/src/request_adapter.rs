@@ -18,25 +18,19 @@ pub(crate) fn permission_profile_from_request(
     let mut entries = Vec::new();
     for root in &req.readable_roots {
         entries.push(FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: absolute_path(root)?,
-            },
+            path: FileSystemPath::from_path(absolute_path(root)?),
             access: FileSystemAccessMode::Read,
         });
     }
     for root in &req.writable_roots {
         entries.push(FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: absolute_path(root)?,
-            },
+            path: FileSystemPath::from_path(absolute_path(root)?),
             access: FileSystemAccessMode::Write,
         });
     }
     for root in &req.deny_read {
         entries.push(FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: absolute_path(root)?,
-            },
+            path: FileSystemPath::from_path(absolute_path(root)?),
             access: FileSystemAccessMode::Deny,
         });
     }

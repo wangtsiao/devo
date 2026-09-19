@@ -142,7 +142,7 @@ impl ToolHandler for ToolSearchHandler {
             ToolCallError::InternalError("loaded deferred tool state lock poisoned".into())
         })?;
         let result = execute_tool_search(
-            &ctx.session_id,
+            ctx.session_id.as_str(),
             &selection,
             &self.definitions,
             &mut loaded_tools,
@@ -444,8 +444,8 @@ mod tests {
                 ToolContext {
                     output_store: None,
                     tool_call_id: crate::invocation::ToolCallId("call".to_string()),
-                    session_id: "session-1".to_string(),
-                    turn_id: Some("turn-1".to_string()),
+                    session_id: "session-1".into(),
+                    turn_id: Some("turn-1".into()),
                     workspace_root: std::path::PathBuf::from("."),
                     budgets: crate::contracts::ToolBudgets {
                         output_limit_bytes: 1024,
@@ -461,6 +461,11 @@ mod tests {
                     network_no_proxy: None,
                     sandbox_permission_overlay: None,
                     sandbox_profile: None,
+                    kernel: None,
+                    python_cell_first_wait_ms: None,
+                    python_cell_watch: None,
+            python_cell_completion: None,
+                session_dir: None,
                 },
                 serde_json::json!({ "query": "knowledge base" }),
                 None,
@@ -584,8 +589,8 @@ mod tests {
                     ToolContext {
                         output_store: None,
                         tool_call_id: crate::invocation::ToolCallId(format!("call-{requested}")),
-                        session_id: "session-1".to_string(),
-                        turn_id: Some("turn-1".to_string()),
+                        session_id: "session-1".into(),
+                        turn_id: Some("turn-1".into()),
                         workspace_root: std::path::PathBuf::from("."),
                         budgets: crate::contracts::ToolBudgets {
                             output_limit_bytes: 1024,
@@ -601,6 +606,11 @@ mod tests {
                         network_no_proxy: None,
                         sandbox_permission_overlay: None,
                         sandbox_profile: None,
+                        kernel: None,
+                        python_cell_first_wait_ms: None,
+                        python_cell_watch: None,
+            python_cell_completion: None,
+                    session_dir: None,
                     },
                     serde_json::json!({ "query": format!("select:{requested}") }),
                     None,

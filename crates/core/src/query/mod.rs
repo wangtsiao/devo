@@ -10,12 +10,12 @@ mod provider_retry;
 mod stream_consumer;
 mod turn_continuation;
 
+pub use devo_protocol::native::event::ModelQueryRetryPhase;
 pub use event::EventCallback;
 pub use event::LiveTurnSettings;
 pub use event::ProviderRetryStatus;
 pub use event::QueryEvent;
 pub use event::QueryOptions;
-pub use event::QueryProviderRetryPhase;
 pub use event::SharedLastModelRequest;
 pub use event::SharedLiveTurnSettings;
 
@@ -47,6 +47,7 @@ use devo_protocol::HostedToolDefinition;
 use devo_protocol::HostedWebFetchTool;
 use devo_protocol::HostedWebSearchTool;
 use devo_protocol::ModelRequest;
+use devo_protocol::ProviderWireApi;
 use devo_protocol::RequestContent;
 use devo_protocol::RequestMessage;
 use devo_protocol::ResolvedReasoningRequest;
@@ -95,12 +96,24 @@ use crate::response_item::message_to_response_items;
 
 const SUBAGENT_MODE_REMINDER: &str = include_str!("../../prompts/subagent_mode_reminder.md");
 
+fn supports_provider_hosted_web_search(wire_api: ProviderWireApi) -> bool {
+    matches!(
+        wire_api,
+        ProviderWireApi::AnthropicMessages | ProviderWireApi::OpenAIResponses
+    )
+}
+
 fn hosted_tools_for_web_capabilities(
     web_search: &devo_config::ResolvedWebSearchConfig,
     web_fetch: devo_config::ResolvedWebFetchConfig,
+    wire_api: ProviderWireApi,
 ) -> Vec<HostedToolDefinition> {
     let mut hosted_tools = Vec::new();
-    if matches!(web_search, devo_config::ResolvedWebSearchConfig::Provider) {
+    // Hosted web_search is only meaningful on Anthropic Messages and OpenAI
+    // Responses wires (DeepSeek cloud, etc.). Chat Completions stays local-only.
+    if matches!(web_search, devo_config::ResolvedWebSearchConfig::Provider)
+        && supports_provider_hosted_web_search(wire_api)
+    {
         hosted_tools.push(HostedToolDefinition::WebSearch(HostedWebSearchTool::new()));
     }
     if web_fetch.is_provider() {
@@ -113,7 +126,11 @@ fn hosted_tools_for_web_capabilities(
 fn hosted_tools_for_web_search(
     web_search: &devo_config::ResolvedWebSearchConfig,
 ) -> Vec<HostedToolDefinition> {
-    hosted_tools_for_web_capabilities(web_search, devo_config::ResolvedWebFetchConfig::Disabled)
+    hosted_tools_for_web_capabilities(
+        web_search,
+        devo_config::ResolvedWebFetchConfig::Disabled,
+        ProviderWireApi::AnthropicMessages,
+    )
 }
 
 /// Compact session messages using LLM-backed summarization.
@@ -369,7 +386,8 @@ fn is_injected_context_message(message: &RequestMessage) -> bool {
             | RequestContent::ProviderReasoning { .. }
             | RequestContent::HostedToolUse { .. }
             | RequestContent::ToolUse { .. }
-            | RequestContent::ToolResult { .. } => false,
+            | RequestContent::ToolResult { .. }
+            | RequestContent::Image { .. } => false,
         })
 }
 
@@ -689,8 +707,11 @@ pub async fn query(
             insert_subagent_request_reminders(&mut messages);
         }
 
-        let hosted_tools =
-            hosted_tools_for_web_capabilities(&turn_config.web_search, turn_config.web_fetch);
+        let hosted_tools = hosted_tools_for_web_capabilities(
+            &turn_config.web_search,
+            turn_config.web_fetch,
+            active_turn_config.model.provider,
+        );
         let request = ModelRequest {
             model_slug: devo_protocol::ModelProfileKey::CatalogSlug(catalog_request_model),
             model: provider_request_model,
@@ -842,6 +863,17 @@ pub async fn query(
                         continue;
                     }
                     ProviderRetryDecision::Fail => {
+                        if retry_count > 0 {
+                            emit_query_event(
+                                &on_event,
+                                QueryEvent::ProviderQueryFailed {
+                                    attempt: retry_count,
+                                    max_attempts: provider_retry::max_provider_retries(),
+                                    message: retry_error.to_string(),
+                                },
+                            )
+                            .await;
+                        }
                         return Err(AgentError::Provider(retry_error));
                     }
                 }
@@ -1104,12 +1136,14 @@ pub async fn query(
             "tool batch completed"
         );
 
-        // Build tool result message (user role, per Anthropic API convention)
+        // Build tool result message (user role, per Anthropic API convention).
+        // Vision attachments from tools (e.g. attach-image via ipython) are
+        // sibling Image blocks so providers receive real multimodal input.
         let truncation_policy = TruncationPolicy::from(turn_config.model.truncation_policy);
         let mut artifacts = Vec::new();
         let result_content: Vec<ContentBlock> = results
             .into_iter()
-            .map(|r| {
+            .flat_map(|r| {
                 artifacts.extend(r.output_artifacts.clone());
                 let tool_name = tool_result_metadata
                     .get(r.tool_use_id.as_str())
@@ -1138,11 +1172,18 @@ pub async fn query(
                 } else {
                     truncate_tool_result_for_model(content_str, tool_name, truncation_policy)
                 };
-                ContentBlock::ToolResult {
+                let mut blocks = vec![ContentBlock::ToolResult {
                     tool_use_id: r.tool_use_id,
                     content,
                     is_error: r.is_error,
+                }];
+                for image in r.images {
+                    blocks.push(ContentBlock::Image {
+                        mime_type: image.mime_type,
+                        data_base64: image.data_base64,
+                    });
                 }
+                blocks
             })
             .collect();
 

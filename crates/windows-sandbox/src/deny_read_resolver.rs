@@ -211,9 +211,9 @@ mod tests {
 
     fn unreadable_path_entry(path: PathBuf) -> FileSystemSandboxEntry {
         FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: AbsolutePathBuf::from_absolute_path(path).expect("absolute path"),
-            },
+            path: FileSystemPath::from_path(
+                AbsolutePathBuf::from_absolute_path(path).expect("absolute path"),
+            ),
             access: FileSystemAccessMode::Deny,
         }
     }

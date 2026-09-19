@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use tracing::warn;
 
+use crate::error::ProviderError;
 use crate::error::context_limit_error;
 use crate::timeout::connect_timeout;
 
@@ -192,12 +193,48 @@ pub(crate) async fn invalid_status_error(
         .as_ref()
         .and_then(|value| value.pointer("/error/code"))
         .and_then(Value::as_str);
-    if let Some(error) = context_limit_error(message, error_kind, error_code) {
+    if let Some(error) = context_limit_error(message.clone(), error_kind, error_code) {
         return anyhow::Error::new(error);
     }
-    anyhow::anyhow!(
+    // Prefer typed HTTP classification so retry policy does not treat
+    // "stream error … 400 Bad Request" as a transient network failure.
+    let typed = match status.as_u16() {
+        401 | 403 => Some(ProviderError::AuthenticationError {
+            message: message.clone(),
+            provider_name: Some(provider.to_string()),
+            status_code: Some(status.as_u16()),
+        }),
+        404 => Some(ProviderError::ModelNotFoundError {
+            message: message.clone(),
+            model_name: Some(model.to_string()),
+        }),
+        408 => Some(ProviderError::ProviderTimeoutError {
+            message: message.clone(),
+            provider_name: Some(provider.to_string()),
+        }),
+        429 => Some(ProviderError::RateLimitError {
+            message: message.clone(),
+            retry_after_seconds: None,
+            provider_name: Some(provider.to_string()),
+        }),
+        400..=499 => Some(ProviderError::InvalidRequestError {
+            message: message.clone(),
+            details: Some(response_body.clone()),
+        }),
+        500..=599 => Some(ProviderError::ProviderServerError {
+            message: message.clone(),
+            status_code: Some(status.as_u16()),
+            provider_name: Some(provider.to_string()),
+        }),
+        _ => None,
+    };
+    let summary = format!(
         "{provider} {operation} error for model {model}: Invalid status code: {status}; response body: {response_body}"
-    )
+    );
+    if let Some(error) = typed {
+        return anyhow::Error::new(error).context(summary);
+    }
+    anyhow::anyhow!(summary)
 }
 
 fn parse_custom_headers(headers: Option<String>) -> Result<HeaderMap> {

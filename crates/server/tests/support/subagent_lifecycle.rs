@@ -9,11 +9,6 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use devo_core::AppConfigStore;
-use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
-use devo_core::PresetModelCatalog;
-use devo_core::SkillsConfig;
 use devo_core::tools::AgentToolCoordinator;
 use devo_core::tools::create_default_tool_registry;
 use devo_protocol::AgentListParams;
@@ -34,10 +29,8 @@ use devo_protocol::WaitAgentParams;
 use devo_protocol::WaitAgentResult;
 use devo_protocol::native::rpc_turn::TurnStartResult;
 use devo_provider::ModelProviderSDK;
-use devo_provider::SingleProviderRouter;
 use devo_server::ClientTransportKind;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -266,28 +259,10 @@ pub fn build_runtime(
     data_root: &std::path::Path,
     provider: Arc<dyn ModelProviderSDK>,
 ) -> Result<Arc<ServerRuntime>> {
-    let db_path = data_root.join("subagent_lifecycle.db");
-    let db = Arc::new(devo_server::db::Database::open(db_path).expect("open test database"));
-    Ok(ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            Arc::clone(&provider),
-            Arc::new(SingleProviderRouter::new(provider)),
-            Arc::new(create_default_tool_registry()),
-            devo_server::empty_mcp_manager(),
-            "test-model".to_string(),
-            Arc::new(PresetModelCatalog::default()),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                ..SkillsConfig::default()
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(
-                AppConfigStore::load(data_root.to_path_buf(), None).expect("load app config store"),
-            )),
-        ),
-    ))
+    Ok(devo_server::test_support::TestRuntime::new(provider)
+        .registry(Arc::new(create_default_tool_registry()))
+        .db_file("subagent_lifecycle.db")
+        .runtime(data_root))
 }
 
 pub async fn initialize_connection(
@@ -344,7 +319,7 @@ pub async fn start_parent_session(
         )
         .await
         .context("session/new")?;
-    Ok(devo_protocol::SessionId::try_from(
+    Ok(devo_protocol::SessionId::from(
         serde_json::from_value::<
             devo_server::SuccessResponse<devo_protocol::native::rpc_session::SessionNewResult>,
         >(response)?
@@ -352,7 +327,7 @@ pub async fn start_parent_session(
         .session
         .id
         .as_str(),
-    )?)
+    ))
 }
 
 pub async fn spawn_child(
@@ -596,7 +571,8 @@ pub fn message_texts(request: &ModelRequest) -> Vec<String> {
                 | RequestContent::ProviderReasoning { .. }
                 | RequestContent::ToolUse { .. }
                 | RequestContent::HostedToolUse { .. }
-                | RequestContent::ToolResult { .. } => None,
+                | RequestContent::ToolResult { .. }
+                | RequestContent::Image { .. } => None,
             })
         })
         .collect()

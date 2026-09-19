@@ -156,7 +156,10 @@ mod tests {
     /// Verifies: empty harness produces an empty digest (no empty heading spam).
     #[test]
     fn empty_state_digest_is_empty() {
-        assert_eq!(format_harness_state_for_prompt(&HarnessState::default()), "");
+        assert_eq!(
+            format_harness_state_for_prompt(&HarnessState::default()),
+            ""
+        );
     }
 
     /// Trace: L2-DES-HARNESS-001
@@ -194,7 +197,7 @@ mod tests {
     #[test]
     fn strip_and_reattach_digest() {
         let digest = wrap_harness_digest("## Continual harness\n\n- keep me out of summarizer");
-        let history = vec![
+        let history = [
             digest.clone(),
             "user: do the work".into(),
             "assistant: ok".into(),

@@ -9,9 +9,10 @@
 //! a second in-memory copy in sync (a cache can be added later behind the
 //! same function).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use devo_protocol::native::ids::ItemId;
 use devo_protocol::native::item::ItemEnvelope;
 use devo_protocol::native::session::Session;
 use devo_protocol::native::turn::Turn;
@@ -38,6 +39,12 @@ pub struct CanonicalHistory {
     /// Latest context-window occupancy observed while reading the rollout
     /// (turn extras or compaction snapshots), when present.
     pub latest_context_occupancy: Option<devo_protocol::native::item::ContextOccupancy>,
+    /// Durable parent pointers for the in-session transcript tree (last edge wins).
+    pub tree_edges: HashMap<ItemId, Option<ItemId>>,
+    /// Current transcript-tree tip (last `SessionLeaf` wins).
+    pub leaf_id: Option<ItemId>,
+    /// Write sequence for the current leaf; used to ignore stale leaf lines.
+    pub leaf_epoch: u64,
 }
 
 /// Errors from reading a rollout file as canonical history.
@@ -134,6 +141,25 @@ fn apply_v2_line(history: &mut CanonicalHistory, line: RolloutLineV2) {
                 // and the first settings write must already observe a bump.
                 session.version = session.version.max(epoch + 1);
             }
+        }
+        RolloutLineV2::Internal {
+            entry: InternalRecordV2::SessionLeaf { epoch, leaf_id },
+            ..
+        } => {
+            if epoch >= history.leaf_epoch {
+                history.leaf_epoch = epoch;
+                history.leaf_id = leaf_id;
+            }
+        }
+        RolloutLineV2::Internal {
+            entry:
+                InternalRecordV2::TreeEdge {
+                    child_id,
+                    parent_id,
+                },
+            ..
+        } => {
+            history.tree_edges.insert(child_id, parent_id);
         }
         RolloutLineV2::SessionTitleUpdated { title, .. } => {
             // Title changes are session metadata; fold them so canonical
@@ -239,6 +265,11 @@ fn apply_settings_to_canonical_session(
                 session.settings.auto_refine_turn_interval = Some(interval.max(1));
             }
         }
+        SessionSettingsField::PythonCellFirstWaitMs => {
+            if let Ok(ms) = serde_json::from_value::<u64>(value) {
+                session.settings.python_cell_first_wait_ms = Some(ms);
+            }
+        }
     }
 }
 
@@ -275,7 +306,7 @@ mod tests {
             turn_status: Some(TurnStatus::Running),
             sibling_turn_ids: Vec::new(),
             input_items: Vec::new(),
-            output_items: vec![TurnItem::AgentMessage(TextItem { text: text.into() })],
+            output_items: vec![TurnItem::AgentMessage(TextItem::text(text))],
             worklog: None,
             error: None,
             schema_version: 1,

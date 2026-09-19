@@ -24,6 +24,9 @@ mod git_sides;
 mod view_cache;
 
 pub(crate) use diff::{error_view, unsupported_view};
+pub(crate) use fs_snapshot::{
+    ToolFsCheckpoint, ToolFsDiff, capture_tool_fs_checkpoint, take_tool_fs_diffs,
+};
 pub(crate) use git::{branch_view, staged_view, uncommitted_view, unstaged_view};
 pub(crate) use git_path::path_scoped_full_view;
 
@@ -305,6 +308,13 @@ impl ActiveWorkspaceBaseline {
         match self {
             Self::Git(baseline) => baseline.turn_id,
             Self::File(baseline) => baseline.turn_id,
+        }
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        match self {
+            Self::Git(baseline) => &baseline.workspace_root,
+            Self::File(baseline) => &baseline.workspace_root,
         }
     }
 

@@ -60,14 +60,15 @@ impl ServerRuntime {
         self.set_agent_status(parent_session_id, child_session_id, SubagentStatus::Failed)
             .await;
         if let Some(session_handle) = self.sessions.lock().await.get(&child_session_id).cloned() {
-            session_handle.set_session_idle(None).await;
+            session_handle.set_runtime_session_idle(None).await;
         }
-        self.broadcast_event(ServerEvent::SessionStatusChanged(
-            SessionStatusChangedPayload {
-                session_id: child_session_id,
-                status: SessionRuntimeStatus::Idle,
-            },
-        ))
+        self.broadcast_notification(
+            devo_protocol::native::event::ServerNotification::session_status_changed(
+                child_session_id,
+                SessionStatus::Idle,
+                /*active_turn_id*/ None,
+            ),
+        )
         .await;
         self.record_subagent_status_event_with_text(
             parent_session_id,
@@ -83,7 +84,7 @@ impl ServerRuntime {
     pub(super) async fn interrupt_child_runtime_work(
         self: &Arc<Self>,
         child_session_id: SessionId,
-    ) -> Option<TurnMetadata> {
+    ) -> Option<crate::turn::RuntimeTurn> {
         // Cancel via a clone rather than `remove` so a concurrent read of the
         // same token (e.g. `run_turn_model_query` fetching it to race against
         // the in-flight query) cannot lose the signal by finding the map entry
@@ -105,7 +106,7 @@ fn subagent_hook_extra(
     let agent_id = base
         .agent_id
         .clone()
-        .unwrap_or_else(|| base.session_id.clone());
+        .unwrap_or_else(|| base.session_id.to_string());
     let agent_type = base
         .agent_type
         .clone()
@@ -135,72 +136,18 @@ mod tests {
     use super::*;
 
     use anyhow::Result;
-    use async_trait::async_trait;
-    use devo_core::AppConfigStore;
-    use devo_core::BundledSkillsConfig;
-    use devo_core::FileSystemSkillCatalog;
-    use devo_core::PresetModelCatalog;
-    use devo_core::SkillsConfig;
     use devo_core::tools::AgentToolCoordinator;
-    use devo_core::tools::ToolRegistry;
     use devo_protocol::AgentInfo;
     use devo_protocol::AgentListParams;
-    use devo_protocol::ModelRequest;
-    use devo_protocol::ModelResponse;
-    use devo_protocol::StreamEvent;
     use devo_protocol::SuccessResponse;
     use devo_protocol::WaitAgentParams;
-    use devo_provider::ModelProviderSDK;
-    use devo_provider::SingleProviderRouter;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
-    struct NoopProvider;
-
-    #[async_trait]
-    impl ModelProviderSDK for NoopProvider {
-        async fn completion(&self, _request: ModelRequest) -> Result<ModelResponse> {
-            anyhow::bail!("noop provider does not support completion")
-        }
-
-        async fn completion_stream(
-            &self,
-            _request: ModelRequest,
-        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
-        {
-            anyhow::bail!("noop provider does not support streaming")
-        }
-
-        fn name(&self) -> &str {
-            "noop-provider"
-        }
-    }
-
     fn build_runtime(data_root: &std::path::Path) -> Result<Arc<ServerRuntime>> {
-        let provider: Arc<dyn ModelProviderSDK> = Arc::new(NoopProvider);
-        let db_path = data_root.join("startup_failure.db");
-        let db = Arc::new(crate::db::Database::open(db_path).expect("open test database"));
-        Ok(ServerRuntime::new(
-            data_root.to_path_buf(),
-            ServerRuntimeDependencies::new(
-                Arc::clone(&provider),
-                Arc::new(SingleProviderRouter::new(provider)),
-                Arc::new(ToolRegistry::new()),
-                crate::empty_mcp_manager(),
-                "test-model".to_string(),
-                Arc::new(PresetModelCatalog::default()),
-                Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                    bundled: Some(BundledSkillsConfig { enabled: false }),
-                    ..SkillsConfig::default()
-                })),
-                devo_core::AgentsMdConfig::default(),
-                db,
-                Arc::new(std::sync::Mutex::new(
-                    AppConfigStore::load(data_root.to_path_buf(), None)
-                        .expect("load app config store"),
-                )),
-            ),
-        ))
+        Ok(crate::test_support::TestRuntime::noop()
+            .db_file("startup_failure.db")
+            .runtime(data_root))
     }
 
     #[tokio::test]
@@ -257,7 +204,7 @@ mod tests {
             agents,
             vec![AgentInfo {
                 session_id: child_session_id,
-                parent_session_id: Some(parent_session_id),
+                parent_session_id: Some(parent_session_id,),
                 agent_path: "root/review".to_string(),
                 agent_nickname: "review".to_string(),
                 agent_role: "default".to_string(),
@@ -309,13 +256,11 @@ mod tests {
             .await;
         let response: SuccessResponse<SessionStartResult> =
             serde_json::from_value(value).expect("session start response");
-        let session_id = response.result.session.session_id;
+        let session_id = SessionId::from(response.result.session.id.as_str());
         let bad_rollout_path = data_root.path().join("rollout-dir");
         std::fs::create_dir(&bad_rollout_path)?;
         let session_handle = runtime.session(session_id).await.expect("session");
-        session_handle
-            .update_record_rollout_path(bad_rollout_path)
-            .await;
+        session_handle.update_rollout_path(bad_rollout_path).await;
 
         let error = runtime
             .start_runtime_turn(
@@ -334,7 +279,10 @@ mod tests {
 
         assert!(matches!(error, ToolCallError::InternalError(_)));
         assert_eq!(reservation.active_turn, None);
-        assert_eq!(summary.status, SessionRuntimeStatus::Idle);
+        assert_eq!(
+            summary.status,
+            devo_protocol::native::session::SessionStatus::Idle
+        );
         assert_eq!(reservation.latest_turn, None);
 
         Ok(())

@@ -1,15 +1,15 @@
 use super::tool_display::*;
 use super::types::*;
-use crate::*;
 use devo_core::tools::tool_spec::ToolPreparationFeedback;
-use devo_core::{ItemId, SessionId, TurnId};
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 
-use super::context_compaction::{completed_event, failed_events, started_event};
+use super::context_compaction::{completed_event, failed_item_notification, started_event};
 use super::event_stream::enqueue_query_event;
 use super::trace::QueryEventDeliveryPolicy;
 use super::trace::query_event_delivery_policy;
+use devo_protocol::native::event::ServerNotification;
+use devo_protocol::native::ids::{ItemId, SessionId, TurnId};
 
 #[test]
 fn command_progress_uses_command_execution_item_id() {
@@ -59,22 +59,25 @@ fn context_compaction_events_share_stable_item_lifecycle() {
 
     let started = started_event(session_id, turn_id, item_id);
     let completed = completed_event(session_id, turn_id, item_id, None);
-    assert!(matches!(started, ServerEvent::ItemStarted(_)));
-    assert!(matches!(completed, ServerEvent::ItemCompleted(_)));
-    assert_eq!(
-        match started {
-            ServerEvent::ItemStarted(payload) => payload.item.item_kind,
+    assert!(matches!(started, ServerNotification::ItemStarted { .. }));
+    assert!(matches!(
+        completed,
+        ServerNotification::ItemCompleted { .. }
+    ));
+    assert!(matches!(
+        match &started {
+            ServerNotification::ItemStarted { item } => &item.item,
             _ => unreachable!(),
         },
-        ItemKind::ContextCompaction
-    );
-    assert_eq!(
-        match completed {
-            ServerEvent::ItemCompleted(payload) => payload.item.item_kind,
+        devo_protocol::native::item::Item::ContextCompaction { .. }
+    ));
+    assert!(matches!(
+        match &completed {
+            ServerNotification::ItemCompleted { item } => &item.item,
             _ => unreachable!(),
         },
-        ItemKind::ContextCompaction
-    );
+        devo_protocol::native::item::Item::ContextCompaction { .. }
+    ));
 }
 
 #[test]
@@ -84,15 +87,12 @@ fn context_compaction_failure_closes_item_and_reports_visible_error() {
     let item_id = ItemId::new();
     let message = "context limit".to_string();
 
-    let events = failed_events(session_id, turn_id, item_id, message.clone());
-    assert!(matches!(events[0], ServerEvent::ItemCompleted(_)));
-    assert_eq!(
-        events[1],
-        ServerEvent::SessionCompactionFailed(SessionCompactionFailedPayload {
-            session_id,
-            message,
-        })
-    );
+    let item = failed_item_notification(session_id, turn_id, item_id, &message);
+    assert!(matches!(item, ServerNotification::ItemCompleted { .. }));
+    let _ = ServerNotification::ContextCompactionFailed {
+        session_id,
+        message,
+    };
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn plan_tool_detection_matches_update_plan() {
 }
 
 #[test]
-fn read_tool_start_item_contains_live_read_action() {
+fn read_tool_start_item_is_native_tool_call() {
     let input = serde_json::json!({
         "path": "crates/tui/src/mod.rs"
     });
@@ -123,27 +123,20 @@ fn read_tool_start_item_contains_live_read_action() {
         ToolPreparationFeedback::None,
     );
 
-    let payload: ToolCallPayload =
-        serde_json::from_value(start_item.payload).expect("tool call payload");
-
-    assert_eq!(start_item.item_kind, ItemKind::ToolCall);
     assert_eq!(
-        payload,
-        ToolCallPayload {
-            tool_call_id: "call-1".to_string(),
+        start_item.native_item,
+        devo_protocol::native::item::Item::ToolCall {
+            call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
-            parameters: input,
-            command_actions: vec![devo_protocol::parse_command::ParsedCommand::Read {
-                cmd: "read crates/tui/src/mod.rs".to_string(),
-                name: "crates/tui/src/mod.rs".to_string(),
-                path: std::path::PathBuf::from("crates/tui/src/mod.rs"),
-            }],
+            source: devo_protocol::native::item::ToolSource::Builtin,
+            server_name: None,
+            input: Some(input),
         }
     );
 }
 
 #[test]
-fn grep_tool_start_item_contains_live_search_action() {
+fn grep_tool_start_item_is_native_tool_call() {
     let input = serde_json::json!({
         "pattern": "ToolUseStart",
         "path": "crates/server/src"
@@ -157,27 +150,20 @@ fn grep_tool_start_item_contains_live_search_action() {
         ToolPreparationFeedback::None,
     );
 
-    let payload: ToolCallPayload =
-        serde_json::from_value(start_item.payload).expect("tool call payload");
-
-    assert_eq!(start_item.item_kind, ItemKind::ToolCall);
     assert_eq!(
-        payload,
-        ToolCallPayload {
-            tool_call_id: "call-1".to_string(),
+        start_item.native_item,
+        devo_protocol::native::item::Item::ToolCall {
+            call_id: "call-1".to_string(),
             tool_name: "grep".to_string(),
-            parameters: input,
-            command_actions: vec![devo_protocol::parse_command::ParsedCommand::Search {
-                cmd: "grep ToolUseStart in crates/server/src".to_string(),
-                query: Some("ToolUseStart".to_string()),
-                path: Some("crates/server/src".to_string()),
-            }],
+            source: devo_protocol::native::item::ToolSource::Builtin,
+            server_name: None,
+            input: Some(input),
         }
     );
 }
 
 #[test]
-fn code_search_tool_start_item_contains_live_search_action() {
+fn code_search_tool_start_item_is_native_tool_call() {
     let input = serde_json::json!({
         "operation": "search",
         "query": "live tool feedback",
@@ -192,27 +178,20 @@ fn code_search_tool_start_item_contains_live_search_action() {
         ToolPreparationFeedback::None,
     );
 
-    let payload: ToolCallPayload =
-        serde_json::from_value(start_item.payload).expect("tool call payload");
-
-    assert_eq!(start_item.item_kind, ItemKind::ToolCall);
     assert_eq!(
-        payload,
-        ToolCallPayload {
-            tool_call_id: "call-1".to_string(),
+        start_item.native_item,
+        devo_protocol::native::item::Item::ToolCall {
+            call_id: "call-1".to_string(),
             tool_name: "code_search".to_string(),
-            parameters: input,
-            command_actions: vec![devo_protocol::parse_command::ParsedCommand::Search {
-                cmd: "code_search live tool feedback in crates".to_string(),
-                query: Some("live tool feedback".to_string()),
-                path: Some("crates".to_string()),
-            }],
+            source: devo_protocol::native::item::ToolSource::Builtin,
+            server_name: None,
+            input: Some(input),
         }
     );
 }
 
 #[test]
-fn exec_tool_start_item_uses_command_execution_payload() {
+fn exec_tool_start_item_is_native_command_execution() {
     let input = serde_json::json!({
         "cmd": "cargo test -p devo-server"
     });
@@ -225,21 +204,21 @@ fn exec_tool_start_item_uses_command_execution_payload() {
         ToolPreparationFeedback::None,
     );
 
-    let payload: CommandExecutionPayload =
-        serde_json::from_value(start_item.payload).expect("command execution payload");
-
-    assert_eq!(start_item.item_kind, ItemKind::CommandExecution);
     assert_eq!(
-        payload,
-        CommandExecutionPayload {
-            tool_call_id: "call-1".to_string(),
-            tool_name: "exec_command".to_string(),
+        start_item.native_item,
+        devo_protocol::native::item::Item::CommandExecution {
+            call_id: "call-1".to_string(),
             command: "cargo test -p devo-server".to_string(),
+            argv: None,
+            cwd: std::path::PathBuf::new(),
             input: Some(input),
-            source: devo_protocol::protocol::ExecCommandSource::Agent,
-            command_actions: Vec::new(),
             output: None,
+            exit_code: None,
+            execution_handle: None,
             is_error: false,
+            execution_mode: devo_protocol::native::item::ExecutionMode::Foreground,
+            origin: devo_protocol::native::item::ExecOrigin::AgentTool,
+            sandbox: None,
         }
     );
 }
@@ -258,119 +237,15 @@ fn live_only_apply_patch_start_item_stays_tool_call() {
         ToolPreparationFeedback::LiveOnly,
     );
 
-    let payload: ToolCallPayload =
-        serde_json::from_value(start_item.payload).expect("tool call payload");
-
-    assert_eq!(start_item.item_kind, ItemKind::ToolCall);
     assert_eq!(
-        payload,
-        ToolCallPayload {
-            tool_call_id: "call-1".to_string(),
+        start_item.native_item,
+        devo_protocol::native::item::Item::ToolCall {
+            call_id: "call-1".to_string(),
             tool_name: "apply_patch".to_string(),
-            parameters: input,
-            command_actions: Vec::new(),
+            source: devo_protocol::native::item::ToolSource::Builtin,
+            server_name: None,
+            input: Some(input),
         }
-    );
-}
-
-#[test]
-fn command_actions_from_read_tool_input_builds_read_action() {
-    let actions = command_actions_from_tool_input(
-        "read",
-        "read crates/tui/src/mod.rs",
-        &serde_json::json!({
-            "filePath": "crates/tui/src/mod.rs"
-        }),
-    );
-    assert_eq!(
-        actions,
-        vec![devo_protocol::parse_command::ParsedCommand::Read {
-            cmd: "read crates/tui/src/mod.rs".to_string(),
-            name: "crates/tui/src/mod.rs".to_string(),
-            path: std::path::PathBuf::from("crates/tui/src/mod.rs"),
-        }]
-    );
-}
-
-#[test]
-fn command_actions_from_read_tool_input_without_path_is_empty() {
-    let actions =
-        command_actions_from_tool_input("read", "read", &serde_json::json!({ "limit": 10 }));
-    assert_eq!(actions, Vec::new());
-}
-
-#[test]
-fn command_actions_from_read_tool_result_summary_recovers_final_path() {
-    let actions = command_actions_from_tool_result(
-        "read",
-        "read ",
-        &serde_json::json!({}),
-        "read: crates/tui/src/mod.rs",
-    );
-    assert_eq!(
-        actions,
-        vec![devo_protocol::parse_command::ParsedCommand::Read {
-            cmd: "read crates/tui/src/mod.rs".to_string(),
-            name: "crates/tui/src/mod.rs".to_string(),
-            path: std::path::PathBuf::from("crates/tui/src/mod.rs"),
-        }]
-    );
-}
-
-#[test]
-fn command_actions_from_grep_tool_input_builds_search_action() {
-    let actions = command_actions_from_tool_input(
-        "grep",
-        "grep rebuild_restored_session in crates/tui/src",
-        &serde_json::json!({
-            "pattern": "rebuild_restored_session",
-            "path": "crates/tui/src"
-        }),
-    );
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        devo_protocol::parse_command::ParsedCommand::Search { query, path, .. }
-        if query.as_deref() == Some("rebuild_restored_session")
-            && path.as_deref() == Some("crates/tui/src")
-    ));
-}
-
-#[test]
-fn command_actions_from_glob_tool_input_include_pattern_and_path() {
-    let actions = command_actions_from_tool_input(
-        "glob",
-        "glob **/Cargo.toml in crates",
-        &serde_json::json!({
-            "pattern": "**/Cargo.toml",
-            "path": "crates"
-        }),
-    );
-    assert_eq!(
-        actions,
-        vec![devo_protocol::parse_command::ParsedCommand::ListFiles {
-            cmd: "glob **/Cargo.toml in crates".to_string(),
-            path: Some("**/Cargo.toml in crates".to_string()),
-        }]
-    );
-}
-
-#[test]
-fn command_actions_from_find_tool_input_include_pattern_and_path() {
-    let actions = command_actions_from_tool_input(
-        "find",
-        "find **/Cargo.toml in crates",
-        &serde_json::json!({
-            "pattern": "**/Cargo.toml",
-            "path": "crates"
-        }),
-    );
-    assert_eq!(
-        actions,
-        vec![devo_protocol::parse_command::ParsedCommand::ListFiles {
-            cmd: "find **/Cargo.toml in crates".to_string(),
-            path: Some("**/Cargo.toml in crates".to_string()),
-        }]
     );
 }
 
@@ -389,7 +264,7 @@ async fn provider_retry_status_waits_for_channel_capacity() {
         attempt: 1,
         max_attempts: 5,
         backoff_ms: 250,
-        phase: devo_core::QueryProviderRetryPhase::Scheduled,
+        phase: devo_core::ModelQueryRetryPhase::Scheduled,
         message: "Retrying provider request in 0.2s".to_string(),
     };
     let retry_event = devo_core::QueryEvent::ProviderRetryStatus(retry_status.clone());

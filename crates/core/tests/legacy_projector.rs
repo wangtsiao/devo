@@ -1,6 +1,6 @@
 //! Integration tests for the v1→v2 rollout migration: fixture files in the
 //! frozen legacy format are read through the dual-format dispatch and
-//! converted with `LegacyProjector`.
+//! converted with `project_legacy_line` (+ `RolloutWriteState`).
 //!
 //! The fixtures under `tests/fixtures/rollout_v1/` are generated from real
 //! legacy `RolloutLine` values built in Rust (the builders below) and kept
@@ -16,13 +16,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use devo_core::{
     ApprovalDecisionItem, ApprovalRequestItem, CollaborationMode, CommandExecutionItem,
     CompactionSnapshotLine, ContentPart, EditId, EditState, EnvironmentContext, ItemId, ItemLine,
-    ItemRecord, LanguageContext, LegacyProjector, MessageEditRecordedLine,
-    MessageEditRecordedRecord, Model, ParsedRolloutLine, Persona, RolloutLine, RolloutLineV2,
-    SessionContext, SessionContextUpdatedLine, SessionId, SessionMetaLine, SessionRecord,
-    SessionRollbackLine, SessionTitleFinalSource, SessionTitleState, SessionTitleUpdatedLine,
-    SystemPromptMode, TextItem, ToolCallItem, ToolProgressItem, ToolResultItem, TurnContext,
-    TurnError, TurnId, TurnItem, TurnKind, TurnLine, TurnRecord, TurnStatus, TurnUsage,
-    WorkspaceRestorePolicy, parse_rollout_line,
+    ItemRecord, LanguageContext, MessageEditRecordedLine, MessageEditRecordedRecord, Model,
+    ParsedRolloutLine, Persona, RolloutLine, RolloutLineV2, RolloutWriteState, SessionContext,
+    SessionContextUpdatedLine, SessionId, SessionMetaLine, SessionRecord, SessionRollbackLine,
+    SessionTitleFinalSource, SessionTitleState, SessionTitleUpdatedLine, SystemPromptMode,
+    TextItem, ToolCallItem, ToolProgressItem, ToolResultItem, TurnContext, TurnError, TurnId,
+    TurnItem, TurnKind, TurnLine, TurnRecord, TurnStatus, TurnUsage, WorkspaceRestorePolicy,
+    parse_rollout_line, project_legacy_line,
 };
 use devo_protocol::native::ids::ItemId as CanonicalItemId;
 use devo_protocol::native::item::{
@@ -192,16 +192,10 @@ fn basic_session_lines() -> Vec<RolloutLine> {
     let session = 0xb1;
     let turn = 0xb2;
     let mut conversation = item_record(0xb3, session, turn, 1);
-    conversation.input_items = vec![TurnItem::UserMessage(TextItem {
-        text: "Fix the flaky test".into(),
-    })];
+    conversation.input_items = vec![TurnItem::UserMessage(TextItem::text("Fix the flaky test"))];
     conversation.output_items = vec![
-        TurnItem::AgentMessage(TextItem {
-            text: "On it.".into(),
-        }),
-        TurnItem::Plan(TextItem {
-            text: "1. reproduce\n2. fix".into(),
-        }),
+        TurnItem::AgentMessage(TextItem::text("On it.")),
+        TurnItem::Plan(TextItem::text("1. reproduce\n2. fix")),
     ];
 
     let mut tool_pair = item_record(0xb4, session, turn, 2);
@@ -255,22 +249,16 @@ fn basic_session_lines() -> Vec<RolloutLine> {
     })];
 
     let mut steer = item_record(0xb8, session, turn, 6);
-    steer.input_items = vec![TurnItem::SteerInput(TextItem {
-        text: "also run clippy".into(),
-    })];
+    steer.input_items = vec![TurnItem::SteerInput(TextItem::text("also run clippy"))];
     steer.output_items = vec![
-        TurnItem::WebSearch(TextItem {
-            text: "search results".into(),
-        }),
-        TurnItem::Reasoning(TextItem {
-            text: "thinking...".into(),
-        }),
+        TurnItem::WebSearch(TextItem::text("search results")),
+        TurnItem::Reasoning(TextItem::text("thinking...")),
     ];
 
     let mut compaction = item_record(0xb9, session, turn, 7);
-    compaction.output_items = vec![TurnItem::ContextCompaction(TextItem {
-        text: "compacted summary".into(),
-    })];
+    compaction.output_items = vec![TurnItem::ContextCompaction(TextItem::text(
+        "compacted summary",
+    ))];
 
     vec![
         RolloutLine::SessionMeta(Box::new(SessionMetaLine {
@@ -372,15 +360,13 @@ fn internal_lines() -> Vec<RolloutLine> {
     });
 
     let mut internals = item_record(0xc3, 0xc1, 0xc2, 1);
-    internals.input_items = vec![TurnItem::HookPrompt(TextItem {
-        text: "hook text".into(),
-    })];
+    internals.input_items = vec![TurnItem::HookPrompt(TextItem::text("hook text"))];
     internals.output_items = vec![
         TurnItem::ToolProgress(ToolProgressItem {
             tool_call_id: "call-9".into(),
             message: "working".into(),
         }),
-        TurnItem::TurnSummary(TextItem { text: "3".into() }),
+        TurnItem::TurnSummary(TextItem::text("3")),
     ];
 
     vec![
@@ -442,9 +428,7 @@ fn orphan_decision_lines() -> Vec<RolloutLine> {
     })];
 
     let mut image = item_record(0xd4, 0xd1, 0xd2, 2);
-    image.output_items = vec![TurnItem::ImageGeneration(TextItem {
-        text: "image result".into(),
-    })];
+    image.output_items = vec![TurnItem::ImageGeneration(TextItem::text("image result"))];
 
     vec![
         RolloutLine::SessionMeta(Box::new(SessionMetaLine {
@@ -507,19 +491,13 @@ fn fixture_content(name: &str, lines: &[RolloutLine]) -> String {
 /// asserts that every line converts without error.
 fn project_fixture(name: &str, lines: &[RolloutLine]) -> Vec<RolloutLineV2> {
     let content = fixture_content(name, lines);
-    let mut projector = LegacyProjector::new();
+    let mut projector = RolloutWriteState::new();
     let mut out = Vec::new();
     for raw_line in content.lines() {
-        match parse_rollout_line(raw_line).expect("fixture line parses") {
-            ParsedRolloutLine::Legacy(line) => {
-                out.extend(
-                    projector
-                        .project_line(&line)
-                        .expect("legacy line projects without error"),
-                );
-            }
-            ParsedRolloutLine::V2(_) => panic!("fixture {name} must contain only legacy lines"),
-        }
+        let line: RolloutLine = serde_json::from_str(raw_line).expect("fixture line parses");
+        out.extend(
+            project_legacy_line(&mut projector, &line).expect("legacy line projects without error"),
+        );
     }
     out
 }
@@ -529,10 +507,8 @@ fn project_fixture(name: &str, lines: &[RolloutLine]) -> Vec<RolloutLineV2> {
 fn assert_v2_roundtrip(projected: &[RolloutLineV2]) {
     for line in projected {
         let raw = serde_json::to_string(line).expect("serialize v2 line");
-        match parse_rollout_line(&raw).expect("v2 line re-parses") {
-            ParsedRolloutLine::V2(parsed) => assert_eq!(parsed.as_ref(), line),
-            ParsedRolloutLine::Legacy(_) => panic!("v2 line parsed as legacy"),
-        }
+        let ParsedRolloutLine::V2(parsed) = parse_rollout_line(&raw).expect("v2 line re-parses");
+        assert_eq!(parsed.as_ref(), line);
     }
 }
 
@@ -582,9 +558,7 @@ fn basic_session_projects_all_lines_in_order() {
         matches!(&envelopes[0].item, Item::UserMessage { content, entry: UserMessageEntry::TurnStart, .. }
             if matches!(content.as_slice(), [UserInput::Text { text }] if text == "Fix the flaky test"))
     );
-    assert!(
-        matches!(&envelopes[1].item, Item::AssistantMessage { text, phase: None } if text == "On it.")
-    );
+    assert!(matches!(&envelopes[1].item, Item::AssistantMessage { text } if text == "On it."));
     assert!(
         matches!(&envelopes[3].item, Item::ToolCall { call_id, tool_name, source: ToolSource::Builtin, .. }
             if call_id == "call-1" && tool_name == "read_file")
@@ -817,7 +791,7 @@ fn orphan_approval_decision_becomes_warning_item() {
 
 #[test]
 fn command_execution_falls_back_to_empty_cwd_before_session_meta() {
-    let mut projector = LegacyProjector::new();
+    let mut projector = RolloutWriteState::new();
     let mut record = item_record(0xe1, 0xe2, 0xe3, 1);
     record.output_items = vec![TurnItem::CommandExecution(CommandExecutionItem {
         tool_call_id: "call-x".into(),
@@ -827,9 +801,8 @@ fn command_execution_falls_back_to_empty_cwd_before_session_meta() {
         output: serde_json::json!({}),
         is_error: false,
     })];
-    let projected = projector
-        .project_line(&item_line(record))
-        .expect("projection succeeds");
+    let projected =
+        project_legacy_line(&mut projector, &item_line(record)).expect("projection succeeds");
     let envelopes = item_envelopes(&projected);
     assert!(
         matches!(&envelopes[0].item, Item::CommandExecution { cwd, .. } if cwd == &PathBuf::new())

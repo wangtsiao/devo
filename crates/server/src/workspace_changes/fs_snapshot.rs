@@ -397,3 +397,73 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hasher.update(bytes);
     format!("sha256:{:x}", hasher.finalize())
 }
+
+/// Rolling filesystem checkpoint used to attribute file edits to a single tool.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolFsCheckpoint {
+    workspace_root: PathBuf,
+    manifest: FileManifest,
+}
+
+/// Prime `details.diffs[]` entry (`oldStr` / `newStr` / `startLine`).
+#[derive(Debug, Clone)]
+pub(crate) struct ToolFsDiff {
+    pub path: String,
+    pub old_str: String,
+    pub new_str: String,
+    pub start_line: u32,
+}
+
+pub(crate) fn capture_tool_fs_checkpoint(cwd: &Path) -> ToolFsCheckpoint {
+    ToolFsCheckpoint {
+        workspace_root: cwd.to_path_buf(),
+        manifest: scan_file_manifest(cwd),
+    }
+}
+
+/// Diff `prev` against the live workspace, then advance the checkpoint.
+pub(crate) fn take_tool_fs_diffs(prev: &ToolFsCheckpoint) -> (Vec<ToolFsDiff>, ToolFsCheckpoint) {
+    let next = capture_tool_fs_checkpoint(&prev.workspace_root);
+    let mut paths = BTreeSet::new();
+    paths.extend(prev.manifest.entries.keys().cloned());
+    paths.extend(next.manifest.entries.keys().cloned());
+
+    let mut diffs = Vec::new();
+    for path in paths {
+        let before = prev.manifest.entries.get(&path);
+        let after = next.manifest.entries.get(&path);
+        let changed = match (before, after) {
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(before), Some(after)) => {
+                before.hash != after.hash
+                    || before.size != after.size
+                    || before.kind != after.kind
+                    || before.text_content != after.text_content
+            }
+            (None, None) => false,
+        };
+        if !changed {
+            continue;
+        }
+        let old_str = before
+            .and_then(|entry| entry.text_content.clone())
+            .unwrap_or_default();
+        let new_str = after
+            .and_then(|entry| entry.text_content.clone())
+            .unwrap_or_default();
+        // Skip binary / unreadables where both sides lack text — no usable Prime diff.
+        if old_str.is_empty() && new_str.is_empty() {
+            continue;
+        }
+        diffs.push(ToolFsDiff {
+            path,
+            old_str,
+            new_str,
+            start_line: 1,
+        });
+        if diffs.len() >= 32 {
+            break;
+        }
+    }
+    (diffs, next)
+}

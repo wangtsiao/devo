@@ -2,8 +2,8 @@
 //!
 //! Mid-turn / mid-ipython only **schedules** (never applies). Apply runs in the
 //! post-`MergeTurn` pipeline via [`apply_pending_refine_at_boundary`] using
-//! `apply_proposal_re_read`. Planning via `crates/provider` is still a stub
-//! (placeholder proposal with empty edits until the auxiliary planner ships).
+//! `apply_proposal_re_read`. Planning prefers LLM `UsagePurpose::Refine` with
+//! heuristic fallback ([`plan_refine_proposal`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use super::*;
 use devo_harness::{
-    append_refinement, apply_proposal_re_read, record_from_proposal, should_auto_refine,
-    AutoRefineSettings, HarnessState, RefineProposal,
+    AutoRefineSettings, HarnessEntry, HarnessKind, HarnessScope, HarnessState, RefineEdit,
+    RefineEditOp, RefineProposal, append_refinement, apply_proposal_re_read, record_from_proposal,
+    should_auto_refine,
 };
 use devo_protocol::native::item::{Item, ItemEnvelope, ItemState};
 use devo_protocol::native::rpc_session::{SessionRefineRunParams, SessionRefineRunResult};
@@ -112,7 +113,7 @@ pub(crate) fn maybe_schedule_auto_refine(
         return false;
     }
     let params = SessionRefineRunParams {
-        session_id: session_id.clone(),
+        session_id: *session_id,
         instructions: Some("auto-interval".into()),
         global: false,
         rollback_id: None,
@@ -140,7 +141,13 @@ pub(crate) fn schedule_refine_run(
     is_root: bool,
     session_dir: Option<&Path>,
 ) -> SessionRefineRunResult {
-    schedule_refine_run_inner(session_id, params, is_root, session_dir, /*autonomous*/ false)
+    schedule_refine_run_inner(
+        session_id,
+        params,
+        is_root,
+        session_dir,
+        /*autonomous*/ false,
+    )
 }
 
 fn schedule_refine_run_inner(
@@ -158,8 +165,8 @@ fn schedule_refine_run_inner(
             refinement_id: None,
         };
     }
-    if let Some(dir) = session_dir {
-        if let Err(error) = ensure_session_harness(dir) {
+    if let Some(dir) = session_dir
+        && let Err(error) = ensure_session_harness(dir) {
             return SessionRefineRunResult {
                 scheduled: false,
                 note: None,
@@ -167,7 +174,6 @@ fn schedule_refine_run_inner(
                 refinement_id: None,
             };
         }
-    }
     let proposal_id = format!("refine_{}", Uuid::new_v4());
     let pending = PendingRefine {
         proposal_id: proposal_id.clone(),
@@ -192,7 +198,7 @@ fn schedule_refine_run_inner(
     }
 }
 
-/// Build a no-op proposal placeholder used until auxiliary model planning ships.
+/// Build a no-op proposal placeholder used when instructions are absent.
 pub(crate) fn placeholder_proposal(pending: &PendingRefine) -> RefineProposal {
     RefineProposal {
         id: pending.proposal_id.clone(),
@@ -200,10 +206,70 @@ pub(crate) fn placeholder_proposal(pending: &PendingRefine) -> RefineProposal {
             .instructions
             .clone()
             .unwrap_or_else(|| "manual".into()),
-        summary: "Refine scheduled (planning pending host pipeline)".into(),
+        summary: "Refine scheduled (no instruction edits)".into(),
         evidence: String::new(),
         expected_outcome: String::new(),
         edits: Vec::new(),
+    }
+}
+
+fn truncate_for_harness(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Heuristic refine planner: with non-empty instructions, emit a memory Create
+/// edit. Used as fallback when LLM planning is unavailable.
+pub(crate) fn plan_refine_proposal(pending: &PendingRefine, harness_path: &Path) -> RefineProposal {
+    let _ = HarnessState::load(harness_path);
+    let Some(instructions) = pending
+        .instructions
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    else {
+        return placeholder_proposal(pending);
+    };
+
+    let uuid_hex = Uuid::new_v4().as_simple().to_string();
+    let mem_id = format!("mem_refine_{}", &uuid_hex[..8]);
+    let title = truncate_for_harness(instructions, 80);
+    let content = truncate_for_harness(instructions, 500);
+    let now = Utc::now();
+    let entry = HarnessEntry {
+        id: mem_id.clone(),
+        kind: HarnessKind::Memory,
+        title: title.clone(),
+        content: content.clone(),
+        path: None,
+        scope: Some(HarnessScope::Local),
+        reference: json!({}),
+        arguments: json!({}),
+        metadata: json!({ "source": "refine_heuristic" }),
+        source: "refine".into(),
+        created_at: now,
+        updated_at: now,
+        version: 1,
+    };
+
+    RefineProposal {
+        id: pending.proposal_id.clone(),
+        trigger: instructions.to_string(),
+        summary: format!("Record refine instruction as memory: {title}"),
+        evidence: format!("User/agent refine instructions: {content}"),
+        expected_outcome: format!("Harness memory `{mem_id}` captures the refine focus."),
+        edits: vec![RefineEdit {
+            op: RefineEditOp::Create,
+            kind: HarnessKind::Memory,
+            id: mem_id,
+            before: None,
+            after: Some(entry),
+        }],
     }
 }
 
@@ -217,17 +283,32 @@ pub(crate) fn pending_status_json(
     })
 }
 
-/// Apply pending refine at the turn boundary. Never called from ipython.
+/// Apply pending refine at the turn boundary (heuristic planner).
 ///
-/// Returns true when an apply ran successfully.
+/// Used by unit tests; production post-turn uses
+/// [`ServerRuntime::apply_pending_refine_at_boundary`].
+#[cfg(test)]
 pub(crate) fn apply_pending_refine_at_boundary(
     session_id: &devo_protocol::native::ids::SessionId,
     session_dir: &Path,
     plan_mode: bool,
 ) -> Option<AppliedRefine> {
-    let Some(pending) = take_pending_refine(session_id) else {
-        return None;
-    };
+    apply_pending_refine_with_proposal(
+        session_id,
+        session_dir,
+        plan_mode,
+        plan_refine_proposal,
+    )
+}
+
+#[cfg(test)]
+fn apply_pending_refine_with_proposal(
+    session_id: &devo_protocol::native::ids::SessionId,
+    session_dir: &Path,
+    plan_mode: bool,
+    plan: impl FnOnce(&PendingRefine, &Path) -> RefineProposal,
+) -> Option<AppliedRefine> {
+    let pending = take_pending_refine(session_id)?;
     if plan_mode && pending.autonomous {
         // Re-queue autonomous refine until Plan Mode ends.
         PENDING_REFINES
@@ -245,7 +326,7 @@ pub(crate) fn apply_pending_refine_at_boundary(
         }
     };
 
-    let proposal = placeholder_proposal(&pending);
+    let proposal = plan(&pending, &harness_path);
     match apply_proposal_re_read(&harness_path, &proposal) {
         Ok(_state) => {
             let mut record = record_from_proposal(&proposal, &harness_path, Some("local"));
@@ -261,6 +342,55 @@ pub(crate) fn apply_pending_refine_at_boundary(
         Err(error) => {
             tracing::warn!(%error, "refine apply failed");
             None
+        }
+    }
+}
+
+impl ServerRuntime {
+    /// Apply pending refine with LLM planning (`UsagePurpose::Refine`) and
+    /// heuristic fallback.
+    pub(crate) async fn apply_pending_refine_at_boundary(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        native_session_id: &devo_protocol::native::ids::SessionId,
+        session_dir: &Path,
+        plan_mode: bool,
+    ) -> Option<AppliedRefine> {
+        let pending = take_pending_refine(native_session_id)?;
+        if plan_mode && pending.autonomous {
+            PENDING_REFINES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(native_session_id.as_str().to_string(), pending);
+            return None;
+        }
+        let harness_path = match ensure_session_harness(session_dir) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(%error, "refine apply skipped: harness unavailable");
+                return None;
+            }
+        };
+        let proposal = self
+            .plan_refine_proposal_llm(session_id, &pending, &harness_path)
+            .await;
+        // Re-insert was already consumed; apply directly.
+        match apply_proposal_re_read(&harness_path, &proposal) {
+            Ok(_state) => {
+                let mut record = record_from_proposal(&proposal, &harness_path, Some("local"));
+                record.rollback_of = pending.rollback_id.clone();
+                if let Err(error) = append_refinement(session_dir, &record) {
+                    tracing::warn!(%error, "failed to append refinements.jsonl");
+                }
+                Some(AppliedRefine {
+                    proposal,
+                    autonomous: pending.autonomous,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "refine apply failed");
+                None
+            }
         }
     }
 }
@@ -308,13 +438,7 @@ impl ServerRuntime {
                 );
             }
         };
-        let Ok(legacy_id) = SessionId::try_from(params.session_id.as_str()) else {
-            return self.error_response(
-                request_id,
-                ProtocolErrorCode::InvalidParams,
-                format!("invalid sessionId: {}", params.session_id.as_str()),
-            );
-        };
+        let legacy_id = params.session_id;
         let (is_root, session_dir) = {
             let sessions = self.sessions.lock().await;
             let Some(handle) = sessions.get(&legacy_id) else {
@@ -326,19 +450,13 @@ impl ServerRuntime {
             };
             let summary = handle.summary().await;
             let is_root = summary.as_ref().is_none_or(|s| s.agent_path.is_none());
-            let session_dir = handle
-                .record()
-                .await
-                .flatten()
-                .and_then(|record| record.rollout_path.parent().map(Path::to_path_buf));
+            let session_dir = handle.rollout_path().await.flatten().and_then(|path| {
+                crate::persistence::RolloutStore::rlm_session_dir_for_rollout(&path)
+            });
             (is_root, session_dir)
         };
-        let result = schedule_refine_run(
-            &params.session_id,
-            &params,
-            is_root,
-            session_dir.as_deref(),
-        );
+        let result =
+            schedule_refine_run(&params.session_id, &params, is_root, session_dir.as_deref());
         serde_json::to_value(SuccessResponse {
             id: request_id,
             result,
@@ -355,31 +473,42 @@ impl ServerRuntime {
         let Some(handle) = self.session(session_id).await else {
             return;
         };
-        let Some(record) = handle.record().await.flatten() else {
+        let Some(rollout_path) = handle.rollout_path().await.flatten() else {
             return;
         };
-        let turn_id = handle
-            .resume_snapshot()
-            .await
-            .and_then(|snap| snap.latest_turn.map(|t| t.turn_id))
-            .unwrap_or_else(TurnId::new);
-        let item_id = ItemId::new();
+        let resume_snapshot = handle.resume_snapshot().await;
+        let native_session_id = if let Some(snap) = resume_snapshot.as_ref() {
+            snap.summary.native.id
+        } else if let Some(session) = handle.native_session().await {
+            session.id
+        } else {
+            // boundary: session actor has no native session projection
+            session_id
+        };
+        let native_turn_id = resume_snapshot
+            .and_then(|snap| snap.latest_turn.map(|turn| turn.native.id))
+            .unwrap_or_else(|| {
+                // boundary: no RuntimeTurn on actor when refinement applied
+                TurnId::new()
+            });
         let seq = handle.allocate_item_seq().await.unwrap_or(0);
         let now = Utc::now();
         let envelope = ItemEnvelope {
-            id: devo_protocol::native::ids::ItemId::from_legacy_uuid(Uuid::from(item_id)),
-            session_id: devo_protocol::native::ids::SessionId::from_legacy_uuid(Uuid::from(
-                session_id,
-            )),
-            turn_id: devo_protocol::native::ids::TurnId::from_legacy_uuid(Uuid::from(turn_id)),
+            id: devo_protocol::native::ids::ItemId::new(),
+            session_id: native_session_id,
+            turn_id: native_turn_id,
             seq,
             revision: 1,
             created_at: now,
             updated_at: now,
             state: ItemState::Completed,
             item: applied.native_item(),
+            parent_id: None,
         };
-        if let Err(error) = self.rollout_store.append_canonical_item(&record, envelope) {
+        if let Err(error) = self
+            .rollout_store
+            .append_canonical_item_at(&rollout_path, envelope)
+        {
             tracing::warn!(%error, "failed to persist Item::Refinement");
         }
     }
@@ -396,7 +525,7 @@ mod tests {
     fn children_cannot_schedule() {
         let id = devo_protocol::native::ids::SessionId::from_string("ses_child".into());
         let params = SessionRefineRunParams {
-            session_id: id.clone(),
+            session_id: id,
             instructions: None,
             global: false,
             rollback_id: None,
@@ -409,12 +538,10 @@ mod tests {
     /// Verifies: root schedule last-write-wins pending refine.
     #[test]
     fn root_schedule_is_pending() {
-        let id = devo_protocol::native::ids::SessionId::from_string(format!(
-            "ses_{}",
-            Uuid::new_v4()
-        ));
+        let id =
+            devo_protocol::native::ids::SessionId::from_string(format!("ses_{}", Uuid::new_v4()));
         let params = SessionRefineRunParams {
-            session_id: id.clone(),
+            session_id: id,
             instructions: Some("focus".into()),
             global: false,
             rollback_id: None,
@@ -431,31 +558,19 @@ mod tests {
     /// Verifies: should_auto_refine integration schedules on interval for roots.
     #[test]
     fn auto_interval_schedules_on_root() {
-        let id = devo_protocol::native::ids::SessionId::from_string(format!(
-            "ses_{}",
-            Uuid::new_v4()
-        ));
+        let id =
+            devo_protocol::native::ids::SessionId::from_string(format!("ses_{}", Uuid::new_v4()));
         let settings = AutoRefineSettings {
             enabled: true,
             turn_interval: 2,
             ..AutoRefineSettings::default()
         };
         assert!(!maybe_schedule_auto_refine(
-            &id,
-            &settings,
-            true,
-            false,
-            true,
-            None
+            &id, &settings, true, false, true, None
         ));
         assert!(!peek_pending_refine(&id));
         assert!(maybe_schedule_auto_refine(
-            &id,
-            &settings,
-            true,
-            false,
-            true,
-            None
+            &id, &settings, true, false, true, None
         ));
         assert!(peek_pending_refine(&id));
         let taken = take_pending_refine(&id).expect("auto pending");
@@ -467,21 +582,14 @@ mod tests {
     /// Verifies: children never auto-refine even at interval.
     #[test]
     fn auto_interval_skips_children() {
-        let id = devo_protocol::native::ids::SessionId::from_string(format!(
-            "ses_{}",
-            Uuid::new_v4()
-        ));
+        let id =
+            devo_protocol::native::ids::SessionId::from_string(format!("ses_{}", Uuid::new_v4()));
         let settings = AutoRefineSettings {
             turn_interval: 1,
             ..AutoRefineSettings::default()
         };
         assert!(!maybe_schedule_auto_refine(
-            &id,
-            &settings,
-            false,
-            false,
-            true,
-            None
+            &id, &settings, false, false, true, None
         ));
         assert!(!peek_pending_refine(&id));
     }
@@ -491,12 +599,10 @@ mod tests {
     #[test]
     fn apply_at_boundary_persists_jsonl() {
         let dir = tempfile::tempdir().unwrap();
-        let id = devo_protocol::native::ids::SessionId::from_string(format!(
-            "ses_{}",
-            Uuid::new_v4()
-        ));
+        let id =
+            devo_protocol::native::ids::SessionId::from_string(format!("ses_{}", Uuid::new_v4()));
         let params = SessionRefineRunParams {
-            session_id: id.clone(),
+            session_id: id,
             instructions: Some("manual".into()),
             global: false,
             rollback_id: None,
@@ -514,10 +620,8 @@ mod tests {
     #[test]
     fn plan_mode_defers_autonomous_apply() {
         let dir = tempfile::tempdir().unwrap();
-        let id = devo_protocol::native::ids::SessionId::from_string(format!(
-            "ses_{}",
-            Uuid::new_v4()
-        ));
+        let id =
+            devo_protocol::native::ids::SessionId::from_string(format!("ses_{}", Uuid::new_v4()));
         let settings = AutoRefineSettings {
             turn_interval: 1,
             ..AutoRefineSettings::default()
@@ -548,5 +652,59 @@ mod tests {
             auto_refine_settings_from_session(Some(true), Some(10)).turn_interval,
             10
         );
+    }
+
+    /// Trace: L2-DES-HARNESS-001
+    /// Verifies: plan_refine_proposal with instructions yields a memory Create edit.
+    #[test]
+    fn plan_refine_proposal_with_instructions_emits_memory_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = HarnessState::file_path(dir.path());
+        HarnessState::default().save_atomic(&path).unwrap();
+        let pending = PendingRefine {
+            proposal_id: "refine_test".into(),
+            instructions: Some("  focus on harness digest wiring  ".into()),
+            global: false,
+            rollback_id: None,
+            requested_at: Utc::now(),
+            autonomous: false,
+        };
+        let proposal = plan_refine_proposal(&pending, &path);
+        assert_eq!(proposal.id, "refine_test");
+        assert!(!proposal.edits.is_empty());
+        assert_eq!(proposal.edits.len(), 1);
+        let edit = &proposal.edits[0];
+        assert_eq!(edit.op, RefineEditOp::Create);
+        assert_eq!(edit.kind, HarnessKind::Memory);
+        assert!(edit.id.starts_with("mem_refine_"));
+        let after = edit.after.as_ref().expect("after");
+        assert!(after.content.contains("harness digest"));
+        assert!(proposal.summary.contains("harness digest"));
+        assert!(proposal.evidence.contains("harness digest"));
+        assert!(proposal.expected_outcome.contains(&edit.id));
+    }
+
+    /// Trace: L2-DES-HARNESS-001
+    /// Verifies: empty/missing instructions keep the no-op empty-edits proposal.
+    #[test]
+    fn plan_refine_proposal_without_instructions_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = HarnessState::file_path(dir.path());
+        HarnessState::default().save_atomic(&path).unwrap();
+        let pending = PendingRefine {
+            proposal_id: "refine_empty".into(),
+            instructions: Some("   ".into()),
+            global: false,
+            rollback_id: None,
+            requested_at: Utc::now(),
+            autonomous: false,
+        };
+        let proposal = plan_refine_proposal(&pending, &path);
+        assert!(proposal.edits.is_empty());
+        let pending_none = PendingRefine {
+            instructions: None,
+            ..pending
+        };
+        assert!(plan_refine_proposal(&pending_none, &path).edits.is_empty());
     }
 }

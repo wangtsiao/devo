@@ -4,12 +4,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use devo_core::AppConfigStore;
-use devo_core::BundledSkillsConfig;
-use devo_core::FileSystemSkillCatalog;
 use devo_core::PresetModelCatalog;
-use devo_core::SkillsConfig;
-use devo_core::tools::ToolRegistry;
 use devo_protocol::Model;
 use devo_protocol::ModelProfileKey;
 use devo_protocol::ModelRequest;
@@ -36,7 +31,6 @@ use tokio::time::timeout;
 
 use devo_server::ClientTransportKind;
 use devo_server::ServerRuntime;
-use devo_server::ServerRuntimeDependencies;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedRequest {
@@ -533,32 +527,12 @@ fn build_runtime_with_models(
     default_model: &str,
     models: Vec<Model>,
 ) -> Result<Arc<ServerRuntime>> {
-    let provider: Arc<dyn ModelProviderSDK> = Arc::new(UnusedProvider);
-    let provider_router: Arc<dyn ProviderRouter> = router;
-    let db = Arc::new(devo_server::db::Database::open(
-        data_root.join("provider_routing.db"),
-    )?);
-    Ok(ServerRuntime::new(
-        data_root.to_path_buf(),
-        ServerRuntimeDependencies::new(
-            provider,
-            provider_router,
-            Arc::new(ToolRegistry::new()),
-            devo_server::empty_mcp_manager(),
-            default_model.to_string(),
-            Arc::new(PresetModelCatalog::new(models)),
-            Box::new(FileSystemSkillCatalog::new(SkillsConfig {
-                bundled: Some(BundledSkillsConfig { enabled: false }),
-                ..SkillsConfig::default()
-            })),
-            devo_core::AgentsMdConfig::default(),
-            db,
-            Arc::new(std::sync::Mutex::new(AppConfigStore::load(
-                data_root.to_path_buf(),
-                /*workspace_root*/ None,
-            )?)),
-        ),
-    ))
+    Ok(devo_server::test_support::TestRuntime::new(Arc::new(UnusedProvider))
+        .router(router)
+        .default_model(default_model)
+        .catalog(Arc::new(PresetModelCatalog::new(models)))
+        .db_file("provider_routing.db")
+        .runtime(data_root))
 }
 
 async fn initialize_connection(
@@ -637,7 +611,7 @@ async fn start_session_with_binding(
         devo_protocol::native::rpc_session::SessionNewResult,
     > = serde_json::from_value(response)
         .with_context(|| format!("decode session/new response: {response_value}"))?;
-    let session_id = SessionId::try_from(response.result.session.id.as_str())?;
+    let session_id = SessionId::from(response.result.session.id.as_str());
     let metadata_response = runtime
         .handle_incoming(
             connection_id,

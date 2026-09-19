@@ -211,7 +211,7 @@ impl ExecutionReplay {
 /// Load acknowledged facts for one turn, tolerating only a truncated crash tail.
 pub fn read_execution_replay(
     path: &std::path::Path,
-    turn_id: crate::TurnId,
+    turn_id: &devo_protocol::native::ids::TurnId,
 ) -> anyhow::Result<ExecutionReplay> {
     use crate::{
         InternalRecordV2, ParsedRolloutLine, RolloutLineReadError, RolloutLineV2,
@@ -233,11 +233,10 @@ pub fn read_execution_replay(
                     turn_id: Some(owner),
                     entry: InternalRecordV2::Execution { record },
                     ..
-                } if owner.as_str() == turn_id.to_string() => replay.apply(&record)?,
+                } if owner.as_str() == turn_id.as_str() => replay.apply(&record)?,
                 RolloutLineV2::CompactionSnapshot { .. } => replay.has_checkpoint = false,
                 _ => {}
             },
-            Ok(ParsedRolloutLine::Legacy(_)) => {}
             Err(RolloutLineReadError::TruncatedTail) => {
                 let mut only_blank = true;
                 while let Some(next) = lines.peek() {

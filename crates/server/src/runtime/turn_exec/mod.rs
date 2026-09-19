@@ -26,7 +26,7 @@ pub(crate) use types::ExecuteTurnRequest;
 use std::sync::Arc;
 
 use anyhow::Context;
-use devo_core::SessionId;
+use devo_protocol::native::ids::SessionId;
 
 use super::*;
 
@@ -61,21 +61,20 @@ pub(crate) fn spawn_post_turn_scheduling(
         }
 
         // (1) Compaction first — agent-requested pending compact (schedule-only
-        // mid-turn). Full overflow/threshold/manual orchestration is P4; here we
-        // consume the pending flag so it cannot stick across turns. In-turn
-        // auto-compact already ran inside `query` before MergeTurn.
-        let native_session_id =
-            devo_protocol::native::ids::SessionId::from_legacy_uuid(uuid::Uuid::from(session_id));
-        let had_pending_compact =
-            super::compact_host::take_pending_compact(&native_session_id).is_some();
-        if had_pending_compact {
-            // TODO(P4): invoke `run_session_compaction` / post-compact continue
-            // with digest strip+reattach when agent-requested compact owns the
-            // turn-end path. Do not apply refine inside that compact turn.
-            tracing::debug!(
-                %session_id,
-                "pending compact.run consumed at turn boundary (execution lands in P4)"
-            );
+        // mid-turn). Execute before refine so order stays compact → refine → ….
+        // In-turn auto-compact already ran inside `query` before MergeTurn.
+        let native_session_id = if let Some(handle) = runtime.session(session_id).await
+            && let Some(summary) = handle.summary().await
+        {
+            summary.native.id
+        } else {
+            // boundary: legacy session id when summary unavailable
+            session_id
+        };
+        if let Some(pending) = super::compact_host::take_pending_compact(&native_session_id) {
+            runtime
+                .execute_agent_requested_compaction(session_id, pending.instructions)
+                .await;
         }
 
         // Session facts for refine / auto-interval.
@@ -90,27 +89,30 @@ pub(crate) fn spawn_post_turn_scheduling(
             .collaboration_mode()
             .await
             .is_some_and(|m| m == devo_protocol::CollaborationMode::Plan);
-        let session_dir = handle
-            .record()
-            .await
-            .flatten()
-            .and_then(|record| record.rollout_path.parent().map(|p| p.to_path_buf()));
+        let session_dir =
+            handle.rollout_path().await.flatten().and_then(|path| {
+                crate::persistence::RolloutStore::rlm_session_dir_for_rollout(&path)
+            });
         let turn_succeeded = handle
             .resume_snapshot()
             .await
             .and_then(|snap| snap.latest_turn)
-            .is_some_and(|t| matches!(t.status, TurnStatus::Completed));
+            .is_some_and(|t| {
+                matches!(
+                    t.native.status,
+                    devo_protocol::native::turn::TurnStatus::Completed
+                )
+            });
         // Goal-continuation turns must not count toward auto-refine (DD-3).
         // Thread TurnInputMode through post-turn when goal turns are marked distinctly.
         let is_goal_continuation = false;
 
         // (2) Apply pending refine (never mid-ipython) then maybe schedule auto.
         if let Some(dir) = session_dir.as_deref() {
-            if let Some(applied) = super::refine::apply_pending_refine_at_boundary(
-                &native_session_id,
-                dir,
-                plan_mode,
-            ) {
+            if let Some(applied) = runtime
+                .apply_pending_refine_at_boundary(session_id, &native_session_id, dir, plan_mode)
+                .await
+            {
                 runtime
                     .persist_applied_refinement(session_id, &applied)
                     .await;
@@ -136,6 +138,10 @@ pub(crate) fn spawn_post_turn_scheduling(
         }
 
         // (3) Post-compact continue — reserved for P4 when compact owns retry.
+        // (3b) Async bash/python completion follow-ups (idle wake).
+        runtime
+            .drain_async_tool_completion_notices(session_id)
+            .await;
         // (4) Queue drain
         if runtime.chain_queued_followup_turn(session_id).await {
             return;
@@ -172,7 +178,7 @@ impl ServerRuntime {
     pub(crate) async fn persist_turn_line_deduped(
         self: &Arc<Self>,
         session_id: devo_core::SessionId,
-        turn: &crate::TurnMetadata,
+        turn: &crate::turn::RuntimeTurn,
     ) -> anyhow::Result<()> {
         let handle = self
             .session(session_id)
@@ -183,32 +189,43 @@ impl ServerRuntime {
             .await
     }
 
+    pub(crate) async fn persist_runtime_turn_line_deduped(
+        self: &Arc<Self>,
+        session_id: devo_core::SessionId,
+        turn: &crate::turn::RuntimeTurn,
+    ) -> anyhow::Result<()> {
+        self.persist_turn_line_deduped(session_id, turn).await
+    }
+
     pub(super) async fn prepare_turn_execution_for_actor(
         self: &Arc<Self>,
         state: &mut SessionActorState,
-        turn: &crate::TurnMetadata,
+        turn: &crate::turn::RuntimeTurn,
         display_input: &str,
+        input_image_paths: &[std::path::PathBuf],
         emits_user_message: bool,
     ) {
-        self.capture_turn_workspace_baseline(
-            state.session_id(),
-            turn.turn_id,
-            state.summary.cwd.clone(),
-        )
-        .await;
         state.turn_approval_cache = crate::execution::ApprovalGrantCache::default();
+        // Emit the visible user bubble before workspace baseline capture so the
+        // TUI is not blocked on git I/O (L2-DES-APP-010 first-party latency).
         if emits_user_message {
-            self.emit_turn_item(
-                state.session_id(),
-                turn.turn_id,
-                crate::ItemKind::UserMessage,
-                devo_core::TurnItem::UserMessage(devo_core::TextItem {
-                    text: display_input.to_string(),
-                }),
-                serde_json::json!({ "title": "You", "text": display_input }),
+            self.emit_turn_native_item(
+                state.summary.native.id,
+                *turn.native_turn_id(),
+                crate::runtime::items::native_user_message_item(
+                    display_input.to_string(),
+                    input_image_paths,
+                    devo_protocol::native::item::UserMessageEntry::Queue,
+                ),
             )
             .await;
         }
+        self.capture_turn_workspace_baseline(
+            state.session_id(),
+            turn.turn_id(),
+            state.summary.cwd.clone(),
+        )
+        .await;
     }
 
     pub(in crate::runtime) fn tool_registry_for_actor_state(

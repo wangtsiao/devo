@@ -59,7 +59,10 @@ fn kind_key(kind: HarnessKind) -> &'static str {
 }
 
 /// Re-read `path`, reject per-entry drift vs the proposal baseline, apply, save.
-pub fn apply_proposal_re_read(path: &Path, proposal: &RefineProposal) -> Result<HarnessState, ApplyError> {
+pub fn apply_proposal_re_read(
+    path: &Path,
+    proposal: &RefineProposal,
+) -> Result<HarnessState, ApplyError> {
     let mut state = HarnessState::load(path)?;
     for edit in &proposal.edits {
         if edit.id == "base_system_prompt" {
@@ -155,10 +158,11 @@ mod tests {
 
         // Mutate after planning baseline was captured.
         let mut drifted = HarnessState::load(&path).unwrap();
-        drifted.entries.get_mut("memory").unwrap().insert(
-            "m1".into(),
-            sample_entry("m1", "changed"),
-        );
+        drifted
+            .entries
+            .get_mut("memory")
+            .unwrap()
+            .insert("m1".into(), sample_entry("m1", "changed"));
         drifted.save_atomic(&path).unwrap();
 
         let proposal = RefineProposal {

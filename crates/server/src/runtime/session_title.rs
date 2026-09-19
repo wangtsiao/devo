@@ -134,17 +134,32 @@ impl ServerRuntime {
     }
 
     fn first_user_text_from_history(
-        history_items: &[devo_protocol::SessionHistoryItem],
+        history_items: &[devo_protocol::SessionHistoryEntry],
     ) -> Option<String> {
-        history_items.iter().find_map(|item| {
-            if item.kind != devo_protocol::SessionHistoryItemKind::User {
+        history_items.iter().find_map(|entry| {
+            let devo_protocol::SessionHistoryEntry::Item {
+                item: devo_protocol::native::item::Item::UserMessage { content, .. },
+            } = entry
+            else {
                 return None;
-            }
-            let body = item.body.trim();
-            if body.is_empty() {
+            };
+            let text = content
+                .iter()
+                .filter_map(|input| match input {
+                    devo_protocol::native::item::UserInput::Text { text } => Some(text.as_str()),
+                    devo_protocol::native::item::UserInput::Image { .. }
+                    | devo_protocol::native::item::UserInput::LocalImage { .. }
+                    | devo_protocol::native::item::UserInput::Audio { .. }
+                    | devo_protocol::native::item::UserInput::Skill { .. }
+                    | devo_protocol::native::item::UserInput::Mention { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = text.trim();
+            if text.is_empty() {
                 None
             } else {
-                Some(body.to_string())
+                Some(text.to_string())
             }
         })
     }
@@ -185,7 +200,7 @@ impl ServerRuntime {
         let previous_title = session_handle
             .summary()
             .await
-            .and_then(|summary| summary.title);
+            .and_then(|summary| summary.title.clone());
         let Some(updated_summary) = session_handle
             .update_title(
                 heuristic.clone(),
@@ -196,11 +211,11 @@ impl ServerRuntime {
         else {
             return;
         };
-        if let Some(record) = session_handle.record().await.flatten()
-            && let Err(error) = self.rollout_store.append_title_update(
-                &record,
+        if let Some(rollout_path) = session_handle.rollout_path().await.flatten()
+            && let Err(error) = self.rollout_store.append_title_update_at(
+                &rollout_path,
+                session_id,
                 heuristic,
-                SessionTitleState::Final(SessionTitleFinalSource::Heuristic),
                 previous_title,
             )
         {
@@ -208,10 +223,14 @@ impl ServerRuntime {
         }
         self.persist_session_summary_if_persistent(session_id, &updated_summary)
             .await;
-        self.broadcast_event(ServerEvent::SessionTitleUpdated(SessionEventPayload {
-            session: updated_summary,
-        }))
-        .await;
+        if let Some(session) = session_handle.native_session().await {
+            self.broadcast_notification(
+                devo_protocol::native::event::ServerNotification::SessionMetadataUpdated {
+                    session: Box::new(session),
+                },
+            )
+            .await;
+        }
     }
 
     const MAX_TITLE_POLISH_ATTEMPTS: usize = 5;
@@ -282,6 +301,19 @@ impl ServerRuntime {
             return true;
         }
 
+        let _aux_permit = match tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            self.auxiliary_model_slots.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                tracing::debug!(session_id = %session_id, "title polish deferred: auxiliary slot busy");
+                return false;
+            }
+        };
+
         let configured_small_model = title_context
             .runtime_context
             .config_store
@@ -292,7 +324,6 @@ impl ServerRuntime {
             .small_model;
         let primary_selection = title_context
             .model_selection
-            .clone()
             .unwrap_or_else(|| title_context.runtime_context.default_model.clone());
         let reasoning_effort_selection = title_context.reasoning_effort_selection.clone();
         let runtime_context = title_context.runtime_context;
@@ -381,7 +412,7 @@ impl ServerRuntime {
         let previous_title = session_handle
             .summary()
             .await
-            .and_then(|summary| summary.title);
+            .and_then(|summary| summary.title.clone());
         let Some(updated_summary) = session_handle
             .update_title(
                 generated_title.clone(),
@@ -393,11 +424,11 @@ impl ServerRuntime {
             // Rename / higher Final won the race — stop polishing.
             return true;
         };
-        if let Some(record) = session_handle.record().await.flatten()
-            && let Err(error) = self.rollout_store.append_title_update(
-                &record,
+        if let Some(rollout_path) = session_handle.rollout_path().await.flatten()
+            && let Err(error) = self.rollout_store.append_title_update_at(
+                &rollout_path,
+                session_id,
                 generated_title,
-                SessionTitleState::Final(SessionTitleFinalSource::ModelGenerated),
                 previous_title,
             )
         {
@@ -406,10 +437,14 @@ impl ServerRuntime {
 
         self.persist_session_summary_if_persistent(session_id, &updated_summary)
             .await;
-        self.broadcast_event(ServerEvent::SessionTitleUpdated(SessionEventPayload {
-            session: updated_summary,
-        }))
-        .await;
+        if let Some(session) = session_handle.native_session().await {
+            self.broadcast_notification(
+                devo_protocol::native::event::ServerNotification::SessionMetadataUpdated {
+                    session: Box::new(session),
+                },
+            )
+            .await;
+        }
         true
     }
 }

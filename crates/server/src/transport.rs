@@ -196,7 +196,7 @@ impl EventBroadcaster {
             .read()
             .await
             .get(session_id)
-            .copied()
+            .cloned()
             .unwrap_or(0)
     }
 
@@ -248,6 +248,10 @@ impl InternalProxyControl {
 
     fn request_shutdown(&self) {
         self.shutdown_token.cancel();
+    }
+
+    fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown_token
     }
 }
 
@@ -335,6 +339,9 @@ async fn run_listener_tasks(
     internal_proxy: Option<(InternalProxyEndpoint, String, InternalProxyControl)>,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
+    let shutdown_token = internal_proxy
+        .as_ref()
+        .map(|(_, _, control)| control.shutdown_token().clone());
     for target in targets {
         let runtime = Arc::clone(&runtime);
         tasks.spawn(async move {
@@ -358,11 +365,101 @@ async fn run_listener_tasks(
         );
     }
 
-    if let Some(result) = tasks.join_next().await {
-        tasks.abort_all();
-        result??;
+    // Every select arm returns — this is a single wait, not a polling loop.
+    tokio::select! {
+        biased;
+        () = async {
+            match &shutdown_token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => {
+            tracing::info!("listener shutdown signalled");
+            tasks.abort_all();
+            Ok(())
+        }
+        joined = tasks.join_next() => {
+            let Some(result) = joined else {
+                return Ok(());
+            };
+            match result {
+                Ok(Ok(())) => {
+                    // Primary stdio (or another listener) ended. Keep the
+                    // singleton alive while proxied TUI clients remain.
+                    let remaining = runtime.active_connection_count().await;
+                    if remaining > 0 && !tasks.is_empty() {
+                        tracing::info!(
+                            remaining,
+                            "primary client disconnected; keeping singleton for proxy clients"
+                        );
+                        wait_for_proxy_clients_to_drain(
+                            &runtime,
+                            &mut tasks,
+                            shutdown_token.as_ref(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    tasks.abort_all();
+                    Ok(())
+                }
+                Ok(Err(error)) => {
+                    tasks.abort_all();
+                    Err(error)
+                }
+                Err(error) => {
+                    tasks.abort_all();
+                    Err(error.into())
+                }
+            }
+        }
     }
-    Ok(())
+}
+
+async fn wait_for_proxy_clients_to_drain(
+    runtime: &Arc<ServerRuntime>,
+    tasks: &mut JoinSet<Result<()>>,
+    shutdown_token: Option<&CancellationToken>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            biased;
+            () = async {
+                match shutdown_token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                tasks.abort_all();
+                return Ok(());
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                let remaining = runtime.active_connection_count().await;
+                if remaining == 0 {
+                    tracing::info!("no proxy clients remain; shutting down singleton server");
+                    tasks.abort_all();
+                    return Ok(());
+                }
+            }
+            joined = tasks.join_next() => {
+                match joined {
+                    None => return Ok(()),
+                    Some(Ok(Ok(()))) => {
+                        tasks.abort_all();
+                        return Ok(());
+                    }
+                    Some(Ok(Err(error))) => {
+                        tasks.abort_all();
+                        return Err(error);
+                    }
+                    Some(Err(error)) => {
+                        tasks.abort_all();
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Stdio uses **NDJSON** (newline-delimited JSON): one JSON-RPC message per line.

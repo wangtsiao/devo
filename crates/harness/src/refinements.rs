@@ -40,6 +40,11 @@ pub fn kernel_snapshot_path(session_dir: &Path) -> PathBuf {
     session_dir.join("kernel.dill")
 }
 
+/// JSON manifest written next to [`kernel_snapshot_path`] (must be a distinct path).
+pub fn kernel_snapshot_manifest_path(session_dir: &Path) -> PathBuf {
+    session_dir.join("kernel.json")
+}
+
 pub fn append_refinement(
     session_dir: &Path,
     record: &RefinementResultRecord,
@@ -105,5 +110,12 @@ mod tests {
         let line = text.lines().next().unwrap();
         let back: RefinementResultRecord = serde_json::from_str(line).unwrap();
         assert_eq!(back.id, "r1");
+    }
+
+    #[test]
+    fn kernel_snapshot_paths_are_canonical() {
+        let dir = std::path::Path::new("/tmp/artifacts/sess");
+        assert_eq!(kernel_snapshot_path(dir), dir.join("kernel.dill"));
+        assert_eq!(kernel_snapshot_manifest_path(dir), dir.join("kernel.json"));
     }
 }

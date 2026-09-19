@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use devo_protocol::SessionId;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -23,7 +24,7 @@ pub struct ToolCallId(pub String);
 pub struct ToolInvocation {
     pub call_id: ToolCallId,
     pub tool_name: ToolName,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub cwd: PathBuf,
     pub input: serde_json::Value,
 }
