@@ -30,6 +30,7 @@ use std::path::Path;
 #[derive(Debug)]
 pub(crate) struct GrantChannel {
     socket: OwnedFd,
+    peer: OwnedFd,
 }
 
 /// Message shape sent with the descriptor (also carries the anti-swap claim).
@@ -45,18 +46,35 @@ pub(crate) struct GrantMessage {
 
 const SCM_MAX_FD: usize = 1;
 
+#[allow(dead_code)] // wired incrementally: session holds the channel; the
+// approval callback and Python facade land in the follow-up commit.
 impl GrantChannel {
-    /// Create the host end of the delivery channel; the peer fd is for the
-    /// kernel child (caller arranges inheritance).
-    pub(crate) fn new() -> io::Result<(Self, OwnedFd)> {
+    /// Create the channel; the peer descriptor is kept internally so the
+    /// host can duplicate it into the child at spawn (peer_fd).
+    pub(crate) fn new() -> io::Result<Self> {
         let mut fds = [0 as RawFd; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        // No CLOEXEC: the peer must survive the kernel exec.
-        let (host, peer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        Ok((Self { socket: host }, peer))
+        // No CLOEXEC: the peer duplicate survives the kernel exec.
+        let (host, peer) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        Ok(Self { socket: host, peer })
+    }
+
+    /// Test constructor: channel + a duplicate of the peer (so the receiving
+    /// side can recvmsg on its own copy).
+    #[cfg(test)]
+    pub(crate) fn with_peer_copy() -> io::Result<(Self, OwnedFd)> {
+        let me = Self::new()?;
+        let peer_dup = dup_no_cloexec(me.peer_fd())?;
+        Ok((me, unsafe { OwnedFd::from_raw_fd(peer_dup) }))
+    }
+
+    /// Peer fd number (duplicate this into the child at spawn).
+    pub(crate) fn peer_fd(&self) -> RawFd {
+        self.peer.as_raw_fd()
     }
 
     /// Deliver one grant: open a detached mount clone of `root` and send it
@@ -204,7 +222,7 @@ mod tests {
 
     #[test]
     fn channel_delivers_grant_fd_with_matching_claim() {
-        let (host, peer) = GrantChannel::new().expect("socketpair");
+        let (host, peer) = GrantChannel::with_peer_copy().expect("socketpair");
         let dir = tempfile::tempdir().expect("tempdir");
 
         host.grant(dir.path(), "write").expect("grant");
@@ -228,7 +246,7 @@ mod tests {
         // clone: `..` through it clamps at the grant root. Unprivileged hosts
         // (EPERM) degrade to a plain O_PATH dirfd: `..` walks to the host
         // parent — documented, and still contained by the OS fence's ruleset.
-        let (host, peer) = GrantChannel::new().expect("socketpair");
+        let (host, peer) = GrantChannel::with_peer_copy().expect("socketpair");
         let dir = tempfile::tempdir().expect("tempdir");
         host.grant(dir.path(), "write").expect("grant");
         let mut buf = [0u8; 1024];
@@ -258,5 +276,15 @@ mod tests {
             // Degraded mode: no clamp (the fence stays the wall).
             assert_ne!((opened_dev, opened_ino), (root_dev, root_ino));
         }
+    }
+}
+
+/// Duplicate `fd` without CLOEXEC so it survives the child's exec.
+pub(crate) fn dup_no_cloexec(fd: RawFd) -> io::Result<RawFd> {
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(dup)
     }
 }

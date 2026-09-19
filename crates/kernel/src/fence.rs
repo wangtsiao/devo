@@ -58,6 +58,10 @@ pub(crate) struct FenceOutcome {
     /// uses when no outer wrapper carries the policy.
     #[cfg(unix)]
     pub child_plan: Option<devo_util_process::sandbox::ResolvedEnforcementPlan>,
+    /// Unix credential delivery channel host end (fenced kernels only):
+    /// grants travel as fds over SCM_RIGHTS (§9). `None` when unfenced.
+    #[cfg(unix)]
+    pub grant_channel: Option<crate::credential_unix::GrantChannel>,
 }
 
 /// Unix fence (Linux bwrap / macOS Seatbelt, design doc §5.2): reuse the same
@@ -74,6 +78,7 @@ pub(super) fn wrap_or_bare(
             command: bare,
             state: FenceState::NotRequested,
             child_plan: None,
+            grant_channel: None,
         };
     };
     let overlay = devo_sandbox::SandboxPermissionOverlay {
@@ -118,6 +123,7 @@ pub(super) fn wrap_or_bare(
                 command: cmd,
                 state: FenceState::Fenced,
                 child_plan: None,
+                grant_channel: None,
             }
         }
         Ok(devo_sandbox::SandboxWrap::None) => {
@@ -130,11 +136,15 @@ pub(super) fn wrap_or_bare(
                 &config.cwd,
                 Some(&overlay),
             ) {
-                Ok(Some(plan)) => FenceOutcome {
-                    command: bare,
-                    state: FenceState::Fenced,
-                    child_plan: Some(plan),
-                },
+                Ok(Some(plan)) => {
+                    let channel = crate::credential_unix::GrantChannel::new().ok();
+                    FenceOutcome {
+                        command: bare,
+                        state: FenceState::Fenced,
+                        child_plan: Some(plan),
+                        grant_channel: channel,
+                    }
+                }
                 Ok(None) => {
                     tracing::warn!(
                         "RLM kernel fence requested but no enforcement plan resolved; kernel \
@@ -145,6 +155,7 @@ pub(super) fn wrap_or_bare(
                         command: bare,
                         state: FenceState::DowngradedUnfenced,
                         child_plan: None,
+                        grant_channel: None,
                     }
                 }
                 Err(err) => {
@@ -157,6 +168,7 @@ pub(super) fn wrap_or_bare(
                         command: bare,
                         state: FenceState::DowngradedUnfenced,
                         child_plan: None,
+                        grant_channel: None,
                     }
                 }
             }
@@ -171,6 +183,7 @@ pub(super) fn wrap_or_bare(
                 command: bare,
                 state: FenceState::DowngradedUnfenced,
                 child_plan: None,
+                grant_channel: None,
             }
         }
     }

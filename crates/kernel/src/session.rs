@@ -330,6 +330,11 @@ pub struct KernelSession {
     /// Fence outcome for this kernel (P0): callers read it to emit rollout
     /// fence events and UI downgrade warnings (design doc §5.3).
     fence_state: crate::fence::FenceState,
+    /// Unix credential delivery channel (§9): grants over SCM_RIGHTS. The
+    /// peer descriptor is inherited by the kernel process; its number rides
+    /// the `DEVO_GRANT_FD` env var.
+    #[cfg(unix)]
+    grant_channel: Option<crate::credential_unix::GrantChannel>,
     /// Per-session credential authority (P2, Windows fenced kernels only):
     /// grants deliver ACEs for the SID carried in the kernel's restricted
     /// token — the kernel is never restarted (§9).
@@ -438,7 +443,20 @@ impl KernelSession {
         // that shell sandboxing uses, carrying the fence roots as overlay.
         // Every unimplementable fence is an explicit downgrade, never silent.
         #[cfg(any(windows, unix))]
-        let fence_outcome = crate::fence::wrap_or_bare(&config, cmd);
+        let mut fence_outcome = crate::fence::wrap_or_bare(&config, cmd);
+        // Unix: duplicate the channel's peer fd (no CLOEXEC) for the child;
+        // its number rides DEVO_GRANT_FD and the descriptor survives exec.
+        #[cfg(unix)]
+        let mut config = config;
+        #[cfg(unix)]
+        if let Some(channel) = fence_outcome.grant_channel.as_ref() {
+            let peer = channel.peer_fd();
+            if let Ok(dup) = crate::credential_unix::dup_no_cloexec(peer) {
+                config
+                    .extra_env
+                    .push(("DEVO_GRANT_FD".to_string(), dup.to_string()));
+            }
+        }
         #[cfg(any(windows, unix))]
         let mut cmd = fence_outcome.command;
         #[cfg(any(windows, unix))]
@@ -520,6 +538,8 @@ impl KernelSession {
             cell_seq: AtomicU64::new(0),
             host_handler: Mutex::new(None),
             fence_state,
+            #[cfg(unix)]
+            grant_channel: fence_outcome.grant_channel.take(),
             #[cfg(windows)]
             fence_credentials,
         }))
@@ -565,6 +585,8 @@ impl KernelSession {
             cell_seq: AtomicU64::new(0),
             host_handler: Mutex::new(host_handler),
             fence_state: crate::fence::FenceState::NotRequested,
+            #[cfg(unix)]
+            grant_channel: None,
             #[cfg(windows)]
             fence_credentials: None,
         }))
@@ -588,6 +610,14 @@ impl KernelSession {
         &self,
     ) -> Option<&devo_windows_sandbox::SessionCredentialAuthority> {
         self.fence_credentials.as_ref()
+    }
+
+    /// Unix credential delivery channel (§9): approvals call `grant`/`revoke`
+    /// on it; the kernel facade turns received descriptors into native
+    /// dirfd-backed rlm.read/rlm.write. `None` for unfenced kernels.
+    #[cfg(unix)]
+    pub fn grant_channel(&self) -> Option<&crate::credential_unix::GrantChannel> {
+        self.grant_channel.as_ref()
     }
 
     /// Install or clear the host_request callback (typically once per turn).
