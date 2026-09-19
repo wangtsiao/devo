@@ -286,6 +286,35 @@ async fn run_cli() -> Result<()> {
 
 fn direct_server_early_dispatch() -> devo_arg0::EarlyDispatch {
     let args: Vec<String> = std::env::args().collect();
+    // One-shot Windows sandbox provisioning: `devo sandbox-setup` pops the
+    // UAC consent and provisions the sandbox accounts/firewall/ACLs so the
+    // RLM kernel fence can be raised (design doc §5.3 setup entry).
+    if args.iter().any(|arg| arg == "sandbox-setup") {
+        #[cfg(windows)]
+        {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let devo_home = devo_util_paths::find_devo_home().unwrap_or_else(|_| {
+                // Fall back to ~/.devo; setup writes the marker there.
+                std::env::var_os("USERPROFILE")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join(".devo")
+            });
+            match devo_windows_sandbox::request_default_sandbox_setup(&devo_home, &cwd) {
+                Ok(()) => {
+                    println!(
+                        "Windows sandbox setup requested (approve the UAC prompt). \
+                         Re-run devo to verify with: sandbox_setup_is_complete"
+                    );
+                    return devo_arg0::EarlyDispatch::Handled(Ok(()));
+                }
+                Err(error) => {
+                    eprintln!("windows sandbox setup failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     match devo_windows_sandbox::run_as_windows_sandbox_if_requested(&args) {
         Ok(true) => {
             // The helper exits the process on success; reaching here is unexpected.

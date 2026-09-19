@@ -227,6 +227,9 @@ pub(super) fn wrap_or_bare(
             // the kernel's restricted token (identity marker, no access by
             // itself); the retained authority delivers later grants as ACEs.
             let session_id = format!("kernel-{}", uuid::Uuid::new_v4());
+            // The SID is only recoverable from the running token, so log it:
+            // crash recovery, manual grants, and audits all key off it.
+            tracing::info!(session_id = %session_id, "RLM kernel session credential pending mint");
             let credentials =
                 match devo_windows_sandbox::SessionCredentialAuthority::new(&session_id, &devo_home)
                 {
@@ -244,6 +247,11 @@ pub(super) fn wrap_or_bare(
                         };
                     }
                 };
+            tracing::info!(
+                session_id = %session_id,
+                sid = %credentials.sid(),
+                "RLM kernel session credential minted"
+            );
             let request = devo_windows_sandbox::WindowsSandboxRequest {
                 // Shell-shaped fields are ignored by the direct-argv launcher.
                 command: String::new(),
@@ -255,6 +263,7 @@ pub(super) fn wrap_or_bare(
                 deny_read: spec.deny_read.clone(),
                 restrict_network: spec.restrict_network,
                 session_credential_sid: Some(credentials.sid().to_string()),
+                env_extra: crate::session::kernel_env_overrides(config),
             };
             let argv = vec![
                 config.python.to_string_lossy().into_owned(),

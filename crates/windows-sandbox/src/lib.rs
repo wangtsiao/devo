@@ -2,6 +2,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -62,6 +63,10 @@ pub struct WindowsSandboxRequest {
     /// Per-session credential SID (design doc §9, P2); `None` for plain
     /// per-command sandboxing. See `credential_delivery`.
     pub session_credential_sid: Option<String>,
+    /// Extra env the sandboxed child must receive. The wrapper builds the
+    /// child's environment from its argv env-json snapshot, so callers cannot
+    /// rely on setting `Command::env` after wrapping.
+    pub env_extra: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +91,32 @@ pub fn prepare_windows_sandbox_launch(
         let _ = req;
         Ok(None)
     }
+}
+
+/// One-shot provisioning entry (`devo sandbox-setup`): request the elevated
+/// setup for workspace-write permissions around `cwd`. The UAC consent prompt
+/// appears; after it completes, `sandbox_setup_is_complete` flips true and the
+/// RLM kernel fence can be raised (design doc §5.3).
+#[cfg(windows)]
+pub fn request_default_sandbox_setup(devo_home: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let profile = PermissionProfile::workspace_write();
+    let roots = vec![devo_util_paths::absolute_path::AbsolutePathBuf::from_absolute_path(cwd)?];
+    let permissions =
+        resolved_permissions::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            &profile,
+            &roots,
+        )?;
+    let env_map = std::env::vars().collect();
+    setup::run_elevated_setup(
+        setup::SandboxSetupRequest {
+            permissions: &permissions,
+            command_cwd: cwd,
+            env_map: &env_map,
+            devo_home,
+            proxy_enforced: false,
+        },
+        setup::SetupRootOverrides::default(),
+    )
 }
 
 /// Direct-argv sandbox launch for non-shell callers (e.g. the RLM kernel host

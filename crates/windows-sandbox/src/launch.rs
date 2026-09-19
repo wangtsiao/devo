@@ -35,7 +35,10 @@ pub(crate) fn prepare_direct_argv_launch(
     let devo_home = find_devo_home()?;
 
 
-    let env_map = env::vars().collect::<HashMap<_, _>>();
+    let mut env_map = env::vars().collect::<HashMap<_, _>>();
+    for (key, value) in &req.env_extra {
+        env_map.insert(key.clone(), value.clone());
+    }
     let program = env::current_exe()?;
     let args = create_windows_sandbox_command_args_for_permission_profile(
         inner_command,

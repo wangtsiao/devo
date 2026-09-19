@@ -405,7 +405,9 @@ mod credential_env_tests {
 /// explicit downgrade, never a silent one (§5.3).
 #[derive(Debug, Clone)]
 pub struct KernelFenceSpec {
-    /// Read-only roots beyond the platform defaults.
+    /// Read-only roots beyond the platform defaults. **Empty = full-disk
+    /// read** (workspace-profile semantic); the Windows legacy sandbox
+    /// backend refuses restricted-read profiles.
     pub readable_roots: Vec<PathBuf>,
     /// Read-write roots (workspace first).
     pub writable_roots: Vec<PathBuf>,
@@ -464,19 +466,8 @@ impl KernelSession {
             }
         }
 
-        for (key, value) in &config.extra_env {
+        for (key, value) in kernel_env_overrides(&config) {
             cmd.env(key, value);
-        }
-
-        if !config.python_path_entries.is_empty() {
-            let mut paths: Vec<PathBuf> = config.python_path_entries.clone();
-            if let Some(existing) = std::env::var_os("PYTHONPATH") {
-                paths.extend(std::env::split_paths(&existing));
-            }
-            let joined = std::env::join_paths(&paths)
-                .map_err(|e| ReplError::Other(format!("PYTHONPATH: {e}")))?;
-            eprintln!("FENCE-PROBE pythonpath entries={paths:?} exists0={}", paths.first().map(|p| p.join("rlm").is_dir()).unwrap_or(false));
-            cmd.env("PYTHONPATH", joined);
         }
 
         let mut child = cmd.spawn().map_err(SpawnError::Spawn)?;
@@ -769,6 +760,25 @@ async fn read_line_event(stdout: &mut BufReader<ChildStdout>) -> Result<KernelEv
     Ok(serde_json::from_str(trimmed)?)
 }
 
+/// Environment overrides the kernel child needs regardless of how it is
+/// launched (bare or sandbox-wrapped): harness env plus the runtime
+/// PYTHONPATH. For the sandbox wrapper these must ride the request itself —
+/// the wrapper builds the child's env from its argv snapshot, so `cmd.env()`
+/// set after wrapping would be lost.
+pub(crate) fn kernel_env_overrides(config: &KernelSessionConfig) -> Vec<(String, String)> {
+    let mut overrides: Vec<(String, String)> = config.extra_env.clone();
+    if !config.python_path_entries.is_empty() {
+        let mut paths: Vec<PathBuf> = config.python_path_entries.clone();
+        if let Some(existing) = std::env::var_os("PYTHONPATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(&paths) {
+            overrides.push(("PYTHONPATH".to_string(), joined.to_string_lossy().into_owned()));
+        }
+    }
+    overrides
+}
+
 async fn read_ready(stdout: &mut BufReader<ChildStdout>) -> Result<ReadyEvent, ReplError> {
     match read_line_event(stdout).await? {
         KernelEvent::Ready { protocol, python } => Ok(ReadyEvent { protocol, python }),
@@ -951,6 +961,71 @@ mod tests {
         drop(session);
     }
 
+    /// Trace: design doc rlm-permissions.md §5-§9 (Windows provisioned path)
+    /// Verifies: with the sandbox provisioned, the kernel spawns inside the
+    /// restricted-token fence; writes inside the workspace succeed, writes
+    /// outside are refused by the OS, and state survives hitting the wall.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn live_fenced_kernel_enforces_os_boundary_windows() {
+        // The fence wrapper re-execs `current_exe()` with the sandbox sentinel
+        // argv; only the real `devo.exe` early-dispatch understands it, so the
+        // in-cargo-test binary cannot self-host the wrapper. Verify via the
+        // product binary (TUI e2e) instead.
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe_name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !exe_name.starts_with("devo") {
+            eprintln!("skip: fence wrapper needs the devo.exe host binary, not {exe_name}");
+            return;
+        }
+        let Some(mut config) = live_config() else {
+            eprintln!("skip: prime-agent-runtime not found");
+            return;
+        };
+        let workspace = tempfile::tempdir().expect("workspace");
+        config.cwd = workspace.path().to_path_buf();
+        config.fence = Some(KernelFenceSpec {
+            readable_roots: Vec::new(), // empty = full-disk read (workspace semantic)
+            writable_roots: vec![workspace.path().to_path_buf()],
+            deny_read: Vec::new(),
+            restrict_network: true,
+        });
+        let session = match KernelSession::spawn(config).await {
+            Ok(s) => s,
+            Err(e) => {
+                panic!("fenced kernel spawn failed (provisioned?): {e}");
+            }
+        };
+        assert_eq!(session.fence_state(), crate::fence::FenceState::Fenced);
+
+        let inside = workspace.path().join("inside.txt");
+        let ok = session
+            .execute(format!("open({inside:?}, 'w').write('ok')"))
+            .await
+            .expect("inside write");
+        assert_eq!(ok.status, "ok", "stderr={}", ok.stderr);
+        let marker = session.execute("fenced_state = 42").await.expect("state");
+        assert_eq!(marker.status, "ok", "stderr={}", marker.stderr);
+
+        // Outside the fence: the restricted token refuses the write.
+        let outside = session
+            .execute("open(r'C:/Windows/devo-fence-probe-x7', 'w')")
+            .await
+            .expect("outside write cell");
+        assert_ne!(
+            outside.status, "ok",
+            "write outside the fence must fail; stdout={:?} stderr={:?}",
+            outside.stdout, outside.stderr
+        );
+
+        let state = session
+            .execute("print(fenced_state)")
+            .await
+            .expect("state after wall");
+        assert_eq!(state.status, "ok", "stderr={}", state.stderr);
+        assert!(state.stdout.contains("42"), "stdout={:?}", state.stdout);
+    }
+
     /// Trace: L2-DES-RLM-001 / design doc rlm-permissions.md §5-§9
     /// Verifies: on Unix the fenced kernel enforces the OS boundary — writes
     /// inside the granted workspace succeed, writes outside are refused by
@@ -965,7 +1040,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         config.cwd = workspace.path().to_path_buf();
         config.fence = Some(KernelFenceSpec {
-            readable_roots: vec![workspace.path().to_path_buf()],
+            readable_roots: Vec::new(), // empty = full-disk read (workspace semantic)
             writable_roots: vec![workspace.path().to_path_buf()],
             deny_read: Vec::new(),
             restrict_network: true,

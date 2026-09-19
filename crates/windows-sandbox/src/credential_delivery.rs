@@ -336,6 +336,40 @@ mod tests {
         let _ = live; // live authority untouched by the sweep
     }
 
+    /// Env-driven grant runner (operational tool, not an assertion):
+    /// `DEVO_GRANT_SID` + `DEVO_GRANT_ROOT` [+ `DEVO_GRANT_HOME`] delivers a
+    /// write ACE for an already-running fenced kernel's session SID.
+    /// Runs as a test so it shares the crate's token/ACL plumbing:
+    /// `cargo test -p devo-windows-sandbox --lib grant_for_running_session -- --nocapture`
+    #[test]
+    fn grant_for_running_session() {
+        let (Ok(sid), Ok(root), home) = (
+            std::env::var("DEVO_GRANT_SID"),
+            std::env::var("DEVO_GRANT_ROOT"),
+            std::env::var("DEVO_GRANT_HOME").unwrap_or_else(|_| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| format!("{}\\.devo", p.to_string_lossy()))
+                    .unwrap_or_else(|| ".devo".to_string())
+            }),
+        ) else {
+            eprintln!("skip: DEVO_GRANT_SID/DEVO_GRANT_ROOT not set");
+            return;
+        };
+        let authority =
+            SessionCredentialAuthority::new(&format!("kernel-{sid}"), std::path::Path::new(&home))
+                .expect("authority");
+        // The authority mints a fresh SID; for an external grant the SID is
+        // fixed, so rebind via the journal path with the given SID.
+        let applied = unsafe {
+            crate::acl::add_allow_ace(
+                std::path::Path::new(&root),
+                LocalSid::from_string(&sid).expect("sid").as_ptr(),
+            )
+        }
+        .expect("grant");
+        eprintln!("granted write ACE root={root} applied={applied}");
+    }
+
     #[test]
     fn grant_read_root_delivers_read_mask_ace() {
         let tmp = tempfile::tempdir().expect("tempdir");

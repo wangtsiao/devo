@@ -255,7 +255,7 @@ impl ServerRuntime {
                     Some(arc)
                 }
                 Err(err) => {
-                    tracing::debug!(%err, "RLM kernel not available for this turn");
+                    tracing::warn!(%err, "RLM kernel not available for this turn; falling back to Discrete");
                     state.kernel.as_ref().map(Arc::clone)
                 }
             };
