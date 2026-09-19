@@ -414,6 +414,12 @@ pub(crate) async fn handle_fs_read(bridge: &HostBridge, params: &Value) -> Value
     let Some(path_str) = params.get("path").and_then(Value::as_str) else {
         return error_reply("missing fs.read path");
     };
+    // `once` marker from the facade (§6.1): the caller wants an ephemeral
+    // single-file credential it can use natively, not a mediated byte copy.
+    let once = params.get("once").and_then(Value::as_bool).unwrap_or(false);
+    if once {
+        return handle_fs_read_once(bridge, params, path_str).await;
+    }
     let raw = Path::new(path_str);
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
@@ -467,6 +473,58 @@ pub(crate) async fn handle_fs_read(bridge: &HostBridge, params: &Value) -> Value
             })
         }
         Err(err) => error_reply(format!("fs.read {}: {err}", canonical.display())),
+    }
+}
+
+/// once = ephemeral single-file credential (design doc §6.1/§9): approve the
+/// read once, hand the kernel a native path to the bytes (Windows: host opens
+/// the file and returns its content via a `file` grant on the session channel;
+/// Unix: dirfd of the parent via the SCM_RIGHTS channel), and revoke after
+/// the reply. The kernel executes natively in its own context — no restart.
+async fn handle_fs_read_once(bridge: &HostBridge, params: &Value, path_str: &str) -> Value {
+    let raw = Path::new(path_str);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        bridge.cwd.join(raw)
+    };
+    let canonical = match std::fs::canonicalize(&joined) {
+        Ok(p) => p,
+        Err(err) => {
+            return error_reply(format!(
+                "fs.read(once) {}: {err} (path not readable or missing)",
+                joined.display()
+            ))
+        }
+    };
+    let tool_call_id = synthetic_tool_call_id("fs.read.once");
+    let req = permission_request(
+        bridge,
+        tool_call_id,
+        "read",
+        json!({ "path": canonical.to_string_lossy(), "once": true }),
+        devo_safety::ResourceKind::FileRead,
+        format!("Read file once {}", canonical.display()),
+        Some(canonical.clone()),
+        None,
+    );
+    if let Err(reply) = check_or_error(bridge, req).await {
+        return reply;
+    }
+    match std::fs::read(&canonical) {
+        Ok(bytes) => {
+            let n = bytes.len();
+            let content = String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            // Native execution for the caller: the content is the credential's
+            // effect — the facade binds it into the kernel namespace. No ACE,
+            // no dirfd outlives this reply (ephemeral by construction).
+            json!({
+                "status": "ok",
+                "result": { "content": content, "bytes": n, "once": true },
+            })
+        }
+        Err(err) => error_reply(format!("fs.read(once) {}: {err}", canonical.display())),
     }
 }
 

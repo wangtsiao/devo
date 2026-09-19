@@ -169,6 +169,51 @@ async def read(path, *, encoding="utf-8") -> str:
         return content
 
 
+async def read_once(path, *, encoding="utf-8") -> str:
+    """Ephemeral single-read credential (design doc §6.1/§9): ask once, the
+    host approves once, the bytes come back bound to the caller's context.
+    Nothing outlives the reply — no ACE, no dirfd, no cache, no restart."""
+    try:
+        with open(path, encoding=encoding) as f:
+            return f.read()
+    except OSError as direct_error:
+        try:
+            reply = await host_request(
+                "fs.read",
+                {"path": str(path), "errno": direct_error.errno, "once": True},
+            )
+        except RuntimeError as denied:
+            raise PermissionError(str(denied)) from direct_error
+        content = reply.get("content")
+        if not isinstance(content, str):
+            raise RuntimeError("fs.read(once) reply carried no content") from direct_error
+        return content
+
+
+async def write_once(path, content) -> None:
+    """Ephemeral single-write (§6.1/§9): one approval, host executes with the
+    kernel's context honored, nothing persists (no cache, no ACE)."""
+    if not isinstance(content, str):
+        raise TypeError(f"content must be str, got {type(content).__name__}")
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        return
+    except OSError as direct_error:
+        try:
+            await host_request(
+                "fs.write",
+                {
+                    "filePath": str(path),
+                    "content": content,
+                    "once": True,
+                },
+            )
+            return
+        except RuntimeError as denied:
+            raise PermissionError(str(denied)) from direct_error
+
+
 async def write(path, content) -> None:
     """Front-door file write (design doc rlm-permissions.md §6.1).
 
