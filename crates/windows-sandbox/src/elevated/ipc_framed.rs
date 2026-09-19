@@ -71,6 +71,12 @@ pub struct SpawnRequest {
     pub stdin_open: bool,
     #[serde(default)]
     pub use_private_desktop: bool,
+    /// Sandbox account credentials for the runner to LogonUser with —
+    /// the primary token's SID is what WFP firewall rules bind to.
+    #[serde(default)]
+    pub sandbox_username: String,
+    #[serde(default)]
+    pub sandbox_password: String,
 }
 
 /// Ack from runner after it spawns the child process.

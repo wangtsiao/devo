@@ -200,6 +200,8 @@ mod windows_impl {
                 tty: false,
                 stdin_open: false,
                 use_private_desktop,
+                sandbox_username: sandbox_creds.username.clone(),
+                sandbox_password: sandbox_creds.password.clone(),
             };
             let transport = retry_runner_spawn_once(
                 sandbox_creds,

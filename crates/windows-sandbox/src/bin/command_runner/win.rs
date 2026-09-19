@@ -278,17 +278,16 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     // wrappers for as long as possible. That way any failure after SID parsing but before the
     // child is fully spawned still releases the backing LocalAlloc memory automatically.
     let cap_psid_ptrs: Vec<*mut _> = cap_psids.iter().map(LocalSid::as_ptr).collect();
-    let base = OwnedWinHandle::new(unsafe { get_current_token_for_restriction()? });
+    // Primary token via LogonUser (WFP fix): a restricted token's user SID is
+    // ignored by WFP per-user firewall rules, so network blocking silently
+    // fails. The primary token keeps the sandbox account's unmodified SID —
+    // WFP respects it, and file access stays enforced by capability-SID ACLs.
     let h_token = OwnedWinHandle::new(unsafe {
-        match token_mode {
-            WindowsSandboxTokenMode::ReadOnlyCapability => {
-                create_readonly_token_with_caps_and_user_from(base.raw(), &cap_psid_ptrs)
-            }
-            WindowsSandboxTokenMode::WritableRootsCapability => {
-                create_workspace_write_token_with_caps_and_user_from(base.raw(), &cap_psid_ptrs)
-            }
-        }
-    }?);
+        devo_windows_sandbox::logon_primary_token(
+            &req.sandbox_username,
+            &req.sandbox_password,
+        )?
+    });
     unsafe {
         // These ACL adjustments need the raw SID values, but ownership stays with `cap_psids`.
         // We do not manually `LocalFree` anything here; the wrappers handle every return path.

@@ -168,6 +168,46 @@ impl Drop for LocalSid {
 
 /// # Safety
 /// Caller must close the returned token handle.
+/// Log on as the sandbox account and return the PRIMARY token. Unlike a
+/// restricted token, a primary token's user SID is respected by WFP per-user
+/// firewall rules — this is how network blocking actually binds to the
+/// sandbox account. File access stays controlled by capability-SID ACLs.
+pub unsafe fn logon_primary_token(username: &str, password: &str) -> Result<HANDLE> {
+    use windows_sys::core::PCWSTR;
+    use windows_sys::Win32::Foundation::GetLastError;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LogonUserW(
+            lpszUsername: PCWSTR,
+            lpszDomain: PCWSTR,
+            lpszPassword: PCWSTR,
+            dwLogonType: u32,
+            dwLogonProvider: u32,
+            phToken: *mut HANDLE,
+        ) -> i32;
+    }
+    const LOGON32_LOGON_BATCH: u32 = 4;
+    const LOGON32_PROVIDER_DEFAULT: u32 = 0;
+
+    let user_w = crate::winutil::to_wide(username);
+    let pass_w = crate::winutil::to_wide(password);
+    let domain_w = crate::winutil::to_wide(".");
+    let mut h_token: HANDLE = 0;
+    let ok = LogonUserW(
+        user_w.as_ptr(),
+        domain_w.as_ptr(),
+        pass_w.as_ptr(),
+        LOGON32_LOGON_BATCH,
+        LOGON32_PROVIDER_DEFAULT,
+        &mut h_token,
+    );
+    if ok == 0 {
+        let code = GetLastError();
+        return Err(anyhow!("LogonUserW failed for {username}: {code}"));
+    }
+    Ok(h_token)
+}
+
 pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
     let desired = TOKEN_DUPLICATE
         | TOKEN_QUERY

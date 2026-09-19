@@ -175,6 +175,8 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             tty,
             stdin_open,
             use_private_desktop,
+            sandbox_username: sandbox_creds.username.clone(),
+            sandbox_password: sandbox_creds.password.clone(),
         },
         read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
         read_roots_include_platform_defaults,
