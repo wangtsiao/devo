@@ -474,10 +474,46 @@ async def list_tools(server: str) -> list[dict[str, Any]]:
 
 
 async def call_tool(server: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:
+    """Call an MCP tool through the approval pipeline (design doc §1/R7).
+
+    First asks the host via ``mcp.call`` (plan-mode denial + permission
+    cascade + grant cache). Only when the host has no handler for the
+    action (older host / standalone kernel) does it fall back to the
+    kernel-local registry — the OS fence still bounds that fallback's
+    effects, and the fallback logs loudly rather than passing silently.
+    """
     _validate_name(tool, "tool")
     if arguments is not None and not isinstance(arguments, dict):
         raise TypeError("arguments must be a dict or None")
-    return await _dispatch(lambda: _registry.call(server, tool, arguments or {}))
+    args = arguments or {}
+    _validate_name(server, "server")
+    try:
+        from . import repl as _repl
+
+        reply = await _repl.host_request(
+            {
+                "server": server,
+                "tool": tool,
+                "arguments": args,
+                "type": "mcp.call",
+            }
+        )
+    except Exception as no_host:  # noqa: BLE001 — standalone/older hosts
+        import sys as _sys
+
+        print(
+            f"mcp.call_tool: host mediation unavailable ({no_host}); "
+            "falling back to kernel-local registry (fence still bounds effects)",
+            file=_sys.stderr,
+        )
+        return await _dispatch(lambda: _registry.call(server, tool, args))
+    status = reply.get("status")
+    if status == "ok":
+        result = reply.get("result")
+        return result
+    raise PermissionError(
+        str(reply.get("error") or f"mcp.call {server}/{tool} denied by host")
+    )
 
 
 async def reload(server: str | None = None) -> None:
