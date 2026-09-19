@@ -28,7 +28,7 @@ use std::os::fd::RawFd;
 use std::path::Path;
 
 #[derive(Debug)]
-pub(crate) struct GrantChannel {
+pub struct GrantChannel {
     socket: OwnedFd,
     peer: OwnedFd,
 }
@@ -79,7 +79,7 @@ impl GrantChannel {
 
     /// Deliver one grant: open a detached mount clone of `root` and send it
     /// with its (dev, ino) claim.
-    pub(crate) fn grant(&self, root: &Path, access: &str) -> io::Result<()> {
+    pub fn grant(&self, root: &Path, access: &str) -> io::Result<()> {
         let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // Prefer open_tree(OPEN_TREE_CLONE|AT_RECURSIVE): a detached mount
@@ -112,7 +112,7 @@ impl GrantChannel {
     }
 
     /// Ask the kernel facade to drop the descriptor for `root`.
-    pub(crate) fn revoke(&self, root: &Path) -> io::Result<()> {
+    pub fn revoke(&self, root: &Path) -> io::Result<()> {
         let message = GrantMessage {
             kind: "revoke".to_string(),
             root: root.to_string_lossy().into_owned(),

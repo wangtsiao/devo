@@ -5,6 +5,9 @@
 
 #[cfg(unix)]
 mod credential_unix;
+
+#[cfg(unix)]
+pub use credential_unix::GrantChannel;
 mod fence;
 mod protocol;
 mod session;

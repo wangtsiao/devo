@@ -262,36 +262,59 @@ pub(super) async fn run_session_actor(
                     &pending,
                 );
                 // P2 (design doc §8/§9): a PathPrefix write approval is not
-                // just a cache/profile entry — deliver it as an allow ACE for
-                // the fenced kernel's session SID so raw `open()` works from
-                // now on, with no kernel restart. Scope selection lives in
+                // just a cache/profile entry — deliver it as a credential to
+                // the fenced kernel so native I/O works from now on, with no
+                // kernel restart. Scope selection lives in
                 // `credential_delivery_root` (tested); Session-scope
                 // exact-file approvals deliberately stay mediated.
-                #[cfg(windows)]
+                // Windows: session-SID ACE. Unix: dirfd over SCM_RIGHTS.
                 if let Some((root, access)) = credential_delivery_root(&scope, &pending)
                     && let Some(kernel) = state.kernel.as_ref()
-                    && let Some(authority) = kernel.fence_credentials()
                 {
-                    let delivered = match access {
-                        super::approval_scope::CredentialAccess::Write => {
-                            authority.grant_write_root(&root)
+                    #[cfg(windows)]
+                    if let Some(authority) = kernel.fence_credentials() {
+                        let delivered = match access {
+                            super::approval_scope::CredentialAccess::Write => {
+                                authority.grant_write_root(&root)
+                            }
+                            super::approval_scope::CredentialAccess::Read => {
+                                authority.grant_read_root(&root)
+                            }
+                        };
+                        match delivered {
+                            Ok(_) => tracing::info!(
+                                root = %root.display(),
+                                "session credential delivered: ACE for the fenced kernel \
+                                 (no restart)"
+                            ),
+                            Err(err) => tracing::warn!(
+                                %err,
+                                root = %root.display(),
+                                "session credential ACE delivery failed; \
+                                 the mediated fallback remains active"
+                            ),
                         }
-                        super::approval_scope::CredentialAccess::Read => {
-                            authority.grant_read_root(&root)
+                    }
+                    #[cfg(unix)]
+                    if let Some(channel) = kernel.grant_channel() {
+                        let access_str = match access {
+                            super::approval_scope::CredentialAccess::Write => "write",
+                            super::approval_scope::CredentialAccess::Read => "read",
+                        };
+                        match channel.grant(&root, access_str) {
+                            Ok(_) => tracing::info!(
+                                root = %root.display(),
+                                access = access_str,
+                                "session credential delivered: dirfd for the fenced kernel \
+                                 (no restart)"
+                            ),
+                            Err(err) => tracing::warn!(
+                                %err,
+                                root = %root.display(),
+                                "session credential dirfd delivery failed; \
+                                 the mediated fallback remains active"
+                            ),
                         }
-                    };
-                    match delivered {
-                        Ok(_) => tracing::info!(
-                            root = %root.display(),
-                            "session credential delivered: ACE for the fenced kernel \
-                             (no restart)"
-                        ),
-                        Err(err) => tracing::warn!(
-                            %err,
-                            root = %root.display(),
-                            "session credential ACE delivery failed; \
-                             the mediated fallback remains active"
-                        ),
                     }
                 }
             }
