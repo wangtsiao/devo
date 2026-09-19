@@ -186,6 +186,11 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         proxy_enforced,
         proxy_settings_mode,
     };
+    // PROBE: elevated backend transport — must fire for elevated spawns
+    crate::logging::log_note(
+        "PROBE-ELEVATED-TRANSPORT spawn_runner_transport_task called",
+        std::env::var("USERPROFILE").ok().map(|h| std::path::PathBuf::from(h).join(".devo/.sandbox")).as_deref(),
+    );
     let transport = spawn_runner_transport_task(sandbox_creds, request).await?;
     let (pipe_write, pipe_read) = transport.into_files();
 
