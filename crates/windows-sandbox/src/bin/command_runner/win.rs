@@ -282,6 +282,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     // ignored by WFP per-user firewall rules, so network blocking silently
     // fails. The primary token keeps the sandbox account's unmodified SID —
     // WFP respects it, and file access stays enforced by capability-SID ACLs.
+    devo_windows_sandbox::log_runner_note("RUNNER-TOKEN-PATH logon_primary_token called", &req.devo_home);
     let h_token = OwnedWinHandle::new(unsafe {
         devo_windows_sandbox::logon_primary_token(
             &req.sandbox_username,

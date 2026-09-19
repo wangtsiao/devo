@@ -36,6 +36,15 @@ pub enum WindowsSandboxProxySettingsMode {
     Preserve,
 }
 
+pub fn log_runner_note(msg: &str, devo_home: &Path) {
+    let dir = devo_home.join(".sandbox");
+    let _ = std::fs::create_dir_all(&dir);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("sandbox.runner.log")) {
+        let _ = writeln!(f, "[{}] {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), msg);
+    }
+}
+
 pub fn windows_sandbox_available() -> bool {
     cfg!(windows)
 }
