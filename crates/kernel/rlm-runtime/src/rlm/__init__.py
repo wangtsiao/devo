@@ -6,6 +6,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
+import os
 from typing import Any
 
 from .bash import BashHandle, BashResult, bash
@@ -114,6 +115,16 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
     return _parse_host_reply(request_type, reply)
 
 
+# Credential grants (design doc §9): start the fd receiver when the host
+# passed a delivery channel (fenced kernels only).
+try:
+    from . import grants as _grants_mod
+
+    _grants_mod.start_from_env()
+except Exception:  # noqa: BLE001 - grants are best-effort native I/O
+    _grants_mod = None
+
+
 def emit(data: dict[str, Any]) -> None:
     """Ship one display event (dict of MIME type -> JSON payload) to the host."""
     from . import repl
@@ -135,6 +146,17 @@ async def read(path, *, encoding="utf-8") -> str:
         with open(path, encoding=encoding) as f:
             return f.read()
     except OSError as direct_error:
+        # Delivered credential (§9): a granted dirfd makes this a native
+        # kernel-side read — no host round-trip, no restart.
+        if _grants_mod is not None:
+            grant = _grants_mod.grant_fd_for(os.fspath(path))
+            if grant is not None:
+                fd, _access, rel = grant
+                try:
+                    with os.fdopen(os.open(rel, os.O_RDONLY, dir_fd=fd), encoding=encoding) as f:
+                        return f.read()
+                except OSError:
+                    pass  # fall through to the mediated front door
         try:
             reply = await host_request(
                 "fs.read", {"path": str(path), "errno": direct_error.errno}
@@ -160,6 +182,20 @@ async def write(path, content) -> None:
             f.write(content)
         return
     except OSError as direct_error:
+        if _grants_mod is not None:
+            grant = _grants_mod.grant_fd_for(os.fspath(path))
+            if grant is not None:
+                fd, access, rel = grant
+                if access == "write":
+                    try:
+                        fd_open = os.open(
+                            rel, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644, dir_fd=fd
+                        )
+                        with os.fdopen(fd_open, "w", encoding="utf-8", newline="") as f:
+                            f.write(content)
+                        return
+                    except OSError:
+                        pass  # fall through to the mediated front door
         try:
             # `filePath` matches the mediated write tool contract; the bridge's
             # approval-path extraction also accepts `path`/`file_path`.
