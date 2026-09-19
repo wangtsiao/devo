@@ -51,28 +51,34 @@ sandboxed long-lived kernel; codex has no equivalent need:
 - Callers pass `None` everywhere except the RLM kernel fence path
   (`crates/kernel/src/fence.rs`).
 
-## Ports applied 2026-09-19 (step 1, from upstream v0.150.1)
+## Ports applied 2026-09-19 (from upstream v0.150.1)
 
-- `audit.rs`: deny-ACE application failures now aggregate into an `Err`
-  (previously logged and swallowed → world-writable dirs stayed world-writable
-  with preflight green). Injected-apply-fn split + regression test, ported from
-  upstream `audit.rs`.
-- `setup.rs`: `setup_refresh_deny_read_paths` — non-elevated setup refresh now
-  re-resolves deny-read paths (exact + glob) from the permission profile and
-  passes them as `SetupRootOverrides.deny_read_paths` in
-  `run_setup_refresh` / `run_setup_refresh_with_extra_read_roots` (previously
-  `None` → deny-read ACEs never refreshed). Divergence note: devo's protocol
-  has no skip-missing entry behavior, so the upstream
-  `remove_skip_missing_path_entries()` call is omitted.
+Step-1 batch: `audit.rs` deny-ACE error aggregation; `setup.rs`
+`setup_refresh_deny_read_paths` (devo divergence: no skip-missing entries to
+strip, so the upstream `remove_skip_missing_path_entries()` call is omitted).
+
+Re-vendor batch 1 (same day):
+- `acl.rs` (A5): `INHERITED_ACE` + `AceScope::{Effective,Explicit}` +
+  `dacl_allow_mask_needs_refresh` + `pub path_write_aces_need_refresh`;
+  `bin/setup_main/win.rs` refresh predicate now uses it (fixes perpetual
+  write-ACE DACL churn on inherited `FILE_DELETE_CHILD`).
+- `deny_read_resolver.rs` (A6): glob scan plans pre-validated — a
+  root-anchored glob without `glob_scan_max_depth` is rejected up front
+  instead of scanning unbounded from the drive root.
+- `Cargo.toml`: restored upstream's `[[bin]]` declarations
+  (`devo-windows-sandbox-setup`, `devo-command-runner`). The fork's
+  `autobins = false` had silently disabled both helpers — provisioning could
+  never find them (structural breakage, now fixed: both exes build).
+  `bin/setup_main/win.rs` references fixed from `crate::*` shortcuts to
+  `devo_windows_sandbox::*` + lib exports (`StatsigMetricsSettings`,
+  `path_write_aces_need_refresh`).
 
 ## Known upstream-behind gaps (to close on next sync — see design doc)
 
 - Proxy port wire (`DEVO_WINDOWS_SANDBOX_PROXY_PORTS` env + marker drift +
   provisioning settings) — fixes ephemeral-port-vs-static-firewall mismatch.
-- `acl.rs`: `INHERITED_ACE`-aware refresh scope (upstream `AceScope::Explicit`)
-  — devo's effective-scope check causes perpetual write-ACE refresh churn.
-- `deny_read_resolver.rs`: pre-validate glob scan plans (root-anchored globs
-  without depth bound currently scan unbounded from the drive root).
 - `helper_materialization.rs`: junction-safe helper lookup retry.
 - `setup.rs`: `SEE_MASK_NOASYNC` + null stdin on ShellExecuteEx; no-reparse
-  HANDLE for ProvisionOnly DACL mutation; symbolic-root read gating.
+  HANDLE for ProvisionOnly DACL mutation; symbolic-root read gating;
+  deny-read-key read-root filtering.
+- `identity.rs` drift is test-only (no functional gap).

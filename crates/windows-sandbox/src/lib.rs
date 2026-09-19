@@ -175,6 +175,7 @@ mod launch;
 #[cfg(windows)]
 mod logging;
 mod otel_stub;
+pub use otel_stub::StatsigMetricsSettings;
 #[cfg(windows)]
 mod path_normalization;
 mod path_util;
@@ -242,6 +243,8 @@ pub use acl::ensure_allow_write_aces;
 pub use acl::fetch_dacl_handle;
 #[cfg(windows)]
 pub use acl::path_mask_allows;
+#[cfg(windows)]
+pub use acl::path_write_aces_need_refresh;
 #[cfg(windows)]
 pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(windows)]
