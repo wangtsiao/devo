@@ -51,6 +51,13 @@ pub struct WindowsSandboxSessionRequest<'a> {
 pub async fn spawn_windows_sandbox_session_for_level(
     request: WindowsSandboxSessionRequest<'_>,
 ) -> Result<SpawnedProcess> {
+    crate::logging::log_note(
+        &format!(
+            "SANDBOX-DISPATCH level={:?} proxy_enforced={}",
+            request.windows_sandbox_level, request.proxy_enforced
+        ),
+        None,
+    );
     if request.proxy_enforced
         || matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated)
     {
