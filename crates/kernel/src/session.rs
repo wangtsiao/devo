@@ -431,30 +431,28 @@ impl KernelSession {
             .env("PYTHONUNBUFFERED", "1");
 
         // OS fence (P0): on Windows with a provisioned sandbox this replaces
-        // the bare argv with the restricted-token wrapper launch; otherwise it
-        // returns the bare command with a loud explicit-downgrade warning.
+        // OS fence (design doc §5): Windows wraps with the restricted-token
+        // launcher; Unix reuses the platform sandbox wrapper (bwrap/Seatbelt)
+        // that shell sandboxing uses, carrying the fence roots as overlay.
+        // Every unimplementable fence is an explicit downgrade, never silent.
+        #[cfg(any(windows, unix))]
+        let fence_outcome = crate::fence::wrap_or_bare(&config, cmd);
+        #[cfg(any(windows, unix))]
+        let mut cmd = fence_outcome.command;
+        #[cfg(any(windows, unix))]
+        let fence_state = fence_outcome.state;
         #[cfg(windows)]
-        let crate::fence::FenceOutcome {
-            command: mut cmd,
-            state: fence_state,
-            credentials: fence_credentials,
-        } = crate::fence::wrap_or_bare(&config, cmd);
-
-        // P0 follow-up: Linux/macOS fence spawn wiring is not implemented yet;
-        // a fence that cannot even be attempted is still an explicit
-        // downgrade, never a silent no-op (design doc §5.3).
-        #[cfg(not(windows))]
-        let fence_state = match config.fence.as_ref() {
-            None => crate::fence::FenceState::NotRequested,
-            Some(_) => {
-                tracing::warn!(
-                    "RLM kernel fence requested but this platform has no fence wiring yet; \
-                     kernel runs UNFENCED with full user permissions (explicit downgrade, \
-                     design doc §5.3)"
-                );
-                crate::fence::FenceState::DowngradedUnfenced
+        let fence_credentials = fence_outcome.credentials;
+        // Unix pipe mode: apply the parent-resolved Landlock/seccomp plan in
+        // the child after fork (same pattern as the shell sandbox path).
+        #[cfg(unix)]
+        if let Some(plan) = fence_outcome.child_plan {
+            unsafe {
+                cmd.pre_exec(move || {
+                    devo_util_process::sandbox::apply_resolved_in_child(Some(&plan))
+                });
             }
-        };
+        }
 
         // Never inherit credential-shaped variables into the kernel: it runs
         // model-generated code and must not see provider or cloud credentials.
@@ -477,6 +475,7 @@ impl KernelSession {
             }
             let joined = std::env::join_paths(&paths)
                 .map_err(|e| ReplError::Other(format!("PYTHONPATH: {e}")))?;
+            eprintln!("FENCE-PROBE pythonpath entries={paths:?} exists0={}", paths.first().map(|p| p.join("rlm").is_dir()).unwrap_or(false));
             cmd.env("PYTHONPATH", joined);
         }
 
@@ -491,7 +490,27 @@ impl KernelSession {
             .ok_or_else(|| ReplError::Other("missing stdout".into()))?;
 
         let mut stdout = BufReader::new(stdout);
-        let ready = read_ready(&mut stdout).await?;
+        let ready = match read_ready(&mut stdout).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                // Handshake died: surface the child's stderr tail instead of a
+                // bare "closed unexpectedly" (fail loudly, never silently).
+                let mut stderr_tail = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        stderr.read_to_string(&mut stderr_tail),
+                    )
+                    .await;
+                }
+                let stderr_tail: String = stderr_tail.chars().take(400).collect();
+                return Err(ReplError::Other(format!(
+                    "kernel handshake failed: {error}; stderr tail: {stderr_tail:?}"
+                ))
+                .into());
+            }
+        };
         if ready.protocol != PROTOCOL_VERSION {
             return Err(ReplError::ProtocolMismatch {
                 got: ready.protocol,
@@ -873,7 +892,10 @@ pub fn default_runtime_pythonpath(start: &Path) -> Option<PathBuf> {
             dir.join("rlm-runtime/src"),
         ];
         if let Some(candidate) = candidates.into_iter().find(|path| path.join("rlm").is_dir()) {
-            return Some(candidate);
+            // Always absolute: the kernel child's cwd differs from this
+            // process's cwd, so a relative PYTHONPATH entry would silently
+            // resolve to nothing inside the child (No module named 'rlm').
+            return Some(dunce::canonicalize(&candidate).unwrap_or(candidate));
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
@@ -927,6 +949,61 @@ mod tests {
         assert_eq!(session.ready().protocol, PROTOCOL_VERSION);
         // Drop the session; kill_on_drop terminates the child.
         drop(session);
+    }
+
+    /// Trace: L2-DES-RLM-001 / design doc rlm-permissions.md §5-§9
+    /// Verifies: on Unix the fenced kernel enforces the OS boundary — writes
+    /// inside the granted workspace succeed, writes outside are refused by
+    /// the OS (not by a filter), and the kernel keeps its state afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_fenced_kernel_enforces_os_boundary() {
+        let Some(mut config) = live_config() else {
+            eprintln!("skip: prime-agent-runtime not found");
+            return;
+        };
+        let workspace = tempfile::tempdir().expect("workspace");
+        config.cwd = workspace.path().to_path_buf();
+        config.fence = Some(KernelFenceSpec {
+            readable_roots: vec![workspace.path().to_path_buf()],
+            writable_roots: vec![workspace.path().to_path_buf()],
+            deny_read: Vec::new(),
+            restrict_network: true,
+        });
+        let session = match KernelSession::spawn(config).await {
+            Ok(s) => s,
+            Err(e) => {
+                panic!("fenced kernel spawn failed (bwrap available?): {e}");
+            }
+        };
+        assert_eq!(session.fence_state(), crate::fence::FenceState::Fenced);
+
+        // Inside the fence: write + read back works, and state persists.
+        let inside = workspace.path().join("inside.txt");
+        let ok = session
+            .execute(format!("open({inside:?}, 'w').write('ok')"))
+            .await
+            .expect("inside write");
+        assert_eq!(ok.status, "ok", "stderr={}", ok.stderr);
+        let marker = session.execute("fenced_state = 42").await.expect("state");
+        assert_eq!(marker.status, "ok", "stderr={}", marker.stderr);
+
+        // Outside the fence: the OS itself refuses the write.
+        let outside = session
+            .execute("open('/usr/local/devo-fence-probe-x7', 'w')")
+            .await
+            .expect("outside write cell");
+        assert_ne!(
+            outside.status, "ok",
+            "write outside the fence must fail; stdout={:?} stderr={:?}",
+            outside.stdout, outside.stderr
+        );
+
+        // After hitting the wall the kernel is the same living process with
+        // its state intact (never restarted, §9).
+        let state = session.execute("print(fenced_state)").await.expect("state after wall");
+        assert_eq!(state.status, "ok", "stderr={}", state.stderr);
+        assert!(state.stdout.contains("42"), "stdout={:?}", state.stdout);
     }
 
     /// Trace: L2-DES-RLM-001

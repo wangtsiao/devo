@@ -1845,8 +1845,11 @@ name = "devo-kernel"
 version = "0.1.39"
 dependencies = [
  "anyhow",
+ "devo-sandbox",
  "devo-util-paths",
+ "devo-util-process",
  "devo-windows-sandbox",
+ "dunce",
  "futures",
  "pretty_assertions",
  "serde",

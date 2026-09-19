@@ -12,6 +12,7 @@
 //! record a `fence-off` event. The one hard exception stays with the approval
 //! pipeline: profiles with deny-read paths never drop their sandbox.
 
+#[cfg(any(windows, test))]
 use crate::session::KernelFenceSpec;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -30,7 +31,8 @@ pub enum FenceState {
 }
 
 /// Pure decision for the fence path — testable without touching the machine's
-/// provisioning state.
+/// provisioning state. (Windows path; the unix branch decides structurally.)
+#[cfg(any(windows, test))]
 pub(crate) fn decide_fence(
     requested: Option<&KernelFenceSpec>,
     sandbox_ready: bool,
@@ -42,15 +44,136 @@ pub(crate) fn decide_fence(
     }
 }
 
-/// Result of the Windows fence application: the launch command, the decision,
-/// and — when fenced — the per-session credential authority whose SID traveled
-/// in the kernel's restricted token. Later `grant_write_root` calls on it
-/// deliver write access to the living kernel without a restart (§9, P2).
-#[cfg(windows)]
+/// Result of the fence application: the launch command, the decision, and —
+/// on Windows when fenced — the per-session credential authority whose SID
+/// traveled in the kernel's restricted token (§9, P2). Unix platforms carry
+/// no authority yet (dirfd delivery channel is follow-up work).
 pub(crate) struct FenceOutcome {
     pub command: Command,
     pub state: FenceState,
+    #[cfg(windows)]
     pub credentials: Option<devo_windows_sandbox::SessionCredentialAuthority>,
+    /// Unix pipe-mode enforcement plan (Landlock + seccomp), applied in the
+    /// child via `pre_exec` — the same mechanism the product's shell sandbox
+    /// uses when no outer wrapper carries the policy.
+    #[cfg(unix)]
+    pub child_plan: Option<devo_util_process::sandbox::ResolvedEnforcementPlan>,
+}
+
+/// Unix fence (Linux bwrap / macOS Seatbelt, design doc §5.2): reuse the same
+/// platform wrapper the product's shell sandboxing uses, carrying the fence
+/// spec's roots as the permission overlay. A missing/unavailable wrapper is an
+/// explicit downgrade, never a silent one.
+#[cfg(unix)]
+pub(super) fn wrap_or_bare(
+    config: &crate::session::KernelSessionConfig,
+    bare: Command,
+) -> FenceOutcome {
+    let Some(spec) = config.fence.as_ref() else {
+        return FenceOutcome {
+            command: bare,
+            state: FenceState::NotRequested,
+            child_plan: None,
+        };
+    };
+    let overlay = devo_sandbox::SandboxPermissionOverlay {
+        read_paths: spec.readable_roots.clone(),
+        write_paths: spec.writable_roots.clone(),
+        // `Unchanged` keeps the workspace profile's network restriction;
+        // `Enabled` would opt the kernel OUT of it.
+        network: if spec.restrict_network {
+            devo_sandbox::SandboxNetworkPermission::Unchanged
+        } else {
+            devo_sandbox::SandboxNetworkPermission::Enabled
+        },
+    };
+    let wrap = devo_sandbox::wrap_command_for_profile_with_overlay(
+        Some("workspace"),
+        &config.cwd,
+        devo_sandbox::WrapMode::PipeComposed,
+        &devo_sandbox::SandboxLogger::new(),
+        Some(&overlay),
+    );
+    match wrap {
+        Ok(devo_sandbox::SandboxWrap::Wrapped(wrapped)) => {
+            let mut cmd = Command::new(&wrapped.program);
+            cmd.args(&wrapped.prefix_args)
+                .arg(&config.python)
+                .arg("-m")
+                .arg("rlm.repl")
+                .current_dir(&config.cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            // bwrap mounts are not up when spawn returns; schedule the
+            // placeholder cleanup like the shell launch path does.
+            if let Some(directory) = wrapped.placeholder_dir.clone() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(devo_sandbox::PLACEHOLDER_CLEANUP_DELAY).await;
+                    devo_sandbox::remove_placeholder_dir(&directory);
+                });
+            }
+            FenceOutcome {
+                command: cmd,
+                state: FenceState::Fenced,
+                child_plan: None,
+            }
+        }
+        Ok(devo_sandbox::SandboxWrap::None) => {
+            // Pipe mode by design: no outer wrapper — the enforcement is the
+            // Landlock/seccomp child plan applied in `pre_exec` (same as the
+            // product's shell sandboxing). A resolvable plan still means
+            // Fenced; without one the downgrade is explicit.
+            match devo_util_process::sandbox::resolve_profile_for_spawn_with_overlay(
+                Some("workspace"),
+                &config.cwd,
+                Some(&overlay),
+            ) {
+                Ok(Some(plan)) => FenceOutcome {
+                    command: bare,
+                    state: FenceState::Fenced,
+                    child_plan: Some(plan),
+                },
+                Ok(None) => {
+                    tracing::warn!(
+                        "RLM kernel fence requested but no enforcement plan resolved; kernel \
+                         runs UNFENCED with full user permissions (explicit downgrade, \
+                         design doc §5.3)"
+                    );
+                    FenceOutcome {
+                        command: bare,
+                        state: FenceState::DowngradedUnfenced,
+                        child_plan: None,
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "RLM kernel fence enforcement plan resolution failed; kernel runs \
+                         UNFENCED with full user permissions (explicit downgrade, §5.3)"
+                    );
+                    FenceOutcome {
+                        command: bare,
+                        state: FenceState::DowngradedUnfenced,
+                        child_plan: None,
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "RLM kernel fence wrapper resolution failed; kernel runs UNFENCED with full \
+                 user permissions (explicit downgrade, design doc §5.3)"
+            );
+            FenceOutcome {
+                command: bare,
+                state: FenceState::DowngradedUnfenced,
+                child_plan: None,
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
