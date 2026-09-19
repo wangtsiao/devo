@@ -46,7 +46,16 @@ pub(crate) fn prepare_direct_argv_launch(
         workspace_roots.as_slice(),
         &env_map,
         &permission_profile,
-        WindowsSandboxLevel::RestrictedToken,
+        // Network-restricted fences need the elevated backend: the legacy
+        // restricted token carries no account-level firewall, so outbound
+        // stays open (verified: fenced kernel reached 1.1.1.1:443). The
+        // elevated backend runs the child as DevoSandboxOffline, whose
+        // firewall rules block non-loopback outbound.
+        if req.restrict_network {
+            WindowsSandboxLevel::Elevated
+        } else {
+            WindowsSandboxLevel::RestrictedToken
+        },
         /*windows_sandbox_private_desktop*/ false,
         /*proxy_enforced*/ false,
         WindowsSandboxProxySettingsMode::Reconcile,
