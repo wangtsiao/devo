@@ -973,8 +973,16 @@ mod tests {
         // in-cargo-test binary cannot self-host the wrapper. Verify via the
         // product binary (TUI e2e) instead.
         let exe = std::env::current_exe().unwrap_or_default();
-        let exe_name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if !exe_name.starts_with("devo") {
+        let exe_name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // The wrapper re-execs current_exe() with the sandbox sentinel argv;
+        // only the product binary's early dispatch understands it. The cargo
+        // test harness (`devo_kernel-<hash>.exe`) cannot self-host it — this
+        // path is verified on the product binary (TUI e2e: fenced spawn,
+        // OS-refused out-of-fence writes, PID-stable credential delivery).
+        if exe_name != "devo.exe" && exe_name != "devo" {
             eprintln!("skip: fence wrapper needs the devo.exe host binary, not {exe_name}");
             return;
         }
