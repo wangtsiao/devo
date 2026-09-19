@@ -73,12 +73,19 @@ Re-vendor batch 1 (same day):
   `devo_windows_sandbox::*` + lib exports (`StatsigMetricsSettings`,
   `path_write_aces_need_refresh`).
 
+Re-vendor batch 2:
+- `helper_materialization.rs`: junction-safe helper lookup retry (canonicalize
+  then retry beside the real executable).
+- `setup.rs`: `SEE_MASK_NOASYNC` on ShellExecuteEx (synchronous activation on
+  Tokio workers without a message loop); `DEVO_WINDOWS_SANDBOX_PROXY_PORTS`
+  env wire parsed into the setup marker (setup side of the port-desync fix —
+  the proxy-side publisher of this env var is P2 network-proxy work).
+
 ## Known upstream-behind gaps (to close on next sync — see design doc)
 
-- Proxy port wire (`DEVO_WINDOWS_SANDBOX_PROXY_PORTS` env + marker drift +
-  provisioning settings) — fixes ephemeral-port-vs-static-firewall mismatch.
-- `helper_materialization.rs`: junction-safe helper lookup retry.
-- `setup.rs`: `SEE_MASK_NOASYNC` + null stdin on ShellExecuteEx; no-reparse
-  HANDLE for ProvisionOnly DACL mutation; symbolic-root read gating;
-  deny-read-key read-root filtering.
+- Proxy-side publisher of `DEVO_WINDOWS_SANDBOX_PROXY_PORTS` (P2) and
+  `WindowsSandboxProvisioningSettings` plumbing.
+- `setup.rs`: no-reparse HANDLE for ProvisionOnly DACL mutation;
+  symbolic-root read gating (needs protocol `missing_path_behavior` /
+  `has_symbolic_root_read_access` first); deny-read-key read-root filtering.
 - `identity.rs` drift is test-only (no functional gap).

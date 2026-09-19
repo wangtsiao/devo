@@ -746,6 +746,13 @@ fn offline_proxy_settings_for_request(
     })
 }
 
+// Internal wire format shared with the network proxy host. The value is a
+// comma-separated, sorted list of non-zero loopback proxy ports actually bound
+// at runtime — folded into the setup marker so the static per-account firewall
+// allowlist stays in sync with reality (upstream fix; devo's sandbox proxy
+// previously bound an ephemeral port the firewall never allowed).
+pub(crate) const WINDOWS_SANDBOX_PROXY_PORTS_ENV_KEY: &str = "DEVO_WINDOWS_SANDBOX_PROXY_PORTS";
+
 pub(crate) fn proxy_ports_from_env(env_map: &HashMap<String, String>) -> Vec<u16> {
     let mut ports = BTreeSet::new();
     for key in PROXY_ENV_KEYS {
@@ -754,6 +761,14 @@ pub(crate) fn proxy_ports_from_env(env_map: &HashMap<String, String>) -> Vec<u16
         {
             ports.insert(port);
         }
+    }
+    if let Some(value) = env_map.get(WINDOWS_SANDBOX_PROXY_PORTS_ENV_KEY) {
+        ports.extend(
+            value
+                .split(',')
+                .filter_map(|port| port.trim().parse::<u16>().ok())
+                .filter(|port| *port != 0),
+        );
     }
     ports.into_iter().collect()
 }
@@ -879,6 +894,7 @@ fn run_setup_exe_payload(payload_b64: &str, needs_elevation: bool, devo_home: &P
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
     use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::Shell::SEE_MASK_NOASYNC;
     use windows_sys::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS;
     use windows_sys::Win32::UI::Shell::SHELLEXECUTEINFOW;
     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
@@ -926,7 +942,9 @@ fn run_setup_exe_payload(payload_b64: &str, needs_elevation: bool, devo_home: &P
     let verb_w = crate::winutil::to_wide("runas");
     let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    // Sandbox setup runs on a Tokio worker without a Windows message loop.
+    // ShellExecuteEx requires synchronous activation on such threads.
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     sei.lpVerb = verb_w.as_ptr();
     sei.lpFile = exe_w.as_ptr();
     sei.lpParameters = params_w.as_ptr();
