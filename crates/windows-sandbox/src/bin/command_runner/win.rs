@@ -282,11 +282,12 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     // ignored by WFP per-user firewall rules, so network blocking silently
     // fails. The primary token keeps the sandbox account's unmodified SID —
     // WFP respects it, and file access stays enforced by capability-SID ACLs.
-    // WFP all-protocol filters (installed at setup) block the sandbox account's
-    // outbound at the OS kernel level — the token type doesn't affect WFP (it
-    // matches the user SID, which is DevoSandboxOffline from the runner either
-    // way). The restricted token from the runner's own token works for file
-    // access (capability-SID ACLs) and doesn't need batch-logon rights.
+    // Restricted token: the ONLY token type CreateProcessAsUserW accepts
+    // without SE_ASSIGNPRIMARYTOKEN_NAME (which the sandbox account lacks).
+    // Windows Firewall does NOT match restricted-token processes (per-user,
+    // per-program — both verified). Network blocking is therefore UNAVAILABLE
+    // on Windows with this architecture; the design doc (§5.3) prescribes an
+    // explicit downgrade warning for this limitation.
     let base = OwnedWinHandle::new(unsafe { get_current_token_for_restriction()? });
     let h_token = OwnedWinHandle::new(unsafe {
         match token_mode {

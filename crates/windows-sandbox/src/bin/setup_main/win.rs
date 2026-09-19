@@ -626,6 +626,19 @@ fn configure_offline_sandbox_network(
         )));
     }
     let firewall_result = firewall::ensure_offline_outbound_block(offline_sid_str, log);
+
+    // Per-program outbound block for the kernel python.exe: restricted tokens
+    // are invisible to ALL firewall rules (verified 2026-09-20). With a
+    // primary token (LogonUserW network logon), this rule is enforced.
+    let kernel_python = std::env::var("DEVO_KERNEL_PYTHON")
+        .unwrap_or_else(|_| r"C:\Program Files\Python313\python.exe".to_string());
+    if let Err(err) = firewall::ensure_program_outbound_block(
+        &kernel_python,
+        "devo_kernel_python_block_outbound",
+        log,
+    ) {
+        let _ = writeln!(log, "WARNING: per-program outbound block failed: {err}");
+    }
     if let Err(err) = firewall_result {
         if extract_setup_failure(&err).is_some() {
             return Err(err);

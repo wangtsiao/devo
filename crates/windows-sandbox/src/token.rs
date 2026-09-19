@@ -186,7 +186,7 @@ pub unsafe fn logon_primary_token(username: &str, password: &str) -> Result<HAND
             phToken: *mut HANDLE,
         ) -> i32;
     }
-    const LOGON32_LOGON_BATCH: u32 = 4;
+    const LOGON32_LOGON_NETWORK: u32 = 3;
     const LOGON32_PROVIDER_DEFAULT: u32 = 0;
 
     let user_w = crate::winutil::to_wide(username);
@@ -197,7 +197,7 @@ pub unsafe fn logon_primary_token(username: &str, password: &str) -> Result<HAND
         user_w.as_ptr(),
         domain_w.as_ptr(),
         pass_w.as_ptr(),
-        LOGON32_LOGON_BATCH,
+        LOGON32_LOGON_NETWORK,
         LOGON32_PROVIDER_DEFAULT,
         &mut h_token,
     );
