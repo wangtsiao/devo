@@ -18,6 +18,7 @@ export type SessionState = WatcherSessionState
 // ============================================================
 
 let abortController: AbortController | null = null
+let watcherClient: ReturnType<typeof createDevoClient> | null = null
 
 /** Minimal session state for transition detection. */
 const sessions = new Map<string, SessionState>()
@@ -51,21 +52,32 @@ export function startNotificationWatcher(transport: DevoNativeTransport): void {
 		log.debug("Stopping existing watcher before restart")
 		abortController.abort()
 	}
+	watcherClient?.dispose()
+	watcherClient = null
 
 	abortController = new AbortController()
 	pendingCount = 0
 
 	const client = createDevoClient({ transport })
+	watcherClient = client
 	setPermissionResponder(async ({ sessionId, permissionId, response }) => {
-		await client.permission.respond({
-			sessionID: sessionId,
-			permissionID: permissionId,
-			response,
-		})
+		try {
+			await client.permission.respond({
+				sessionId: sessionId,
+				permissionId: permissionId,
+				response,
+			})
+		} catch (err) {
+			log.error("Permission reply failed", { sessionId, permissionId, response }, err)
+		}
 	})
 
 	log.info("Starting notification watcher")
-	connectWithRetry(client, abortController.signal)
+	void connectWithRetry(client, abortController.signal).catch((err) => {
+		if (!abortController?.signal.aborted) {
+			log.error("Notification watcher stopped unexpectedly", {}, err)
+		}
+	})
 }
 
 /**
@@ -76,6 +88,8 @@ export function stopNotificationWatcher(): void {
 		abortController.abort()
 		abortController = null
 	}
+	watcherClient?.dispose()
+	watcherClient = null
 	sessions.clear()
 	pendingCount = 0
 	beginHydration()

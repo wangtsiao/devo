@@ -14,6 +14,7 @@ import { getBaseClient, getProjectClient } from "../../services/connection-manag
 import { SettingsHeader } from "./settings-header"
 import { SettingsRow } from "./settings-row"
 import { SettingsSection } from "./settings-section"
+import { skillSourceLabel } from "./skill-source"
 
 interface SkillRow {
 	id: string
@@ -24,20 +25,6 @@ interface SkillRow {
 	source: string
 }
 
-function skillSourceLabel(source: unknown): string {
-	if (typeof source === "string") return source
-	if (source && typeof source === "object") {
-		const value = source as Record<string, unknown>
-		if ("User" in value || source === "User") return "user"
-		if (typeof value.Workspace === "object" || "cwd" in value) return "workspace"
-		if (typeof value.Plugin === "object" || "plugin_id" in value || "pluginId" in value) {
-			return "plugin"
-		}
-		if ("System" in value) return "system"
-		if ("Admin" in value) return "admin"
-	}
-	return "unknown"
-}
 
 function useSkillsClient() {
 	const connected = useAtomValue(serverConnectedAtom)
@@ -92,7 +79,7 @@ export function SkillSettings({
 	})
 
 	return (
-		<div className={embedded ? "space-y-6 px-8 py-8" : "space-y-10"}>
+		<div className={embedded ? "space-y-6" : "space-y-8"}>
 			{!embedded && (
 				<SettingsHeader
 					title="Skills"
@@ -143,6 +130,7 @@ export function SkillSettings({
 							<Switch
 								checked={skill.enabled}
 								disabled={!skill.path || toggle.isPending}
+								aria-label={`${skill.enabled ? "Disable" : "Enable"} ${skill.name}`}
 								onCheckedChange={(checked) =>
 									toggle.mutate({ path: skill.path, enabled: checked === true })
 								}

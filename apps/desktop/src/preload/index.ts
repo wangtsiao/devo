@@ -85,6 +85,24 @@ contextBridge.exposeInMainWorld("devo", {
 		getState: () => ipcRenderer.invoke("native-traffic-log:state"),
 	},
 
+	providerOAuth: {
+		login: (providerId: string, enterpriseUrl?: string) =>
+			ipcRenderer.invoke("provider-oauth:login", { providerId, enterpriseUrl }),
+		cancel: () => ipcRenderer.invoke("provider-oauth:cancel"),
+		onUpdate: (
+			callback: (update: { url?: string; instructions: string; userCode?: string; phase?: "saving" }) => void,
+		) => {
+			const listener = (
+				_event: unknown,
+				update: { url?: string; instructions: string; userCode?: string; phase?: "saving" },
+			) => callback(update)
+			ipcRenderer.on("provider-oauth:update", listener)
+			return () => {
+				ipcRenderer.removeListener("provider-oauth:update", listener)
+			}
+		},
+	},
+
 	terminal: {
 		create: (options: { cwd?: string; cols?: number; rows?: number }) =>
 			ipcRenderer.invoke("terminal:create", options),
@@ -167,6 +185,23 @@ contextBridge.exposeInMainWorld("devo", {
 		stashPop: (directory: string) => ipcRenderer.invoke("git:stash-pop", directory),
 		getRoot: (directory: string) => ipcRenderer.invoke("git:root", directory),
 		diffStat: (directory: string) => ipcRenderer.invoke("git:diff-stat", directory),
+		workspaceChangesSummary: (
+			directory: string,
+			scope: "uncommitted" | "staged" | "unstaged" | "branch",
+			options?: { baseBranch?: string | null; ignoreWhitespace?: boolean },
+		) => ipcRenderer.invoke("git:workspace-changes-summary", directory, scope, options),
+		workspaceFilePatch: (
+			directory: string,
+			scope: "uncommitted" | "staged" | "unstaged" | "branch" | "turn",
+			filePath: string,
+			options?: {
+				baseBranch?: string | null
+				ignoreWhitespace?: boolean
+				fileStatus?: string | null
+				checkpointId?: string | null
+				mergeBase?: string | null
+			},
+		) => ipcRenderer.invoke("git:workspace-file-patch", directory, scope, filePath, options),
 		commitAll: (directory: string, message: string) =>
 			ipcRenderer.invoke("git:commit-all", directory, message),
 		push: (directory: string, remote?: string) => ipcRenderer.invoke("git:push", directory, remote),

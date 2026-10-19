@@ -38,4 +38,34 @@ describe("native tool name mapping", () => {
 			fromInput: "request_user_input",
 		})
 	})
+
+	test("keeps native tool names instead of collapsing to generic tool", () => {
+		const grep = toolPartFromUpdate(
+			"session-1",
+			{ kind: "grep", title: "grep", rawInput: {} },
+			undefined,
+			1,
+		)
+		const shell = toolPartFromUpdate(
+			"session-1",
+			{ kind: "shell_command", title: "shell_command", rawInput: {} },
+			undefined,
+			1,
+		)
+		const glob = toolPartFromUpdate(
+			"session-1",
+			{ kind: "glob", title: "glob", rawInput: {} },
+			undefined,
+			1,
+		)
+		expect({
+			grep: grep.tool,
+			shell: shell.tool,
+			glob: glob.tool,
+		}).toEqual({
+			grep: "grep",
+			shell: "shell_command",
+			glob: "glob",
+		})
+	})
 })

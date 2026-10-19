@@ -85,6 +85,44 @@ pub struct TurnReadResult {
     pub turn: Turn,
 }
 
+/// A saved turn can be recoverable without any live execution task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRecovery {
+    pub turn_id: TurnId,
+    pub revision: u64,
+    pub attempt: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRecoveryReadParams {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRecoveryReadResult {
+    pub recovery: Option<TurnRecovery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnResumeParams {
+    pub session_id: SessionId,
+    pub expected_turn_id: TurnId,
+    pub recovery_revision: u64,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnResumeResult {
+    pub turn: Turn,
+    pub attempt: u32,
+}
+
 // ── session/queue/* ──
 
 /// If the session is idle the input immediately executes as a new turn
@@ -151,24 +189,6 @@ pub struct SessionQueueRemoveParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionQueueRemoveResult {}
-
-/// Promotes a queued entry into the running turn as a steer; fails with
-/// `TURN_NOT_STEERABLE` when no steerable turn exists.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionQueueSteerParams {
-    pub session_id: SessionId,
-    pub queue_item_id: QueueItemId,
-    pub expected_turn_id: TurnId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionQueueSteerResult {
-    pub item_id: ItemId,
-}
-
-// ── task/* ──
 
 /// Starts a background task (L2-DES-APP-008 DD-7, unified task model). The
 /// kind discriminates the backing: `process` is an OS process/pty inheriting

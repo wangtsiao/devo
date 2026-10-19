@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use devo_core::tools::create_default_tool_registry;
@@ -28,7 +29,6 @@ use tokio::time::timeout;
 mod support;
 
 use support::build_runtime_with_registry;
-use support::collect_until_turn_completed;
 use support::create_goal;
 use support::initialize_connection;
 use support::read_goal;
@@ -60,12 +60,12 @@ impl ModelProviderSDK for CompletingGoalProvider {
 
         match request_number {
             1 => {
-                let input = serde_json::json!({ "status": "complete" });
+                let input = serde_json::json!({ "code": "import goal; await goal.complete()" });
                 Ok(Box::pin(stream::iter(vec![
                     Ok(StreamEvent::ToolCallStart {
                         index: 0,
                         id: "complete-goal".to_string(),
-                        name: "update_goal".to_string(),
+                        name: "ipython".to_string(),
                         input: input.clone(),
                     }),
                     Ok(StreamEvent::MessageDone {
@@ -73,7 +73,7 @@ impl ModelProviderSDK for CompletingGoalProvider {
                             id: "update-goal-response".to_string(),
                             content: vec![ResponseContent::ToolUse {
                                 id: "complete-goal".to_string(),
-                                name: "update_goal".to_string(),
+                                name: "ipython".to_string(),
                                 input,
                             }],
                             stop_reason: Some(StopReason::ToolUse),
@@ -94,7 +94,7 @@ impl ModelProviderSDK for CompletingGoalProvider {
             ]))),
             _ => {
                 self.unexpected_request.notify_one();
-                Ok(Box::pin(stream::pending()))
+                anyhow::bail!("unexpected provider request {request_number} after goal completion")
             }
         }
     }
@@ -105,7 +105,7 @@ impl ModelProviderSDK for CompletingGoalProvider {
 }
 
 #[tokio::test]
-async fn update_goal_completion_finishes_current_turn_without_another_continuation() -> Result<()> {
+async fn goal_complete_finishes_current_turn_without_another_continuation() -> Result<()> {
     let data_root = TempDir::new()?;
     let provider = Arc::new(CompletingGoalProvider::default());
     let runtime = build_runtime_with_registry(
@@ -120,14 +120,33 @@ async fn update_goal_completion_finishes_current_turn_without_another_continuati
         &runtime,
         connection_id,
         session_id,
-        "complete the goal with update_goal",
+        "complete the goal from Python",
         None,
         GoalIfExists::Reject,
         "goal-update-completion",
     )
     .await?;
 
-    collect_until_turn_completed(&mut notifications_rx).await?;
+    // This turn starts a real Python process and performs a host RPC. The
+    // tool-free goal fixture's five-second budget can expire on a busy runner.
+    let mut observed = Vec::new();
+    timeout(Duration::from_secs(/*secs*/ 30), async {
+        while let Some(value) = notifications_rx.recv().await {
+            let completed = value.get("method") == Some(&serde_json::json!("turn/completed"));
+            observed.push(value);
+            if completed {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("notification channel closed before turn/completed")
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "timed out waiting for Python goal completion; provider requests: {}; notifications: {observed:?}",
+            provider.requests.load(Ordering::SeqCst),
+        )
+    })??;
     wait_for_captured_request_count(&provider.captured_requests, /*expected*/ 2).await?;
 
     let response = read_goal(&runtime, connection_id, session_id).await?;
@@ -141,17 +160,29 @@ async fn update_goal_completion_finishes_current_turn_without_another_continuati
             .captured_requests
             .lock()
             .expect("lock captured requests");
+        let active_goal_contexts = requests
+            .iter()
+            .map(|request| {
+                request.messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(content, devo_protocol::RequestContent::Text { text, .. }
+                            if text.contains("Continue working toward the active thread goal."))
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(active_goal_contexts, vec![true, false]);
         assert!(
             requests[1].messages.iter().any(|message| {
                 message.content.iter().any(|content| {
                     matches!(
                         content,
                         devo_protocol::RequestContent::ToolResult { content, .. }
-                            if content.contains("Goal marked complete")
+                            if content.contains("complete")
                     )
                 })
             }),
-            "the follow-up request should contain the successful update_goal result"
+            "the follow-up request should contain the successful goal.complete result"
         );
     }
 

@@ -17,6 +17,13 @@ export interface NativeTrafficLogState {
 	path: string | null
 }
 
+export interface ProviderOAuthUpdate {
+	url?: string
+	instructions: string
+	userCode?: string
+	phase?: "saving"
+}
+
 export interface ModelRef {
 	providerID: string
 	modelID: string
@@ -476,6 +483,12 @@ export interface DevoAPI {
 	nativeTraffic: {
 		getState: () => Promise<NativeTrafficLogState>
 	}
+	providerOAuth: {
+		login: (providerId: string, enterpriseUrl?: string) => Promise<void>
+		/** False once the non-cancellable credential save has started. */
+		cancel: () => Promise<boolean>
+		onUpdate: (callback: (update: ProviderOAuthUpdate) => void) => () => void
+	}
 	terminal: {
 		create: (options: { cwd?: string; cols?: number; rows?: number }) => Promise<TerminalSessionInfo>
 		write: (id: string, data: string) => void
@@ -515,6 +528,42 @@ export interface DevoAPI {
 		stashPop: (directory: string) => Promise<GitStashResult>
 		getRoot: (directory: string) => Promise<string | null>
 		diffStat: (directory: string) => Promise<GitDiffStat>
+		workspaceChangesSummary: (
+			directory: string,
+			scope: "uncommitted" | "staged" | "unstaged" | "branch",
+			options?: { baseBranch?: string | null; ignoreWhitespace?: boolean },
+		) => Promise<{
+			scope: string
+			status: string
+			workspace_root: string
+			coverage: string
+			attribution: string
+			change_set_status: string
+			files: Array<{
+				path: string
+				status: string
+				additions: number | null
+				deletions: number | null
+				binary: boolean
+				diff_truncated: boolean
+			}>
+			stats: { files_changed: number; additions: number; deletions: number }
+			unified_diff: string | null
+			warnings: string[]
+			generated_at: string
+		}>
+		workspaceFilePatch: (
+			directory: string,
+			scope: "uncommitted" | "staged" | "unstaged" | "branch" | "turn",
+			filePath: string,
+			options?: {
+				baseBranch?: string | null
+				ignoreWhitespace?: boolean
+				fileStatus?: string | null
+				checkpointId?: string | null
+				mergeBase?: string | null
+			},
+		) => Promise<string>
 		commitAll: (directory: string, message: string) => Promise<GitCommitResult>
 		push: (directory: string, remote?: string) => Promise<GitPushResult>
 		createBranch: (directory: string, branchName: string) => Promise<GitCheckoutResult>

@@ -7,31 +7,58 @@ import {
 	createIpcTransport,
 	defaultCwd,
 	permissionOptionId,
-	partTime,
 	providerDataFromConfigOptions,
 	questionInfoFromNative,
 	sessionErrorEvent,
 	stableId,
-	textFromUpdate,
-	toolCallIdFromUpdate,
-	toolPartFromUpdate,
 } from "./native-client-support"
+import {
+	type NativeItemEnvelope,
+	envelopeFromWire,
+	mergeNativeEnvelope,
+	nativeItemType,
+	recentNativeItems,
+} from "./native-item"
+export type { NativeItemEnvelope } from "./native-item"
+export {
+	assistantOrReasoningText,
+	compareNativeItems,
+	envelopeFromWire,
+	isUserMessageItem,
+	mergeNativeEnvelope,
+	nativeItemType,
+	recentNativeItems,
+	sortedNativeItems,
+	userMessageText,
+} from "./native-item"
 import type {
+	ModelListResult,
+	CredentialListResult,
+	ModelCatalogRefreshParams,
+	ModelCatalogRefreshResult,
+	ProviderDisconnectParams,
+	ProviderDisconnectResult,
+	ProviderDiscoverParams,
+	ProviderDiscoverResult,
+	ProviderInfo,
+	ProviderListResult,
+	ProviderModelInfo,
+	ProviderModelRemoveParams,
+	ProviderModelRemoveResult,
+	ProviderModelVariant,
+	ProviderUpsertParams,
+	ProviderUpsertResult,
 	ProviderValidateParams,
 	ProviderValidateResult,
-	ProviderVendorListResult,
-	ProviderVendorUpsertParams,
-	ProviderVendorUpsertResult,
-	InputItem,
+	InputModality,
+	UserInput,
 	TurnStartResult,
 	WorkspaceChangeCoverage,
 	WorkspaceChangeScope,
 	WorkspaceChangeSetStatus,
-	WorkspaceChangeStats,
 	WorkspaceChangeViewStatus,
 	WorkspaceChangesReadParams,
 	WorkspaceChangesReadResult,
-	WorkspaceChangesUpdatedPayload,
 	WorkspaceDiffDetail,
 	SessionInterruptParams,
 } from "./generated/native"
@@ -140,8 +167,7 @@ export type QuestionInfo = {
 
 export type QuestionRequest = {
 	id: string
-	requestID: string
-	sessionID: string
+	sessionId: string
 	questions: QuestionInfo[]
 }
 
@@ -163,14 +189,31 @@ export type ToolStateCompleted = any
 export type UserMessage = any
 export type Worktree = any
 export type {
-	ProviderModelBinding,
+	ModelInfo,
+	CredentialInfo,
+	ModelListResult,
+	CredentialListResult,
+	ModelCatalogRefreshParams,
+	ModelCatalogRefreshResult,
+	ProviderDisconnectParams,
+	ProviderDisconnectResult,
+	ProviderDiscoverParams,
+	ProviderDiscoverResult,
+	ProviderInfo,
+	ProviderListResult,
+	ProviderModelInfo,
+	ProviderModelRemoveParams,
+	ProviderModelRemoveResult,
+	ProviderModelVariant,
+	ProviderUpsertParams,
+	ProviderUpsertResult,
 	ProviderValidateParams,
 	ProviderValidateResult,
-	ProviderVendor,
-	ProviderVendorListResult,
-	ProviderVendorUpsertParams,
-	ProviderVendorUpsertResult,
 	ProviderWireApi,
+	InputModality,
+	ReasoningCapability,
+	ReasoningEffort,
+	ReasoningLevelChoice,
 	WorkspaceChangeAttribution,
 	WorkspaceChangeBase,
 	WorkspaceChangeCoverage,
@@ -183,35 +226,52 @@ export type {
 	WorkspaceChangedFileStatus,
 	WorkspaceChangesReadParams,
 	WorkspaceChangesReadResult,
-	WorkspaceChangesUpdatedPayload,
 	WorkspaceDiffDetail,
 } from "./generated/native"
 
-export type WorkspaceChangesReadOptions = {
-	sessionID: string
-	cwd?: string
-	scopes: WorkspaceChangeScope[]
-	baseBranch?: string
-	turnID?: string
-	diffDetail?: WorkspaceDiffDetail
-	maxDiffBytes?: number | bigint
-}
-
-export type WorkspaceChangesUpdatedEventProperties = {
-	sessionID: string
-	turnID: string
+/** Native `workspace/changes/updated` notification params (wire camelCase). */
+type WorkspaceChangesUpdatedNotification = {
+	sessionId: string
+	turnId: string
 	scope: WorkspaceChangeScope
 	status: WorkspaceChangeViewStatus
 	coverage: WorkspaceChangeCoverage
 	changeSetStatus: WorkspaceChangeSetStatus
-	stats: {
-		filesChanged: number
-		additions: number
-		deletions: number
-	}
+	stats: { filesChanged: number; additions: number; deletions: number }
 	version: number
 	generatedAt: string
 }
+
+// ── Canonical provider/model catalog types (L2-DES-MODEL-002) ──
+
+/** Canonical provider/model types generated from the Native protocol schema. */
+export type CatalogWireApi = ProviderWireApi
+export type CatalogModelVariant = ProviderModelVariant
+export type CatalogModelInfo = ProviderModelInfo
+export type CatalogProviderInfo = ProviderInfo
+export type ProviderCatalogListResult = ProviderListResult
+export type CatalogProviderUpsertParams = ProviderUpsertParams
+export type CatalogProviderUpsertResult = ProviderUpsertResult
+export type CatalogProviderDisconnectParams = ProviderDisconnectParams
+export type CatalogProviderDisconnectResult = ProviderDisconnectResult
+export type CatalogProviderModelRemoveParams = ProviderModelRemoveParams
+export type CatalogProviderModelRemoveResult = ProviderModelRemoveResult
+export type CatalogProviderValidateParams = ProviderValidateParams
+export type CatalogProviderValidateResult = ProviderValidateResult
+export type CatalogProviderDiscoverParams = ProviderDiscoverParams
+export type CatalogProviderDiscoverResult = ProviderDiscoverResult
+/**
+ * First-party workspace/changes/read options — Native wire names (`sessionId`,
+ * `turnId`, …). Chat item view models and permission/question events use the
+ * same camelCase identity fields (`sessionId`/`itemId`/`turnId`/`requestId`).
+ */
+export type WorkspaceChangesReadOptions = Omit<WorkspaceChangesReadParams, "diffDetail"> & {
+	/** Optional; defaults to summary when omitted. */
+	diffDetail?: WorkspaceDiffDetail
+}
+
+/** Native `workspace/changes/updated` event properties (wire camelCase). */
+export type WorkspaceChangesUpdatedEventProperties = WorkspaceChangesUpdatedNotification
 
 interface GlobalEvent {
 	directory: string
@@ -234,16 +294,104 @@ type PendingPermission = {
 	native?: boolean
 }
 
-function partCacheKey(sessionId: string, messageId: string): string {
-	return `${sessionId}\u001f${messageId}`
-}
-
-function renderedNativeItemKey(sessionId: string, itemId: string): string {
-	return partCacheKey(sessionId, itemId)
-}
-
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined
+}
+
+/** Canonical Native plan-entry statuses — no snake_case reshape. */
+function planStatus(status: string): string {
+	switch (status) {
+		case "completed":
+		case "inProgress":
+		case "cancelled":
+		case "pending":
+			return status
+		default:
+			return "pending"
+	}
+}
+
+type MappedPlanEntry = { content: string; status: string }
+
+function mapPlanEntry(entry: unknown): MappedPlanEntry | null {
+	const value = objectRecord(entry) ?? {}
+	const content = String(value.step ?? value.content ?? value.title ?? "").trim()
+	if (!content) return null
+	return {
+		content,
+		status: planStatus(String(value.status ?? "pending")),
+	}
+}
+
+/**
+ * Expand a single Plan entry when the server historically stored the whole
+ * `update_plan` output as one `step` (JSON object, JSON array, or Mixed text
+ * with a trailing pretty-printed plan array). Structured entries pass through.
+ */
+function expandPlanEntries(entries: unknown[]): MappedPlanEntry[] {
+	const mapped = entries.map(mapPlanEntry).filter((entry): entry is MappedPlanEntry => entry !== null)
+	if (mapped.length !== 1) return mapped
+	const only = mapped[0]
+	const expanded = expandPlanEntriesFromBlob(only.content)
+	return expanded.length > 0 ? expanded : mapped
+}
+
+function expandPlanEntriesFromBlob(content: string): MappedPlanEntry[] {
+	const trimmed = content.trim()
+	if (!trimmed) return []
+
+	const tryParsePlan = (value: unknown): MappedPlanEntry[] => {
+		const plan = Array.isArray(value)
+			? value
+			: Array.isArray(objectRecord(value)?.plan)
+				? (objectRecord(value)?.plan as unknown[])
+				: null
+		if (!plan) return []
+		return plan.map(mapPlanEntry).filter((entry): entry is MappedPlanEntry => entry !== null)
+	}
+
+	if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+		try {
+			return tryParsePlan(JSON.parse(trimmed) as unknown)
+		} catch {
+			// Fall through to Mixed-text extraction.
+		}
+	}
+
+	// Mixed tool text: "<explanation>\n\n[ { status, step }, ... ]"
+	const arrayStart = trimmed.indexOf("\n[")
+	if (arrayStart >= 0) {
+		const maybeArray = trimmed.slice(arrayStart + 1).trim()
+		if (maybeArray.startsWith("[")) {
+			try {
+				return tryParsePlan(JSON.parse(maybeArray) as unknown)
+			} catch {
+				return []
+			}
+		}
+	}
+
+	// Embedded update_plan-shaped objects inside prose.
+	if (
+		/"status"\s*:\s*"(?:pending|completed|inProgress|cancelled)"/.test(trimmed) &&
+		/"(?:step|content)"\s*:/.test(trimmed)
+	) {
+		const objectStart = trimmed.indexOf("{")
+		const arrayStartInline = trimmed.indexOf("[")
+		const start =
+			objectStart >= 0 && (arrayStartInline < 0 || objectStart < arrayStartInline)
+				? objectStart
+				: arrayStartInline
+		if (start >= 0) {
+			try {
+				return tryParsePlan(JSON.parse(trimmed.slice(start)) as unknown)
+			} catch {
+				return []
+			}
+		}
+	}
+
+	return []
 }
 
 const KNOWN_PERMISSION_SCOPES: PermissionResponse[] = [
@@ -257,27 +405,14 @@ const KNOWN_PERMISSION_SCOPES: PermissionResponse[] = [
 	"commandPrefixPersist",
 ]
 
-function snakeCaseToCamelCase(value: string): string {
-	return value.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
-}
-
-export function normalizeApprovalScope(scope: string): PermissionResponse | null {
-	for (const candidate of [scope, snakeCaseToCamelCase(scope)]) {
-		if ((KNOWN_PERMISSION_SCOPES as string[]).includes(candidate)) {
-			return candidate as PermissionResponse
-		}
-	}
-	return null
-}
-
-export function normalizeApprovalScopes(scopes: string[] | undefined): PermissionResponse[] {
+/** Drop unknown tokens; keep only canonical Native approval scopes (no snake_case aliases). */
+function knownApprovalScopes(scopes: string[] | undefined): PermissionResponse[] {
 	const normalized: PermissionResponse[] = []
 	const seen = new Set<string>()
 	for (const scope of scopes ?? ["once"]) {
-		const value = normalizeApprovalScope(scope)
-		if (value && !seen.has(value)) {
-			seen.add(value)
-			normalized.push(value)
+		if ((KNOWN_PERMISSION_SCOPES as string[]).includes(scope) && !seen.has(scope)) {
+			seen.add(scope)
+			normalized.push(scope as PermissionResponse)
 		}
 	}
 	return normalized.length > 0 ? normalized : ["once"]
@@ -309,227 +444,6 @@ function stringOrUndefined(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined
 }
 
-/** Maps a Native FileChangeKind entry into flat tool-input fields the UI can render. */
-function mapFileChangeKind(change: Record<string, unknown> | undefined): {
-	changeType?: string
-	content?: string
-	unifiedDiff?: string
-	movePath?: string
-} {
-	if (!change) return {}
-	const changeType = typeof change.type === "string" ? change.type : undefined
-	const content = typeof change.content === "string" ? change.content : undefined
-	const unifiedDiff =
-		typeof change.unifiedDiff === "string"
-			? change.unifiedDiff
-			: typeof change.unified_diff === "string"
-				? change.unified_diff
-				: undefined
-	const movePath =
-		typeof change.movePath === "string"
-			? change.movePath
-			: typeof change.move_path === "string"
-				? change.move_path
-				: undefined
-	return { changeType, content, unifiedDiff, movePath }
-}
-
-/**
- * Project Native `fileChange` items into tool-part input.
- * Preserves change kind + unifiedDiff so the desktop row can show
- * Writing/Added or Editing/Edited with an expandable diff — not a generic tool.
- */
-function fileChangeInput(item: Record<string, unknown>): Record<string, unknown> | undefined {
-	const changes = Array.isArray(item.changes) ? item.changes : []
-	if (changes.length === 0) return undefined
-
-	const mapped = changes.map((entry) => {
-		const record = objectRecord(entry) ?? {}
-		const path = typeof record.path === "string" ? record.path : undefined
-		const kind = mapFileChangeKind(objectRecord(record.change))
-		return {
-			path,
-			...kind,
-			...(typeof record.content === "string" && kind.content == null
-				? { content: record.content }
-				: {}),
-		}
-	})
-
-	const first = mapped[0]
-	if (!first) return undefined
-	const path = first.path
-	const hasPayload =
-		path != null ||
-		first.content != null ||
-		first.unifiedDiff != null ||
-		first.changeType != null
-	if (!hasPayload) return undefined
-
-	const unifiedDiffs = mapped
-		.map((entry) => entry.unifiedDiff)
-		.filter((diff): diff is string => typeof diff === "string" && diff.length > 0)
-
-	return {
-		...(path ? { filePath: path, path } : {}),
-		...(first.changeType ? { changeType: first.changeType } : {}),
-		...(first.content != null ? { content: first.content } : {}),
-		...(first.unifiedDiff != null ? { unifiedDiff: first.unifiedDiff } : {}),
-		...(first.movePath ? { movePath: first.movePath } : {}),
-		...(mapped.length > 1 ? { changes: mapped } : {}),
-		...(unifiedDiffs.length > 1 ? { unifiedDiff: unifiedDiffs.join("\n") } : {}),
-	}
-}
-
-/**
- * History often stores file tools as a nameless ToolResult whose `output` is
- * `{ diff, files: [{ kind, filePath, oldContent, postContent, ... }] }` —
- * the same shape the TUI parses on resume. Project that into flat tool input
- * so desktop can render Writing/Added / Editing/Edited instead of generic JSON.
- */
-function fileChangeInputFromToolOutput(output: unknown): Record<string, unknown> | undefined {
-	const record =
-		typeof output === "string"
-			? (() => {
-					try {
-						return objectRecord(JSON.parse(output))
-					} catch {
-						return undefined
-					}
-				})()
-			: objectRecord(output)
-	if (!record) return undefined
-	const files = Array.isArray(record.files) ? record.files : []
-	if (files.length === 0) return undefined
-
-	const topDiff =
-		typeof record.diff === "string"
-			? record.diff
-			: typeof record.patch === "string"
-				? record.patch
-				: undefined
-
-	const mapped = files.map((entry) => {
-		const file = objectRecord(entry) ?? {}
-		const path =
-			typeof file.filePath === "string"
-				? file.filePath
-				: typeof file.path === "string"
-					? file.path
-					: undefined
-		const kind = typeof file.kind === "string" ? file.kind : undefined
-		const changeType =
-			kind === "add" || kind === "update" || kind === "delete" || kind === "move"
-				? kind === "move"
-					? "update"
-					: kind
-				: undefined
-		const content = typeof file.content === "string" ? file.content : undefined
-		const oldString =
-			typeof file.oldContent === "string"
-				? file.oldContent
-				: typeof file.preContent === "string"
-					? file.preContent
-					: typeof file.pre_content === "string"
-						? file.pre_content
-						: undefined
-		const newString =
-			typeof file.postContent === "string"
-				? file.postContent
-				: typeof file.post_content === "string"
-					? file.post_content
-					: changeType === "update" || changeType === "add"
-						? content
-						: undefined
-		const unifiedDiff =
-			typeof file.diff === "string"
-				? file.diff
-				: typeof file.patch === "string"
-					? file.patch
-					: undefined
-		const movePath =
-			typeof file.movePath === "string"
-				? file.movePath
-				: typeof file.move_path === "string"
-					? file.move_path
-					: undefined
-		return {
-			path,
-			changeType,
-			content: changeType === "add" || changeType === "delete" ? content : undefined,
-			oldString,
-			newString,
-			unifiedDiff,
-			movePath,
-		}
-	})
-
-	const first = mapped[0]
-	if (!first?.path && !first?.unifiedDiff && !first?.content && !first?.oldString) {
-		return undefined
-	}
-
-	const unifiedDiff = first.unifiedDiff ?? topDiff
-	return {
-		...(first.path ? { filePath: first.path, path: first.path } : {}),
-		...(first.changeType ? { changeType: first.changeType } : {}),
-		...(first.content != null ? { content: first.content } : {}),
-		...(first.oldString != null ? { oldString: first.oldString } : {}),
-		...(first.newString != null ? { newString: first.newString } : {}),
-		...(unifiedDiff ? { unifiedDiff } : {}),
-		...(first.movePath ? { movePath: first.movePath } : {}),
-		...(mapped.length > 1 ? { changes: mapped } : {}),
-	}
-}
-
-/** Infer write vs edit from Native fileChange entries when toolName is absent. */
-function fileChangeToolKind(item: Record<string, unknown>): "write" | "edit" | undefined {
-	const changes = Array.isArray(item.changes) ? item.changes : []
-	const first = objectRecord(changes[0])
-	const change = objectRecord(first?.change)
-	const changeType = typeof change?.type === "string" ? change.type : undefined
-	if (changeType === "add") return "write"
-	if (changeType === "update" || changeType === "delete") return "edit"
-	return undefined
-}
-
-function fileChangeToolKindFromInput(
-	input: Record<string, unknown> | undefined,
-): "write" | "edit" | undefined {
-	if (!input) return undefined
-	const changeType = typeof input.changeType === "string" ? input.changeType : undefined
-	if (changeType === "add") return "write"
-	if (changeType === "update" || changeType === "delete") return "edit"
-	if (typeof input.unifiedDiff === "string" || typeof input.oldString === "string") return "edit"
-	if (typeof input.content === "string" && (input.path != null || input.filePath != null)) {
-		return "write"
-	}
-	return undefined
-}
-
-/** Prefer displayContent; unwrap Mixed `{ output: string }` without JSON.stringify. */
-function toolResultDisplayOutput(item: Record<string, unknown>): unknown {
-	if (typeof item.displayContent === "string" && item.displayContent.length > 0) {
-		return item.displayContent
-	}
-	if (typeof item.display_content === "string" && item.display_content.length > 0) {
-		return item.display_content
-	}
-	return unwrapToolOutputValue(item.output)
-}
-
-function unwrapToolOutputValue(output: unknown): unknown {
-	if (typeof output === "string") return output
-	const record = objectRecord(output)
-	if (!record) return output
-	// Mixed tool result: text lives under `output` / `text`; keep file-change
-	// metadata objects intact so callers can project `files[]`.
-	if (Array.isArray(record.files)) return output
-	if (typeof record.output === "string") return record.output
-	if (typeof record.text === "string") return record.text
-	return output
-}
-
 function numberFromProtocol(value: unknown): number {
 	if (typeof value === "number" && Number.isFinite(value)) return value
 	if (typeof value === "bigint") return Number(value)
@@ -551,10 +465,8 @@ function contextOccupancyFromProtocol(value: unknown): ContextOccupancyWire | nu
 	if (!occupancy) return null
 	const rawCategories = Array.isArray(occupancy.categories) ? occupancy.categories : []
 	return {
-		totalTokens: numberFromProtocol(occupancy.totalTokens ?? occupancy.total_tokens),
-		contextWindowTokens: numberFromProtocol(
-			occupancy.contextWindowTokens ?? occupancy.context_window_tokens,
-		),
+		totalTokens: numberFromProtocol(occupancy.totalTokens),
+		contextWindowTokens: numberFromProtocol(occupancy.contextWindowTokens),
 		categories: rawCategories.flatMap((entry) => {
 			const category = objectRecord(entry)
 			const id = String(category?.id ?? "")
@@ -563,71 +475,10 @@ function contextOccupancyFromProtocol(value: unknown): ContextOccupancyWire | nu
 				{
 					id,
 					tokens: numberFromProtocol(category?.tokens),
-					shareBps: numberFromProtocol(category?.shareBps ?? category?.share_bps),
+					shareBps: numberFromProtocol(category?.shareBps),
 				},
 			]
 		}),
-	}
-}
-
-function workspaceChangeStats(value: unknown): WorkspaceChangeStats {
-	const stats = objectRecord(value)
-	return {
-		files_changed: numberFromProtocol(stats?.files_changed ?? stats?.filesChanged),
-		additions: numberFromProtocol(stats?.additions),
-		deletions: numberFromProtocol(stats?.deletions),
-	}
-}
-
-// ── Canonical provider conversions (ratified #11) ──
-
-function canonicalProviderVendorWire(vendor: ProviderVendor): Record<string, unknown> {
-	return {
-		name: vendor.name,
-		...(vendor.base_url != null ? { baseUrl: vendor.base_url } : {}),
-		...(vendor.credential != null ? { credential: vendor.credential } : {}),
-		...(vendor.headers != null ? { headers: vendor.headers } : {}),
-		wireApis: vendor.wire_apis,
-		enabled: vendor.enabled,
-	}
-}
-
-function canonicalModelBindingWire(binding: ProviderModelBinding): Record<string, unknown> {
-	return {
-		bindingId: binding.binding_id,
-		modelSlug: binding.model_slug,
-		provider: binding.provider,
-		requestModel: binding.request_model,
-		...(binding.display_name != null ? { displayName: binding.display_name } : {}),
-		invocationMethod: binding.invocation_method,
-		...(binding.default_reasoning_effort != null
-			? { defaultReasoningEffort: binding.default_reasoning_effort }
-			: {}),
-		enabled: binding.enabled,
-	}
-}
-
-function legacyProviderVendorFromCanonical(vendor: Record<string, unknown>): ProviderVendor {
-	return {
-		name: String(vendor.name ?? ""),
-		base_url: (vendor.baseUrl as string | null) ?? null,
-		credential: (vendor.credential as string | null) ?? null,
-		headers: (vendor.headers as string | null) ?? null,
-		wire_apis: (vendor.wireApis ?? []) as ProviderVendor["wire_apis"],
-		enabled: Boolean(vendor.enabled),
-	}
-}
-
-function legacyModelBindingFromCanonical(binding: Record<string, unknown>): ProviderModelBinding {
-	return {
-		binding_id: String(binding.bindingId ?? ""),
-		model_slug: String(binding.modelSlug ?? ""),
-		provider: String(binding.provider ?? ""),
-		request_model: String(binding.requestModel ?? ""),
-		display_name: (binding.displayName as string | null) ?? null,
-		invocation_method: binding.invocationMethod as ProviderModelBinding["invocation_method"],
-		default_reasoning_effort: (binding.defaultReasoningEffort as string | null) ?? null,
-		enabled: Boolean(binding.enabled),
 	}
 }
 
@@ -690,73 +541,6 @@ function sessionConfigOptionsFromModelPreferences(preferences: ModelPreferencesW
 	return options
 }
 
-/** Canonical (camelCase) workspace change view → legacy generated shape. */
-function legacyWorkspaceChangeViewFromCanonical(	view: Record<string, unknown>,
-): WorkspaceChangeView {
-	const base = objectRecord(view.base)
-	return {
-		scope: view.scope as WorkspaceChangeView["scope"],
-		status: view.status as WorkspaceChangeView["status"],
-		workspace_root: String(view.workspaceRoot ?? ""),
-		base: base ? legacyWorkspaceChangeBaseFromCanonical(base) : undefined,
-		coverage: view.coverage as WorkspaceChangeView["coverage"],
-		attribution: view.attribution as WorkspaceChangeView["attribution"],
-		change_set_status: view.changeSetStatus as WorkspaceChangeView["change_set_status"],
-		files: (view.files ?? []) as WorkspaceChangeView["files"],
-		stats: workspaceChangeStats(view.stats),
-		unified_diff: typeof view.unifiedDiff === "string" ? view.unifiedDiff : undefined,
-		warnings: (view.warnings ?? []) as string[],
-		generated_at: String(view.generatedAt ?? ""),
-	}
-}
-
-function legacyWorkspaceChangeBaseFromCanonical(
-	base: Record<string, unknown>,
-): WorkspaceChangeBase {
-	if (base.kind === "branch") {
-		return {
-			kind: "branch",
-			base_branch: String(base.baseBranch ?? ""),
-			merge_base: String(base.mergeBase ?? ""),
-			head: String(base.head ?? ""),
-		} as WorkspaceChangeBase
-	}
-	if (base.kind === "turn_checkpoint") {
-		return {
-			kind: "turn_checkpoint",
-			turn_id: String(base.turnId ?? ""),
-			checkpoint_id: String(base.checkpointId ?? ""),
-			backend: base.backend,
-		} as WorkspaceChangeBase
-	}
-	return {
-		kind: "head",
-		head: typeof base.head === "string" ? base.head : undefined,
-	} as WorkspaceChangeBase
-}
-
-function workspaceChangesUpdatedEventProperties(
-	payload: WorkspaceChangesUpdatedPayload,
-): WorkspaceChangesUpdatedEventProperties {
-	const value = payload as unknown as Record<string, unknown>
-	const stats = objectRecord(value.stats) ?? {}
-	return {
-		sessionID: value.sessionId ?? value.session_id,
-		turnID: value.turnId ?? value.turn_id,
-		scope: payload.scope,
-		status: payload.status,
-		coverage: payload.coverage,
-		changeSetStatus: value.changeSetStatus ?? value.change_set_status,
-		stats: {
-			filesChanged: numberFromProtocol(stats.filesChanged ?? stats.files_changed),
-			additions: numberFromProtocol(stats.additions),
-			deletions: numberFromProtocol(stats.deletions),
-		},
-		version: numberFromProtocol(payload.version),
-		generatedAt: value.generatedAt ?? value.generated_at,
-	}
-}
-
 function parseTimestampMs(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) return value
 	if (typeof value !== "string") return undefined
@@ -771,30 +555,6 @@ function parseTitleState(value: unknown): string | undefined {
 		if (keys.length === 1) return keys[0]
 	}
 	return undefined
-}
-
-/** Wire timestamps from a native ItemEnvelope into appendText/appendTool updates. */
-function nativeItemTimingFields(
-	envelope: Record<string, unknown>,
-	options: { includeCompletedAt?: boolean } = {},
-): Record<string, unknown> {
-	const turnId = typeof envelope.turnId === "string" ? envelope.turnId : ""
-	const fields: Record<string, unknown> = {}
-	if (turnId) fields._meta = { [DEVO_TURN_ID_META]: turnId }
-	if (typeof envelope.createdAt === "string") fields.createdAt = envelope.createdAt
-	if (options.includeCompletedAt && typeof envelope.updatedAt === "string") {
-		fields.completedAt = envelope.updatedAt
-	}
-	return fields
-}
-
-function updateEventTimeMs(update: Record<string, unknown>, fallback: number): number {
-	return (
-		parseTimestampMs(update.completedAt) ??
-		parseTimestampMs(update.createdAt) ??
-		updateHistoryCreatedAt(update) ??
-		fallback
-	)
 }
 
 type LoadedSessionLimit = number | null
@@ -818,17 +578,6 @@ type SessionSettingsQueue = {
 }
 
 const SESSION_SETTINGS_RETRY_DELAYS_MS = [250, 1_000, 2_000] as const
-const HISTORY_MESSAGE_ID_RE = /^(?:tool-)?history-(\d+)$/
-const DEVO_TURN_ID_META = "devo/turnId"
-const DEVO_HISTORY_INDEX_META = "devo/historyIndex"
-const DEVO_PARENT_MESSAGE_ID_META = "devo/parentMessageId"
-const DEVO_ITEM_KIND_META = "devo/itemKind"
-const DEVO_RESEARCH_ARTIFACT_TYPE_META = "devo/researchArtifactType"
-const DEVO_RESEARCH_ARTIFACT_TITLE_META = "devo/researchArtifactTitle"
-const DEVO_COMPACTION_STATUS_META = "devo/compactionStatus"
-const COMPACTION_STARTED_LABEL = "Compacting context"
-const COMPACTION_COMPLETED_LABEL = "Context compacted"
-
 type PromptPartInput = {
 	type: string
 	text?: string
@@ -851,7 +600,7 @@ function pathFromFileUri(uri: string): string | null {
 }
 
 export type PromptAsyncOutcome =
-	| { outcome: "started" }
+	| { outcome: "started"; turnId?: string }
 	| { outcome: "queued"; queueItemId: string }
 
 export type QueueWireEntry = {
@@ -886,8 +635,8 @@ function parseQueueWireEntries(value: unknown): QueueWireEntry[] {
 		.sort((left, right) => left.position - right.position)
 }
 
-function inputItemsFromPromptParts(parts: PromptPartInput[]): InputItem[] {
-	const input: InputItem[] = []
+function userInputsFromPromptParts(parts: PromptPartInput[]): UserInput[] {
+	const input: UserInput[] = []
 	const text = parts
 		.map((part) => (part.type === "text" ? (part.text ?? "") : ""))
 		.join("\n")
@@ -901,8 +650,7 @@ function inputItemsFromPromptParts(parts: PromptPartInput[]): InputItem[] {
 		if (path) {
 			input.push({
 				type: "mention",
-				path,
-				name: part.filename ?? path.split(/[\\/]/).pop() ?? path,
+				uri: path,
 			})
 			continue
 		}
@@ -942,6 +690,39 @@ function errorRecord(error: unknown): Record<string, unknown> | undefined {
 	}
 }
 
+/** Map a native turn failure onto the Desktop session/assistant error shape. */
+function assistantErrorFromTurnFailure(
+	turnStatus: string,
+	turnError: Record<string, unknown> | undefined,
+): { name: string; data: Record<string, unknown> } | undefined {
+	const message =
+		typeof turnError?.message === "string" && turnError.message.trim()
+			? turnError.message.trim()
+			: undefined
+	if (!message) {
+		// Follow-up `turn/completed` after TurnFailed has status failed but no
+		// error payload — do not invent a generic message that would clobber UI.
+		return undefined
+	}
+	const code =
+		typeof turnError?.errorCode === "string"
+			? turnError.errorCode
+			: typeof turnError?.error_code === "string"
+				? turnError.error_code
+				: turnStatus === "failed"
+					? "TurnFailed"
+					: "Error"
+	const details = objectRecord(turnError?.details)
+	return {
+		name: code,
+		data: {
+			message,
+			...(code !== "Error" ? { code } : {}),
+			...(details ?? {}),
+		},
+	}
+}
+
 function settingsErrorCode(error: unknown): string | undefined {
 	const record = errorRecord(error)
 	if (typeof record?.code === "string") return record.code
@@ -954,6 +735,24 @@ function settingsErrorCode(error: unknown): string | undefined {
 		}
 	}
 	return undefined
+}
+
+/** True when the Native server reports the session is gone / never existed. */
+export function isSessionNotFoundError(error: unknown): boolean {
+	const code = settingsErrorCode(error)
+	const normalizedCode = code?.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+	if (normalizedCode === "session_not_found") return true
+	const record = errorRecord(error)
+	if (typeof record?.code === "string") {
+		const recordCode = record.code.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+		if (recordCode === "session_not_found") return true
+	}
+	const message = error instanceof Error ? error.message : String(error)
+	return (
+		/session does not exist/i.test(message) ||
+		/^session .+ not found$/i.test(message) ||
+		/session id is not addressable by this server/i.test(message)
+	)
 }
 
 function isTransientSessionSettingsError(error: unknown): boolean {
@@ -977,83 +776,6 @@ function waitForSessionSettingsRetry(delayMs: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, delayMs))
 }
 
-function historyMessageCreatedAt(messageId: string): number | undefined {
-	const match = HISTORY_MESSAGE_ID_RE.exec(messageId)
-	if (!match) return undefined
-	const index = Number.parseInt(match[1], 10)
-	return Number.isFinite(index) ? index + 1 : undefined
-}
-
-function updateMeta(update: Record<string, unknown>): Record<string, unknown> | undefined {
-	return objectRecord(update._meta)
-}
-
-function updateMetaString(update: Record<string, unknown>, key: string): string | undefined {
-	const value = updateMeta(update)?.[key]
-	return typeof value === "string" && value ? value : undefined
-}
-
-function textPartMetadataFromUpdate(
-	update: Record<string, unknown>,
-	existingPart?: Record<string, unknown>,
-): Record<string, unknown> | undefined {
-	const existing = objectRecord(existingPart?.metadata)
-	const metadata = existing ? { ...existing } : {}
-	const meta = updateMeta(update)
-	if (meta?.[DEVO_ITEM_KIND_META] === "research_artifact") {
-		metadata[DEVO_ITEM_KIND_META] = "research_artifact"
-		const artifactType = meta[DEVO_RESEARCH_ARTIFACT_TYPE_META]
-		if (typeof artifactType === "string" && artifactType) {
-			metadata[DEVO_RESEARCH_ARTIFACT_TYPE_META] = artifactType
-		}
-		const title = meta[DEVO_RESEARCH_ARTIFACT_TITLE_META]
-		if (typeof title === "string" && title) {
-			metadata[DEVO_RESEARCH_ARTIFACT_TITLE_META] = title
-		}
-	}
-	if (meta?.[DEVO_ITEM_KIND_META] === "context_compaction") {
-		metadata[DEVO_ITEM_KIND_META] = "context_compaction"
-		const status = meta[DEVO_COMPACTION_STATUS_META]
-		if (typeof status === "string" && status) {
-			metadata[DEVO_COMPACTION_STATUS_META] = status
-		}
-	}
-	if (meta?.[DEVO_ITEM_KIND_META] === "proposed_plan" || meta?.[DEVO_ITEM_KIND_META] === "plan") {
-		metadata[DEVO_ITEM_KIND_META] = meta[DEVO_ITEM_KIND_META]
-		if (meta.planEntries !== undefined) metadata.planEntries = meta.planEntries
-	}
-	return Object.keys(metadata).length > 0 ? metadata : undefined
-}
-
-function updateHistoryCreatedAt(update: Record<string, unknown>): number | undefined {
-	const value = updateMeta(update)?.[DEVO_HISTORY_INDEX_META]
-	const index =
-		typeof value === "number"
-			? value
-			: typeof value === "string"
-				? Number.parseInt(value, 10)
-				: undefined
-	return typeof index === "number" && Number.isFinite(index) && index >= 0
-		? Math.floor(index) + 1
-		: undefined
-}
-
-function messageCreatedAt(message: Message): number {
-	const historyCreated = historyMessageCreatedAt(message.id)
-	if (historyCreated !== undefined) return historyCreated
-	const created = message.time?.created
-	return typeof created === "number" && Number.isFinite(created) ? created : 0
-}
-
-function compareMessages(left: Message, right: Message): number {
-	const byCreated = messageCreatedAt(left) - messageCreatedAt(right)
-	return byCreated === 0 ? left.id.localeCompare(right.id) : byCreated
-}
-
-function sortedMessages(messages: Message[]): Message[] {
-	return [...messages].sort(compareMessages)
-}
-
 const initializePromises = new WeakMap<DevoNativeTransport, Promise<void>>()
 
 export const DESKTOP_INITIALIZE_PARAMS = {
@@ -1070,49 +792,60 @@ export const DESKTOP_INITIALIZE_PARAMS = {
 	},
 } as const
 
-function recentMessages(messages: Message[], limit: number | undefined): Message[] {
-	const sorted = sortedMessages(messages)
-	if (limit === undefined || sorted.length <= limit) return sorted
-	let start = sorted.length - limit
-	while (start > 0 && sorted[start].role !== "user") {
-		start -= 1
-	}
-	return sorted.slice(start)
-}
 
 class NativeClient {
 	private transport: DevoNativeTransport | null = null
 	private openPromise: Promise<void> | null = null
 	private initialized = false
+	private disposed = false
+	private unsubscribeTransport: (() => void) | null = null
 	private events = new AsyncEventQueue<GlobalEvent>()
 	private sessions = new Map<string, Session>()
 	private sessionDirectories = new Map<string, string>()
 	private sessionStatuses = new Map<string, SessionStatus>()
 	private promptStartedAtBySession = new Map<string, number>()
-	private messages = new Map<string, Message[]>()
-	private parts = new Map<string, Part[]>()
+	/** Session transcript: Native ItemEnvelope keyed by itemId (no Message/Part dual). */
+	private items = new Map<string, Map<string, NativeItemEnvelope>>()
 	private loadedSessionLimits = new Map<string, LoadedSessionLimit>()
-	private lastUserMessageBySession = new Map<string, string>()
-	private userMessageByTurn = new Map<string, string>()
-	private messageTurnIds = new Map<string, string>()
+	private historyCursors = new Map<string, string | null>()
+	private resumedSessions = new Set<string>()
+	private sessionResumes = new Map<string, Promise<void>>()
+	private subscriptionLoads = new Map<string, Promise<void>>()
+	private directorySubscriptions = new Map<string, Promise<void>>()
+	private sessionLists = new Map<string, Promise<Session[]>>()
 	private configOptionsBySession = new Map<string, SessionConfigOption[]>()
 	private configOptionsByDirectory = new Map<string, SessionConfigOption[]>()
 	private pendingPermissions = new Map<string, PendingPermission>()
 	private pendingQuestions = new Map<string, PendingQuestion>()
 	private subscriptions = new Map<string, { subscriptionId: string; cursors: Array<{ streamId: string; seq: number }> }>()
 	private subscriptionCursors = new Map<string, Array<{ streamId: string; seq: number }>>()
-	private renderedNativeItems = new Set<string>()
 	private turnSessions = new Map<string, string>()
 	private activeTurnIds = new Map<string, string>()
 	private queueEntriesBySession = new Map<string, QueueWireEntry[]>()
+	/** Native itemId → callId (for command output deltas). */
 	private nativeItemCallIds = new Map<string, string>()
 	private sessionDiscovery = new Map<string, Promise<Session | undefined>>()
 	private sessionLoads = new Map<string, Promise<void>>()
 	private sessionSettingsQueues = new Map<string, SessionSettingsQueue>()
 	private lastEventTime = 0
 	private referenceSearchSession: ReferenceSearchSession | null = null
+	/** >0 while applying subscription create replay — must not bump sidebar sort keys. */
+	private subscriptionReplayDepth = 0
 
 	constructor(private readonly options: CreateDevoClientOptions) {}
+
+	dispose(): void {
+		if (this.disposed) return
+		this.disposed = true
+		const unsubscribe = this.unsubscribeTransport
+		this.unsubscribeTransport = null
+		try {
+			unsubscribe?.()
+		} finally {
+			this.events.close()
+		}
+	}
+
 	project = {
 		list: async () => ({ data: await this.listProjects() }),
 	}
@@ -1123,76 +856,86 @@ class NativeClient {
 		status: async () => ({ data: Object.fromEntries(this.sessionStatuses) }),
 		create: async (_params?: { title?: string }) => ({ data: await this.createSession() }),
 		promptAsync: async (params: {
-			sessionID: string
+			sessionId: string
 			parts: PromptPartInput[]
 			model?: unknown
 			agent?: string
 			variant?: string
 			collaborationMode?: string
 		}) => {
-			const directory = this.sessionDirectories.get(params.sessionID) ?? this.options.directory ?? defaultCwd()
-			this.lastUserMessageBySession.delete(params.sessionID)
+			const directory = this.sessionDirectories.get(params.sessionId) ?? this.options.directory ?? defaultCwd()
 			const activityAt = Math.max(Date.now(), this.lastEventTime + 1)
-			this.touchNativeSessionActivity(params.sessionID, activityAt)
-			const wasBusy = this.sessionStatuses.get(params.sessionID)?.type === "busy"
+			this.touchNativeSessionActivity(params.sessionId, activityAt)
+			const wasBusy = this.sessionStatuses.get(params.sessionId)?.type === "busy"
 			try {
 				const result = await this.pushSessionQueue({
-					sessionID: params.sessionID,
+					sessionId: params.sessionId,
 					parts: params.parts,
 					collaborationMode: params.collaborationMode,
 				})
 				if (result.outcome === "started") {
 					const promptStartedAt = Math.max(Date.now(), this.lastEventTime + 1)
-					this.promptStartedAtBySession.set(params.sessionID, promptStartedAt)
+					this.promptStartedAtBySession.set(params.sessionId, promptStartedAt)
 					const busyStatus = { type: "busy" }
-					this.sessionStatuses.set(params.sessionID, busyStatus)
+					this.sessionStatuses.set(params.sessionId, busyStatus)
 					this.emit(directory, {
 						type: "session.status",
-						properties: { sessionID: params.sessionID, status: busyStatus },
+						properties: { sessionId: params.sessionId, status: busyStatus },
 					})
 				}
 				return { data: result }
 			} catch (error) {
-				if (!wasBusy && !this.activeTurnIds.has(params.sessionID)) {
-					this.promptStartedAtBySession.delete(params.sessionID)
-					this.completeOpenAssistantMessages(params.sessionID, directory, activityAt)
+				if (!wasBusy && !this.activeTurnIds.has(params.sessionId)) {
+					this.promptStartedAtBySession.delete(params.sessionId)
+					this.completeOpenAssistantMessages(params.sessionId, directory, activityAt)
 					const idleStatus = { type: "idle" }
-					this.sessionStatuses.set(params.sessionID, idleStatus)
+					this.sessionStatuses.set(params.sessionId, idleStatus)
 					this.emit(directory, {
 						type: "session.status",
-						properties: { sessionID: params.sessionID, status: idleStatus },
+						properties: { sessionId: params.sessionId, status: idleStatus },
 					})
 				}
-				this.emit(directory, sessionErrorEvent(params.sessionID, error))
+				this.emit(directory, sessionErrorEvent(params.sessionId, error))
 				throw error
 			}
 		},
 		queue: {
-			list: async (params: { sessionID: string }) => {
-				await this.ensureSessionSubscription(params.sessionID)
-				const result = (await this.requestCanonical("session/queue/list", {
-					sessionId: params.sessionID,
-				})) as { entries?: unknown }
-				const entries = parseQueueWireEntries(result.entries)
-				this.emitQueueSnapshot(params.sessionID, entries, "sync")
-				return { data: { entries } }
+			list: async (params: { sessionId: string }) => {
+				// Historical sessions show up in session/list but are not
+				// addressable until session/resume. Composer refresh races
+				// message load on open, so wait for load before queue/list.
+				try {
+					await this.ensureSessionReady(params.sessionId)
+					const result = (await this.requestCanonical("session/queue/list", {
+						sessionId: params.sessionId,
+					})) as { entries?: unknown }
+					const entries = parseQueueWireEntries(result.entries)
+					this.emitQueueSnapshot(params.sessionId, entries, "sync")
+					return { data: { entries } }
+				} catch (error) {
+					if (isSessionNotFoundError(error)) {
+						this.emitQueueSnapshot(params.sessionId, [], "sync")
+						return { data: { entries: [] } }
+					}
+					throw error
+				}
 			},
 			push: async (params: {
-				sessionID: string
+				sessionId: string
 				parts: PromptPartInput[]
 				collaborationMode?: string
 			}) => ({ data: await this.pushSessionQueue(params) }),
 			update: async (params: {
-				sessionID: string
+				sessionId: string
 				queueItemId: string
 				parts?: PromptPartInput[]
 				position?: number
 			}) => {
 				const result = (await this.requestCanonical("session/queue/update", {
-					sessionId: params.sessionID,
+					sessionId: params.sessionId,
 					queueItemId: params.queueItemId,
 					...(params.parts
-						? { input: inputItemsFromPromptParts(params.parts) }
+						? { input: userInputsFromPromptParts(params.parts) }
 						: {}),
 					...(params.position !== undefined ? { position: params.position } : {}),
 				})) as { entry?: unknown }
@@ -1200,7 +943,7 @@ class NativeClient {
 				if (entry) {
 					const entries = parseQueueWireEntries([entry])
 					if (entries[0]) {
-						const current = this.queueEntriesForSession(params.sessionID)
+						const current = this.queueEntriesForSession(params.sessionId)
 						const next = current.map((item) =>
 							item.queueItemId === entries[0].queueItemId ? entries[0] : item,
 						)
@@ -1208,7 +951,7 @@ class NativeClient {
 							next.push(entries[0])
 						}
 						this.emitQueueSnapshot(
-							params.sessionID,
+							params.sessionId,
 							next.sort((left, right) => left.position - right.position),
 							"updated",
 						)
@@ -1216,56 +959,57 @@ class NativeClient {
 				}
 				return { data: result }
 			},
-			remove: async (params: { sessionID: string; queueItemId: string }) => {
+			remove: async (params: { sessionId: string; queueItemId: string }) => {
 				await this.requestCanonical("session/queue/remove", {
-					sessionId: params.sessionID,
+					sessionId: params.sessionId,
 					queueItemId: params.queueItemId,
 				})
 				return { data: null }
 			},
-			steer: async (params: { sessionID: string; queueItemId: string }) => {
-				const expectedTurnId = this.activeTurnIds.get(params.sessionID)
-				if (!expectedTurnId) {
-					throw new Error("No active turn to steer")
-				}
-				const result = await this.requestCanonical("session/queue/steer", {
-					sessionId: params.sessionID,
-					queueItemId: params.queueItemId,
-					expectedTurnId,
-				})
-				return { data: result }
-			},
 		},
-		editMessage: async (params: { sessionID: string; itemID: string; text: string }) => {
-			const directory = this.sessionDirectories.get(params.sessionID) ?? this.options.directory ?? defaultCwd()
+		steer: async (params: { sessionId: string; parts: PromptPartInput[] }) => {
+			const expectedTurnId = this.activeTurnIds.get(params.sessionId)
+			if (!expectedTurnId) {
+				throw new Error("No active turn to steer")
+			}
+			const result = await this.requestCanonical("turn/steer", {
+				sessionId: params.sessionId,
+				expectedTurnId,
+				input: userInputsFromPromptParts(params.parts),
+				idempotencyKey: crypto.randomUUID(),
+			})
+			return { data: result }
+		},
+		editMessage: async (params: { sessionId: string; itemId: string; text: string }) => {
+			const directory = this.sessionDirectories.get(params.sessionId) ?? this.options.directory ?? defaultCwd()
 			const promptStartedAt = Math.max(Date.now(), this.lastEventTime + 1)
-			this.promptStartedAtBySession.set(params.sessionID, promptStartedAt)
-			this.touchNativeSessionActivity(params.sessionID, promptStartedAt)
+			this.promptStartedAtBySession.set(params.sessionId, promptStartedAt)
+			this.touchNativeSessionActivity(params.sessionId, promptStartedAt)
 			try {
 				const result = await this.requestCanonical("session/message/edit", {
-					sessionId: params.sessionID,
-					itemId: params.itemID,
+					sessionId: params.sessionId,
+					itemId: params.itemId,
 					expectedRevision: 0,
 					content: [{ type: "text", text: params.text }],
 					idempotencyKey: crypto.randomUUID(),
 				})
-				if (this.sessionStatuses.get(params.sessionID)?.type !== "busy") {
+				if (this.sessionStatuses.get(params.sessionId)?.type !== "busy") {
 					const busyStatus = { type: "busy" }
-					this.sessionStatuses.set(params.sessionID, busyStatus)
+					this.sessionStatuses.set(params.sessionId, busyStatus)
 					this.emit(directory, {
 						type: "session.status",
-						properties: { sessionID: params.sessionID, status: busyStatus },
+						properties: { sessionId: params.sessionId, status: busyStatus },
 					})
 				}
 				return { data: result }
 			} catch (error) {
-				this.promptStartedAtBySession.delete(params.sessionID)
+				this.promptStartedAtBySession.delete(params.sessionId)
 				throw error
 			}
 		},
-		abort: async (params: { sessionID: string }) => {
+		abort: async (params: { sessionId: string }) => {
 			const interruptParams: SessionInterruptParams = {
-				scope: { scope: "session", sessionId: params.sessionID },
+				scope: { scope: "session", sessionId: params.sessionId },
 			}
 			await this.request("session/interrupt", interruptParams)
 		},
@@ -1274,23 +1018,23 @@ class NativeClient {
 		 * metadata updates do not require a prior resume, so this path is safe
 		 * while history is still loading and returns only after the server ACKs.
 		 */
-		updateSettings: async (params: SessionSettingsPatch & { sessionID: string }) => {
-			return { data: await this.enqueueSessionSettings(params.sessionID, params) }
+		updateSettings: async (params: SessionSettingsPatch & { sessionId: string }) => {
+			return { data: await this.enqueueSessionSettings(params.sessionId, params) }
 		},
-		retrySettings: async (params: { sessionID: string }) => {
-			return { data: await this.retrySessionSettings(params.sessionID) }
+		retrySettings: async (params: { sessionId: string }) => {
+			return { data: await this.retrySessionSettings(params.sessionId) }
 		},
-		update: async (params: { sessionID: string; title: string }) => {
+		update: async (params: { sessionId: string; title: string }) => {
 			// Canonical session/metadata/update (L2-DES-APP-008): the title
 			// patch on the persist-first path; result is the canonical Session.
 			const result = (await this.requestCanonical("session/metadata/update", {
-				sessionId: params.sessionID,
+				sessionId: params.sessionId,
 				expectedVersion: 0,
 				title: params.title,
 			})) as { session?: Record<string, unknown> }
 			const metadata = {
 				...(result.session ?? {}),
-				id: String(result.session?.id ?? params.sessionID),
+				id: String(result.session?.id ?? params.sessionId),
 				title: result.session?.title ?? params.title,
 			}
 			const session = this.rememberNativeSession(metadata)
@@ -1300,62 +1044,70 @@ class NativeClient {
 			})
 			return { data: session }
 		},
-		delete: async (params: { sessionID: string }) => {
-			await this.requestCanonical("session/delete", { sessionId: params.sessionID })
-			const { directory } = this.forgetSession(params.sessionID)
-			this.emitSessionDeleted(params.sessionID, directory)
+		delete: async (params: { sessionId: string }) => {
+			await this.requestCanonical("session/delete", { sessionId: params.sessionId })
+			const { directory } = this.forgetSession(params.sessionId)
+			this.emitSessionDeleted(params.sessionId, directory)
 		},
 		// `session.get` is a durable snapshot read. It intentionally does not
 		// resume the server actor; callers that need history use `messages`,
 		// while metadata updates can write the snapshot directly.
-		get: async (params: { sessionID: string }) => ({
-			data: await this.getSessionById(params.sessionID),
+		get: async (params: { sessionId: string }) => ({
+			data: await this.getSessionById(params.sessionId),
 		}),
-		diff: async (params: { sessionID: string }) => {
-			const result = (await this.requestCanonical("workspace/changes/read", {
-				sessionId: params.sessionID,
-				scopes: ["uncommitted"],
-				diffDetail: "full",
-				maxDiffBytes: 2_000_000,
-			})) as { views?: Array<Record<string, unknown>> }
-			return {
-				data: (result.views ?? [])
-					.map((view) => view.unifiedDiff)
-					.filter((diff): diff is string => typeof diff === "string" && diff.length > 0)
-					.map((diff) => ({ diff })),
+		diff: async (params: { sessionId: string }) => {
+			try {
+				const result = (await this.requestCanonical("workspace/changes/read", {
+					sessionId: params.sessionId,
+					scopes: ["uncommitted"],
+					diffDetail: "full",
+					maxDiffBytes: 2_000_000,
+				})) as { views?: Array<Record<string, unknown>> }
+				return {
+					data: (result.views ?? [])
+						.map((view) => view.unifiedDiff)
+						.filter((diff): diff is string => typeof diff === "string" && diff.length > 0)
+						.map((diff) => ({ diff })),
+				}
+			} catch (error) {
+				if (isSessionNotFoundError(error)) {
+					this.dropMissingSession(params.sessionId)
+					return { data: [] }
+				}
+				throw error
 			}
 		},
-		revert: async (params: { sessionID: string }) => ({
-			data: this.sessions.get(params.sessionID),
+		revert: async (params: { sessionId: string }) => ({
+			data: this.sessions.get(params.sessionId),
 		}),
-		unrevert: async (params: { sessionID: string }) => ({
-			data: this.sessions.get(params.sessionID),
+		unrevert: async (params: { sessionId: string }) => ({
+			data: this.sessions.get(params.sessionId),
 		}),
-		command: async (params: { sessionID: string; command: string; arguments?: string }) => {
+		command: async (params: { sessionId: string; command: string; arguments?: string }) => {
 			const suffix = params.arguments ? ` ${params.arguments}` : ""
 			await this.session.promptAsync({
-				sessionID: params.sessionID,
+				sessionId: params.sessionId,
 				parts: [{ type: "text", text: `/${params.command}${suffix}` }],
 			})
 		},
-		summarize: async (params: { sessionID: string }) => {
+		summarize: async (params: { sessionId: string }) => {
 			await this.ensureInitialized()
-			await this.ensureSessionSubscription(params.sessionID)
+			await this.ensureSessionSubscription(params.sessionId)
 			await this.requestCanonical("session/compact/start", {
-				sessionId: params.sessionID,
+				sessionId: params.sessionId,
 			})
 		},
-		messages: async (params: { sessionID: string; limit?: number }) => ({
-			data: await this.sessionMessages(params.sessionID, normalizedHistoryLimit(params.limit)),
+		messages: async (params: { sessionId: string; limit?: number }) => ({
+			data: await this.sessionMessages(params.sessionId, normalizedHistoryLimit(params.limit)),
 		}),
 		fork: async (params: {
-			sessionID: string
+			sessionId: string
 			atTurnId?: string
 			cut?: "through" | "before"
 		}) => {
 			await this.ensureInitialized()
 			const result = (await this.requestCanonical("session/fork", {
-				sessionId: params.sessionID,
+				sessionId: params.sessionId,
 				...(params.atTurnId ? { atTurnId: params.atTurnId } : {}),
 				...(params.cut ? { cut: params.cut } : {}),
 			})) as { session?: Record<string, unknown> }
@@ -1376,7 +1128,7 @@ class NativeClient {
 
 	turn = {
 		start: async (params: {
-			sessionID: string
+			sessionId: string
 			parts: PromptPartInput[]
 			model?: unknown
 			variant?: string
@@ -1394,12 +1146,12 @@ class NativeClient {
 				const settingsPatch: SessionSettingsPatch = {
 					mode: params.collaborationMode,
 				}
-				await this.enqueueSessionSettings(params.sessionID, settingsPatch)
+				await this.enqueueSessionSettings(params.sessionId, settingsPatch)
 			}
-			await this.ensureSessionSubscription(params.sessionID)
+			await this.ensureSessionSubscription(params.sessionId)
 			const result = (await this.requestCanonical("turn/start", {
-				sessionId: params.sessionID,
-				input: inputItemsFromPromptParts(params.parts),
+				sessionId: params.sessionId,
+				input: userInputsFromPromptParts(params.parts),
 				idempotencyKey: crypto.randomUUID(),
 			})) as { turn: unknown }
 			return { data: result }
@@ -1408,7 +1160,7 @@ class NativeClient {
 
 	task = {
 		startAgent: async (params: {
-			sessionID: string
+			sessionId: string
 			prompt: string
 			forkTurns?: string
 			maxTurns?: number
@@ -1418,7 +1170,7 @@ class NativeClient {
 			await this.ensureInitialized()
 			const result = (await this.requestCanonical("task/start", {
 				kind: "agent",
-				sessionId: params.sessionID,
+				sessionId: params.sessionId,
 				input: [{ type: "text", text: params.prompt }],
 				...(params.forkTurns ? { forkTurns: params.forkTurns } : {}),
 				...(params.maxTurns !== undefined ? { maxTurns: params.maxTurns } : {}),
@@ -1435,24 +1187,24 @@ class NativeClient {
 	}
 
 	question = {
-		reply: async (params: { requestID: string; answers: QuestionAnswer[] }) => {
-			await this.respondToQuestion(params.requestID, params.answers, "question.replied")
+		reply: async (params: { requestId: string; answers: QuestionAnswer[] }) => {
+			await this.respondToQuestion(params.requestId, params.answers, "question.replied")
 		},
-		reject: async (params: { requestID: string }) => {
-			await this.respondToQuestion(params.requestID, [], "question.rejected")
+		reject: async (params: { requestId: string }) => {
+			await this.respondToQuestion(params.requestId, [], "question.rejected")
 		},
 	}
 
 	permission = {
 		respond: async (params: {
-			sessionID: string
-			permissionID: string
+			sessionId: string
+			permissionId: string
 			response: PermissionResponse
 		}) => {
-			await this.respondToPermission(params.permissionID, params.response)
+			await this.respondToPermission(params.permissionId, params.response)
 		},
-		reply: async (params: { requestID: string; reply?: PermissionResponse }) => {
-			await this.respondToPermission(params.requestID, params.reply ?? "reject")
+		reply: async (params: { requestId: string; reply?: PermissionResponse }) => {
+			await this.respondToPermission(params.requestId, params.reply ?? "reject")
 		},
 	}
 
@@ -1481,27 +1233,37 @@ class NativeClient {
 	workspace = {
 		changes: {
 			read: async (params: WorkspaceChangesReadOptions) => {
-				// Canonical workspace/changes/read (L2-DES-APP-008): camelCase
-				// wire shape; views convert back to the legacy snake shape the
-				// renderer consumes while it stays on generated bindings.
+				// Pass Native WorkspaceChangesReadParams through; only default diffDetail.
 				const wireParams: Record<string, unknown> = {
-					sessionId: params.sessionID,
+					sessionId: params.sessionId,
 					scopes: params.scopes,
 					diffDetail: params.diffDetail ?? "summary",
 				}
 				if (params.cwd !== undefined) wireParams.cwd = params.cwd
 				if (params.baseBranch !== undefined) wireParams.baseBranch = params.baseBranch
-				if (params.turnID !== undefined) wireParams.turnId = params.turnID
+				if (params.turnId !== undefined) wireParams.turnId = params.turnId
 				if (params.maxDiffBytes !== undefined) {
 					wireParams.maxDiffBytes = Number(params.maxDiffBytes)
 				}
-				const canonical = (await this.requestCanonical(
+				if (params.ignoreWhitespace !== undefined) {
+					wireParams.ignoreWhitespace = params.ignoreWhitespace
+				}
+				if (params.paths !== undefined) {
+					wireParams.paths = params.paths
+				}
+				if (params.includeFileSides !== undefined) {
+					wireParams.includeFileSides = params.includeFileSides
+				}
+				const data = (await this.requestCanonical(
 					"workspace/changes/read",
 					wireParams,
-				)) as { views?: Array<Record<string, unknown>> }
-				const data: WorkspaceChangesReadResult = {
-					views: (canonical.views ?? []).map(legacyWorkspaceChangeViewFromCanonical),
-				}
+				).catch((error) => {
+					if (isSessionNotFoundError(error)) {
+						this.dropMissingSession(params.sessionId)
+						return { views: [] }
+					}
+					throw error
+				})) as WorkspaceChangesReadResult
 				return { data }
 			},
 		},
@@ -1513,43 +1275,51 @@ class NativeClient {
 
 	// User requirement: Desktop's composer status area needs direct goal state
 	// controls, while the existing /goal trigger remains available for entry.
-	private async canonicalGoalTransition(method: string, sessionID: string): Promise<unknown> {
+	private async canonicalGoalTransition(method: string, sessionId: string): Promise<unknown> {
 		const current = (await this.requestCanonical("session/goal/read", {
-			sessionId: sessionID,
+			sessionId,
 		})) as { goal?: { id?: string } | null }
 		const expectedGoalId = current.goal?.id
 		if (!expectedGoalId) throw new Error("session has no active goal")
 		return this.requestCanonical(method, {
-			sessionId: sessionID,
+			sessionId,
 			expectedGoalId,
 		})
 	}
 
 	goal = {
-		status: async (params: { sessionID: string }) => {
-			const result = (await this.requestCanonical("session/goal/read", {
-				sessionId: params.sessionID,
-			})) as { goal?: unknown }
-			return { data: result.goal }
+		status: async (params: { sessionId: string }) => {
+			try {
+				const result = (await this.requestCanonical("session/goal/read", {
+					sessionId: params.sessionId,
+				})) as { goal?: unknown }
+				return { data: result.goal }
+			} catch (error) {
+				if (isSessionNotFoundError(error)) {
+					this.dropMissingSession(params.sessionId)
+					return { data: null }
+				}
+				throw error
+			}
 		},
-		pause: async (params: { sessionID: string }) => {
+		pause: async (params: { sessionId: string }) => {
 			const result = (await this.canonicalGoalTransition(
 				"session/goal/pause",
-				params.sessionID,
+				params.sessionId,
 			)) as { goal?: unknown }
 			return { data: result.goal }
 		},
-		resume: async (params: { sessionID: string }) => {
+		resume: async (params: { sessionId: string }) => {
 			const result = (await this.canonicalGoalTransition(
 				"session/goal/resume",
-				params.sessionID,
+				params.sessionId,
 			)) as { goal?: unknown }
 			return { data: result.goal }
 		},
-		clear: async (params: { sessionID: string }) => {
+		clear: async (params: { sessionId: string }) => {
 			const result = await this.canonicalGoalTransition(
 				"session/goal/clear",
-				params.sessionID,
+				params.sessionId,
 			)
 			return { data: result }
 		},
@@ -1578,10 +1348,19 @@ class NativeClient {
 	}
 
 	worktree = {
-		list: async () => ({ data: [] }),
-		create: async (_params: unknown) => ({ data: null }),
-		remove: async (_params: unknown) => ({ data: null }),
-		reset: async (_params: unknown) => ({ data: null }),
+		list: async () => {
+			const result = await this.requestCanonical("workspace/worktree/list", { cwd: this.options.directory ?? defaultCwd() }) as { worktrees: Array<{ directory: string }> }
+			return { data: result.worktrees.map((worktree) => worktree.directory) }
+		},
+		create: async (params: { worktreeCreateInput: { name: string; startCommand?: string } }) => ({
+			data: await this.requestCanonical("workspace/worktree/create", { cwd: this.options.directory ?? defaultCwd(), name: params.worktreeCreateInput.name }),
+		}),
+		remove: async (params: { worktreeRemoveInput: { directory: string } }) => ({
+			data: await this.requestCanonical("workspace/worktree/remove", { cwd: this.options.directory ?? defaultCwd(), directory: params.worktreeRemoveInput.directory }),
+		}),
+		reset: async (params: { worktreeResetInput: { directory: string } }) => ({
+			data: await this.requestCanonical("workspace/worktree/reset", { cwd: this.options.directory ?? defaultCwd(), directory: params.worktreeResetInput.directory }),
+		}),
 	}
 
 	config = {
@@ -1621,11 +1400,11 @@ class NativeClient {
 
 	context = {
 		usage: {
-			read: async (params: { sessionID: string }) => {
+			read: async (params: { sessionId: string }) => {
 				const result = (await this.requestCanonical("context/usage/read", {
-					sessionId: params.sessionID,
+					sessionId: params.sessionId,
 				})) as { occupancy?: unknown }
-				this.emitContextUsage(params.sessionID, result.occupancy)
+				this.emitContextUsage(params.sessionId, result.occupancy)
 				return { data: result.occupancy }
 			},
 		},
@@ -1647,53 +1426,70 @@ class NativeClient {
 		}),
 	}
 
+	private modelPreferencesWrite: Promise<unknown> = Promise.resolve()
+
+	model = {
+		preferences: {
+			write: (params: { patch: { model?: string; reasoningEffort?: string } }) => {
+				const write = this.modelPreferencesWrite.catch(() => undefined).then(async () => {
+					const result = await this.requestCanonical("model/preferences/write", {
+						...params, ...(this.options.directory ? { cwd: this.options.directory } : {}),
+					}) as { preferences: ModelPreferencesWire }
+					this.rememberDirectoryConfigOptions(this.options.directory ?? defaultCwd(),
+						sessionConfigOptionsFromModelPreferences(result.preferences))
+					return { data: result }
+				})
+				this.modelPreferencesWrite = write
+				return write
+			},
+		},
+		list: async (): Promise<{ data: ModelListResult }> => ({
+			data: await this.requestCanonical("model/list", {}) as ModelListResult,
+		}),
+		refreshCatalog: async (params: ModelCatalogRefreshParams): Promise<{ data: ModelCatalogRefreshResult }> => {
+			const data = await this.requestCanonical("model/catalog/refresh", params) as ModelCatalogRefreshResult
+			if (data.status === "updated") this.invalidateConfigOptionCaches()
+			return { data }
+		},
+	}
+
+	credential = {
+		/** Native returns credential metadata only, never secret values. */
+		list: async (): Promise<{ data: CredentialListResult }> => ({
+			data: await this.requestCanonical("credential/list", {}) as CredentialListResult,
+		}),
+	}
+
 	provider = {
 		list: async () => {
-			// Canonical provider/list (ratified #11): camelCase wire; vendors
-			// convert back to the generated snake shape for callers.
-			const result = (await this.requestCanonical("provider/list", {})) as {
-				providers?: Array<Record<string, unknown>>
-			}
-			const data: ProviderVendorListResult = {
-				provider_vendors: (result.providers ?? []).map(legacyProviderVendorFromCanonical),
-			}
+			const data = (await this.requestCanonical("provider/list", {})) as ProviderListResult
 			return { data }
 		},
 		validate: async (params: ProviderValidateParams) => {
-			const result = (await this.requestCanonical("provider/validate", {
-				providerVendor: canonicalProviderVendorWire(params.provider_vendor),
-				modelBinding: canonicalModelBindingWire(params.model_binding),
-				...(params.api_key !== undefined && params.api_key !== null
-					? { apiKey: params.api_key }
-					: {}),
-			})) as { replyPreview?: string }
-			const data: ProviderValidateResult = { reply_preview: result.replyPreview ?? "" }
+			const data = (await this.requestCanonical("provider/validate", params)) as ProviderValidateResult
 			return { data }
 		},
-		upsert: async (params: ProviderVendorUpsertParams) => {
-			const result = (await this.requestCanonical("provider/upsert", {
-				providerVendor: canonicalProviderVendorWire(params.provider_vendor),
-				...(params.model_binding
-					? { modelBinding: canonicalModelBindingWire(params.model_binding) }
-					: {}),
-				...(params.default_model_binding !== undefined && params.default_model_binding !== null
-					? { defaultModelBinding: params.default_model_binding }
-					: {}),
-				...(params.api_key !== undefined && params.api_key !== null
-					? { apiKey: params.api_key }
-					: {}),
-			})) as {
-				providerVendor?: Record<string, unknown>
-				modelBinding?: Record<string, unknown>
-			}
-			const data: ProviderVendorUpsertResult = {
-				provider_vendor: legacyProviderVendorFromCanonical(result.providerVendor ?? {}),
-				...(result.modelBinding
-					? { model_binding: legacyModelBindingFromCanonical(result.modelBinding) }
-					: {}),
-			} as ProviderVendorUpsertResult
+		upsert: async (params: ProviderUpsertParams) => {
+			const data = (await this.requestCanonical("provider/upsert", params)) as ProviderUpsertResult
 			this.invalidateConfigOptionCaches()
 			return { data }
+		},
+		disconnect: async (params: ProviderDisconnectParams): Promise<ProviderDisconnectResult> => {
+			const result = (await this.requestCanonical("provider/disconnect", params)) as ProviderDisconnectResult
+			this.invalidateConfigOptionCaches()
+			return result
+		},
+		modelRemove: async (params: ProviderModelRemoveParams): Promise<ProviderModelRemoveResult> => {
+			const result = (await this.requestCanonical("provider/model/remove", params)) as ProviderModelRemoveResult
+			this.invalidateConfigOptionCaches()
+			return result
+		},
+		discover: async (params: ProviderDiscoverParams): Promise<ProviderDiscoverResult> => {
+			const result = (await this.requestCanonical("provider/discover", params)) as ProviderDiscoverResult
+			// Discover mutates the connection model directory; composer selectors
+			// read model/preferences which must not keep a pre-discover snapshot.
+			this.invalidateConfigOptionCaches()
+			return result
 		},
 		auth: async () => ({ data: [] }),
 		oauth: {
@@ -1701,16 +1497,6 @@ class NativeClient {
 			callback: async (_params: unknown) => ({ data: null }),
 		},
 	}
-
-	auth = {
-		set: async (_params: unknown) => ({ data: null }),
-		remove: async (_params: unknown) => ({ data: null }),
-	}
-
-	part = {
-		delete: async (_params: unknown) => ({ data: null }),
-	}
-
 	private async listProjects(): Promise<Project[]> {
 		const sessions = await this.listSessions()
 		const byDirectory = new Map<string, Project>()
@@ -1746,6 +1532,17 @@ class NativeClient {
 	}
 
 	private async listSessions(params?: { limit?: number; roots?: boolean; search?: string }): Promise<Session[]> {
+		const key = JSON.stringify(params ?? {})
+		const pending = this.sessionLists.get(key)
+		if (pending) return pending
+		const load = this.listSessionsOnce(params)
+		this.sessionLists.set(key, load)
+		try { return await load } finally {
+			if (this.sessionLists.get(key) === load) this.sessionLists.delete(key)
+		}
+	}
+
+	private async listSessionsOnce(params?: { limit?: number; roots?: boolean; search?: string }): Promise<Session[]> {
 		await this.ensureInitialized()
 		const sessions: Session[] = []
 		let cursor: string | undefined
@@ -1783,74 +1580,96 @@ class NativeClient {
 		})) as { session: Record<string, unknown> }
 		const session = this.rememberNativeSession(result.session)
 		await this.ensureSessionSubscription(session.id)
+		this.resumedSessions.add(session.id)
 		this.emit(session.directory ?? cwd, {
 			type: "session.created",
 			properties: { info: session, session },
 		})
 		return session
 		}
-	private async sessionMessages(sessionId: string, limit?: number): Promise<Array<{ info: Message; parts: Part[] }>> {
-		await this.loadSession(sessionId, limit)
-		const messages = recentMessages(this.messages.get(sessionId) ?? [], limit)
-		return messages.map((info) => ({
-			info,
-			parts: this.parts.get(partCacheKey(sessionId, info.id)) ?? [],
-		}))
+	private async sessionMessages(
+		sessionId: string,
+		limit?: number,
+	): Promise<Array<{ info: NativeItemEnvelope }>> {
+		try {
+			await this.loadSession(sessionId, limit)
+		} catch (error) {
+			if (isSessionNotFoundError(error)) return []
+			throw error
+		}
+		const items = [...(this.items.get(sessionId)?.values() ?? [])]
+		return recentNativeItems(items, limit).map((info) => ({ info }))
 	}
 	private async loadSession(sessionId: string, limit?: number): Promise<void> {
-		const loadedLimit = this.loadedSessionLimits.get(sessionId)
-		if (loadedLimitCovers(loadedLimit, limit)) return
-		const pending = this.sessionLoads.get(sessionId)
+		// A concurrent queue/read or wider history request must not claim that a
+		// narrower in-flight window covers it. Recheck coverage after joining.
+		while (!loadedLimitCovers(this.loadedSessionLimits.get(sessionId), limit)) {
+			const pending = this.sessionLoads.get(sessionId)
+			if (pending) { await pending; continue }
+			const load = this.loadSessionOnce(sessionId, limit)
+			this.sessionLoads.set(sessionId, load)
+			try { await load } catch (error) {
+				if (isSessionNotFoundError(error) && (this.sessions.has(sessionId) || this.items.has(sessionId))) {
+					this.dropMissingSession(sessionId)
+				}
+				throw error
+			} finally {
+				if (this.sessionLoads.get(sessionId) === load) this.sessionLoads.delete(sessionId)
+			}
+		}
+	}
+
+	private dropMissingSession(sessionId: string): void {
+		const { directory } = this.forgetSession(sessionId)
+		this.subscriptions.delete(sessionId)
+		this.sessionSettingsQueues.delete(sessionId)
+		this.emitSessionDeleted(sessionId, directory)
+	}
+
+	private async ensureSessionReady(sessionId: string): Promise<void> {
+		if (this.resumedSessions.has(sessionId)) return
+		const pending = this.sessionResumes.get(sessionId)
 		if (pending) return pending
-		const load = this.loadSessionOnce(sessionId, limit)
-		this.sessionLoads.set(sessionId, load)
+		const resume = this.resumeSessionOnce(sessionId)
+		this.sessionResumes.set(sessionId, resume)
+		try { await resume } finally {
+			if (this.sessionResumes.get(sessionId) === resume) this.sessionResumes.delete(sessionId)
+		}
+	}
+
+	private async resumeSessionOnce(sessionId: string): Promise<void> {
 		try {
-			await load
-		} finally {
-			if (this.sessionLoads.get(sessionId) === load) this.sessionLoads.delete(sessionId)
+			const resumed = (await this.requestCanonical("session/resume", { sessionId })) as {
+				session: Record<string, unknown>; lastContextOccupancy?: unknown; last_context_occupancy?: unknown
+			}
+			const enriched = this.rememberNativeSession(resumed.session)
+			this.emit(enriched.directory ?? this.options.directory ?? defaultCwd(), {
+				type: "session.updated", properties: { info: enriched, session: enriched },
+			})
+			this.emitContextUsage(sessionId, resumed.lastContextOccupancy ?? resumed.last_context_occupancy)
+			await this.ensureSessionSubscription(sessionId)
+			this.resumedSessions.add(sessionId)
+			this.sessionsNeedingResume.delete(sessionId)
+		} catch (error) {
+			if (isSessionNotFoundError(error)) this.dropMissingSession(sessionId)
+			throw error
 		}
 	}
 
 	private async loadSessionOnce(sessionId: string, limit?: number): Promise<void> {
-		await this.ensureInitialized()
-		const session = await this.getSessionById(sessionId)
-		const cwd = session?.directory ?? this.sessionDirectories.get(sessionId)
-		if (!cwd) throw new Error(`session ${sessionId} not found`)
-		const resumed = (await this.requestCanonical("session/resume", {
-			sessionId,
-		})) as { session: Record<string, unknown>; lastContextOccupancy?: unknown; last_context_occupancy?: unknown }
-		const enriched = this.rememberNativeSession(resumed.session)
-		// The resume response carries the authoritative persisted model /
-		// settings for the session; cold `session/list` snapshots may lack
-		// them. Surface the enrichment so renderer session stores re-seed the
-		// composer — without this, the enriched snapshot stays buried in this
-		// client's internal cache and restored sessions fall back to defaults.
-		this.emit(enriched.directory ?? cwd, {
-			type: "session.updated",
-			properties: { info: enriched, session: enriched },
-		})
-		this.emitContextUsage(
-			sessionId,
-			resumed.lastContextOccupancy ?? resumed.last_context_occupancy,
-		)
-		let cursor: string | undefined
+		await this.ensureSessionReady(sessionId)
+		let loaded = this.loadedSessionLimits.get(sessionId) ?? 0
+		let cursor: string | null = this.historyCursors.get(sessionId) ?? "tail"
 		do {
 			const page = (await this.requestCanonical("session/items/list", {
-				sessionId,
-				...(cursor ? { cursor } : {}),
-				limit: 500,
+				sessionId, cursor, limit: Math.min(200, limit === undefined ? 200 : Math.max(1, limit - loaded)),
 			})) as { data?: Array<Record<string, unknown>>; nextCursor?: string | null }
-			for (const item of page.data ?? []) {
-				this.handleNativeItemEnvelope(item, nativeItemNotificationMethod(item))
-			}
-			cursor = page.nextCursor ?? undefined
-		} while (cursor)
-		const queueResult = (await this.requestCanonical("session/queue/list", {
-			sessionId,
-		})) as { entries?: unknown }
-		this.emitQueueSnapshot(sessionId, parseQueueWireEntries(queueResult.entries), "sync")
-		await this.ensureSessionSubscription(sessionId)
-		this.loadedSessionLimits.set(sessionId, null)
+			for (const item of page.data ?? []) this.handleNativeItemEnvelope(item, nativeItemNotificationMethod(item))
+			loaded += (page.data ?? []).length
+			cursor = page.nextCursor ?? null
+			this.historyCursors.set(sessionId, cursor)
+			this.loadedSessionLimits.set(sessionId, cursor ? loaded : null)
+		} while (cursor && (limit === undefined || loaded < limit))
 	}
 
 	private async getSessionById(sessionId: string): Promise<Session | undefined> {
@@ -1878,7 +1697,16 @@ class NativeClient {
 		const usage = objectRecord(info.usage)
 		const total = objectRecord(usage?.total)
 		const created = parseTimestampMs(info.createdAt) ?? existing?.time.created ?? Date.now()
-		const updated = parseTimestampMs(info.lastActivityAt) ?? existing?.time.updated ?? created
+		const wireActivity = parseTimestampMs(info.lastActivityAt)
+		const existingActivity = Math.max(existing?.time.lastActivity ?? 0, existing?.time.updated ?? 0)
+		// Never let resume/snapshot lower a known activity timestamp — that alone
+		// can reshuffle the sidebar. Prefer the newer of wire vs in-memory.
+		const updated =
+			wireActivity != null
+				? Math.max(wireActivity, existingActivity)
+				: existingActivity > 0
+					? existingActivity
+					: created
 		const parent = objectRecord(info.parent)
 		const forkFromId =
 			typeof info.forkFromId === "string"
@@ -1929,7 +1757,7 @@ class NativeClient {
 			id,
 			title: typeof info.title === "string" ? info.title : existing?.title,
 			titleState: titleState ?? existing?.titleState ?? "Unset",
-			parentID: typeof parent?.sessionId === "string" ? parent.sessionId : existing?.parentID,
+			parentId: typeof parent?.sessionId === "string" ? parent.sessionId : existing?.parentId,
 			forkFromId,
 			atTurnId,
 			time: { created, updated, lastActivity: updated },
@@ -1966,8 +1794,12 @@ class NativeClient {
 	 * (agentsAtom / sidebar) recompute without a session/list refresh.
 	 * Native turn/item traffic does not carry session/metadataUpdated for
 	 * activity-only bumps — only title updates do — so the client owns live sync.
+	 *
+	 * Skipped during subscription replay: historical turn/item envelopes must
+	 * not reshuffle the sidebar when the user merely opens a session.
 	 */
 	private touchNativeSessionActivity(sessionId: string, at = Date.now()): void {
+		if (this.subscriptionReplayDepth > 0) return
 		const session = this.sessions.get(sessionId)
 		if (!session) return
 		const previous = Math.max(session.time.lastActivity ?? 0, session.time.updated ?? 0)
@@ -1988,22 +1820,32 @@ class NativeClient {
 		if (!this.transport) throw new Error("Devo Native transport is not connected")
 		if (this.initialized) return
 
-		let promise = initializePromises.get(this.transport)
+		const transport = this.transport
+		let promise = initializePromises.get(transport)
 		if (!promise) {
 			promise = this.request("initialize", DESKTOP_INITIALIZE_PARAMS).then(() => {})
-			initializePromises.set(this.transport, promise)
+			initializePromises.set(transport, promise)
 		}
-		await promise
+		try {
+			await promise
+		} catch (error) {
+			// A failed handshake must not block retries on a still-open transport.
+			// Another caller may have already replaced this entry with a new attempt.
+			if (initializePromises.get(transport) === promise) initializePromises.delete(transport)
+			throw error
+		}
 		this.initialized = true
 	}
 
 	private async open(): Promise<void> {
+		if (this.disposed) throw new Error("Devo Native client has been disposed")
 		if (this.transport) return
 		if (this.openPromise) return this.openPromise
 		this.openPromise = Promise.resolve()
 			.then(() => {
+				if (this.disposed) throw new Error("Devo Native client has been disposed")
 				this.transport = this.options.transport ?? createIpcTransport()
-				this.transport.subscribe((event) => this.handleTransportEvent(event))
+				this.unsubscribeTransport = this.transport.subscribe((event) => this.handleTransportEvent(event))
 			})
 			.finally(() => {
 				this.openPromise = null
@@ -2065,7 +1907,30 @@ class NativeClient {
 		return this.referenceSearchSession
 	}
 
+    private recoveryListeners = new Set<() => void>()
+
+    readonly turnRecovery = {
+        read: async (sessionId: string) => this.request("turn/recovery/read", { sessionId }),
+        resume: async (sessionId: string, recovery: { turnId: string; revision: number }, idempotencyKey: string) => {
+            const result = await this.request("turn/resume", {
+                sessionId, expectedTurnId: recovery.turnId, recoveryRevision: recovery.revision, idempotencyKey,
+            })
+            return result
+        },
+        cancel: async (sessionId: string) => this.session.abort({ sessionId }),
+        subscribe: (listener: () => void) => {
+            this.recoveryListeners.add(listener)
+            return () => { this.recoveryListeners.delete(listener) }
+        },
+    }
+
 	private handleTransportEvent(event: DevoNativeTransportEvent): void {
+		if (this.disposed) return
+        if (event.type === "closed" || (event.type === "notification" &&
+            (event.method?.startsWith("turn/") || event.method === "session/metadataUpdated"))) {
+            for (const listener of this.recoveryListeners) listener()
+        }
+
 		if (event.type === "closed") {
 			if (this.transport) {
 				initializePromises.delete(this.transport)
@@ -2076,6 +1941,11 @@ class NativeClient {
 			this.pendingPermissions.clear()
 			this.pendingQuestions.clear()
 			this.subscriptions.clear()
+			for (const sessionId of this.sessions.keys()) this.sessionsNeedingResume.add(sessionId)
+			this.loadedSessionLimits.clear()
+			this.historyCursors.clear()
+			this.resumedSessions.clear()
+			this.directorySubscriptions.clear()
 			this.turnSessions.clear()
 			this.nativeItemCallIds.clear()
 			this.referenceSearchSession = null
@@ -2124,7 +1994,7 @@ class NativeClient {
 			) ?? {}
 			const approvalId = String(value.approvalId ?? value.requestId ?? "")
 			if (!approvalId) return true
-			const availableScopes = normalizeApprovalScopes(
+			const availableScopes = knownApprovalScopes(
 				Array.isArray(value.availableScopes) ? value.availableScopes.map(String) : undefined,
 			)
 			const existing = this.pendingPermissions.get(approvalId)
@@ -2165,6 +2035,21 @@ class NativeClient {
 
 	private handleNativeNotification(method: string, params: unknown): boolean {
 		const value = objectRecord(params) ?? {}
+		if (method === "provider/authStale") {
+			const providerId = String(value.providerId ?? value.provider_id ?? "")
+			const reason =
+				typeof value.reason === "string" && value.reason.trim().length > 0
+					? value.reason
+					: undefined
+			this.emit(this.options.directory ?? defaultCwd(), {
+				type: "provider.authStale",
+				properties: {
+					providerId,
+					reason,
+				},
+			})
+			return true
+		}
 		if (method === "session/created" || method === "session/metadataUpdated") {
 			const sessionValue = objectRecord(value.session)
 			if (sessionValue) {
@@ -2179,11 +2064,22 @@ class NativeClient {
 		if (method === "session/statusChanged") {
 			const sessionId = String(value.sessionId ?? "")
 			if (!sessionId) return true
+			// Subscription replay may include historical Active status for
+			// abandoned turns; live busy is seeded only from the snapshot's
+			// registry-backed activeTurn (and live events after ack).
+			if (this.subscriptionReplayDepth > 0 && String(value.status) === "active") {
+				return true
+			}
 			const status = { type: String(value.status) === "active" ? "busy" : "idle" }
+			if (status.type === "busy" && this.subscriptionReplayDepth === 0) {
+				void this.ensureSessionSubscription(sessionId).catch(error => {
+					this.emit(this.sessionDirectories.get(sessionId) ?? defaultCwd(), sessionErrorEvent(sessionId, error))
+				})
+			}
 			this.sessionStatuses.set(sessionId, status)
 			this.emit(this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd(), {
 				type: "session.status",
-				properties: { sessionID: sessionId, status },
+				properties: { sessionId: sessionId, status },
 			})
 			return true
 		}
@@ -2224,7 +2120,7 @@ class NativeClient {
 			}
 			return true
 		}
-		if (method === "turn/started" || method === "turn/statusChanged" || method === "turn/completed") {
+		if ((method === "turn/started" || method === "turn/resumed") || method === "turn/statusChanged" || method === "turn/completed") {
 			const turn = objectRecord(value.turn)
 			const turnId = String(turn?.id ?? value.turnId ?? "")
 			const sessionId = String(turn?.sessionId ?? this.turnSessions.get(turnId) ?? "")
@@ -2233,33 +2129,49 @@ class NativeClient {
 			const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
 			const turnStatus = String(turn?.status ?? value.status ?? "")
 			const terminal = method === "turn/completed" || ["completed", "interrupted", "failed"].includes(turnStatus)
-			if (method === "turn/started" && turnId) {
+			// Historical turn/started without a matching terminal must not
+			// resurrect busy after an idle/registry-empty snapshot.
+			if (this.subscriptionReplayDepth > 0 && !terminal) {
+				return true
+			}
+			if ((method === "turn/started" || method === "turn/resumed") && turnId) {
 				this.activeTurnIds.set(sessionId, turnId)
 				this.emit(directory, {
 					type: "session.activeTurn",
-					properties: { sessionID: sessionId, turnID: turnId },
+					properties: { sessionId: sessionId, turnId: turnId },
 				})
 			}
 			const status = { type: terminal ? "idle" : "busy" }
 			this.sessionStatuses.set(sessionId, status)
-			this.emit(directory, { type: "session.status", properties: { sessionID: sessionId, status } })
+			this.emit(directory, { type: "session.status", properties: { sessionId: sessionId, status } })
 			const activityAt =
 				parseTimestampMs(terminal ? turn?.completedAt : turn?.startedAt) ??
 				parseTimestampMs(turn?.updatedAt) ??
 				Date.now()
 			// Start + terminal only: statusChanged mid-turn would spam session.updated.
-			if (method === "turn/started" || terminal) {
+			if ((method === "turn/started" || method === "turn/resumed") || terminal) {
 				this.touchNativeSessionActivity(sessionId, activityAt)
 			}
 			if (terminal) {
 				this.activeTurnIds.delete(sessionId)
 				this.emit(directory, {
 					type: "session.activeTurn",
-					properties: { sessionID: sessionId, turnID: null },
+					properties: { sessionId: sessionId, turnId: null },
 				})
 				const startedAt = this.promptStartedAtBySession.get(sessionId) ?? 0
 				this.promptStartedAtBySession.delete(sessionId)
-				this.completeOpenAssistantMessages(sessionId, directory, startedAt)
+				// Native `TurnFailed` projects as `turn/completed` with `turn.error`
+				// (often followed by a completed notification without error). Surface
+				// the payload so Desktop can render session/assistant failure UI.
+				const turnError = objectRecord(turn?.error)
+				const assistantError = assistantErrorFromTurnFailure(turnStatus, turnError)
+				if (assistantError) {
+					this.emit(directory, {
+						type: "session.error",
+						properties: { sessionId: sessionId, turnId, error: assistantError },
+					})
+				}
+				this.completeOpenAssistantMessages(sessionId, directory, startedAt, assistantError)
 				this.pendingQuestions.forEach((pending, requestId) => {
 					if (pending.sessionId === sessionId) this.pendingQuestions.delete(requestId)
 				})
@@ -2287,16 +2199,36 @@ class NativeClient {
 			}
 			return true
 		}
+		if (
+			method === "context/compactionStarted" ||
+			method === "context/compactionCompleted" ||
+			method === "context/compactionFailed"
+		) {
+			const sessionId = String(value.sessionId ?? "")
+			if (!sessionId) return true
+			const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
+			const status =
+				method === "context/compactionFailed"
+					? "failed"
+					: method === "context/compactionCompleted"
+						? "completed"
+						: "started"
+			this.emit(directory, {
+				type: `session.compaction.${status}`,
+				properties: { sessionId: sessionId },
+			})
+			// Prefer item/started|completed for durable transcript markers.
+			// context/compactionStarted has no itemId — only update session atom.
+			return true
+		}
 		if (method === "item/assistantMessage/delta" || method === "item/reasoning/delta") {
 			const sessionId = String(value.sessionId ?? "")
 			const itemId = String(value.itemId ?? "")
 			const delta = String(value.delta ?? "")
 			if (sessionId && itemId && delta) {
 				const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
-				this.appendText(sessionId, directory, "assistant", method.includes("reasoning") ? "reasoning" : "text", {
-					messageId: itemId,
-					content: { text: delta },
-				})
+				const itemType = method.includes("reasoning") ? "reasoning" : "assistantMessage"
+				this.applyNativeTextDelta(sessionId, directory, itemId, itemType, delta)
 			}
 			return true
 		}
@@ -2305,13 +2237,8 @@ class NativeClient {
 			const itemId = String(value.itemId ?? "")
 			const delta = String(value.delta ?? "")
 			if (sessionId && itemId && delta) {
-				this.appendTool(sessionId, this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd(), {
-					toolCallId: this.nativeItemCallIds.get(itemId) ?? itemId,
-					title: "Command",
-					kind: "execute",
-					status: "in_progress",
-					rawOutput: delta,
-				})
+				const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
+				this.applyNativeCommandOutputDelta(sessionId, directory, itemId, delta)
 			}
 			return true
 		}
@@ -2330,7 +2257,7 @@ class NativeClient {
 			if (pending) {
 				this.pendingQuestions.delete(requestId)
 				const directory = this.sessionDirectories.get(pending.sessionId) ?? this.options.directory ?? defaultCwd()
-				this.emit(directory, { type: "question.replied", properties: { sessionID: pending.sessionId, requestID: requestId } })
+				this.emit(directory, { type: "question.replied", properties: { sessionId: pending.sessionId, requestId: requestId } })
 			}
 			return true
 		}
@@ -2341,7 +2268,7 @@ class NativeClient {
 				this.pendingPermissions.delete(approvalId)
 				this.emit(this.sessionDirectories.get(pending.sessionId ?? "") ?? this.options.directory ?? defaultCwd(), {
 					type: "permission.replied",
-					properties: { sessionID: pending.sessionId ?? String(value.sessionId ?? ""), requestID: approvalId },
+					properties: { sessionId: pending.sessionId ?? String(value.sessionId ?? ""), requestId: approvalId },
 				})
 			}
 			return true
@@ -2354,14 +2281,17 @@ class NativeClient {
 		if (method === "turn/usage/updated" || method === "session/usage/updated") {
 			const sessionId = String(value.sessionId ?? "")
 			const usage = objectRecord(value.usage) ?? {}
-			const total = objectRecord(usage.total) ?? usage
+			// Native usage uses the same camelCase query shape as the TUI.
+			const query = objectRecord(usage.query) ?? {}
+			const used = Number(query.totalTokens ?? 0)
+			const size = Number(value.contextWindow ?? 0)
 			if (sessionId) {
 				this.emit(this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd(), {
 					type: "session.usage.updated",
 					properties: {
-						sessionID: sessionId,
-						used: Number(total.totalTokens ?? value.lastQueryInputTokens ?? 0),
-						size: Number(value.contextWindow ?? 0),
+						sessionId: sessionId,
+						used,
+						size,
 						cost: 0,
 					},
 				})
@@ -2375,8 +2305,8 @@ class NativeClient {
 				this.emit(this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd(), {
 					type: "turn.provider_retry_status",
 					properties: {
-						sessionID: sessionId,
-						turnID: String(value.turnId ?? ""),
+						sessionId: sessionId,
+						turnId: String(value.turnId ?? ""),
 						attempt: Number(value.attempt ?? 0),
 						backoffMs: Number(value.nextDelayMs ?? 0),
 						provider: String(value.provider ?? ""),
@@ -2390,7 +2320,7 @@ class NativeClient {
 		}
 		if (method === "workspace/changes/updated") {
 			const payload = objectRecord(value.WorkspaceChangesUpdated) ?? value
-			this.handleWorkspaceChangesUpdated(payload as WorkspaceChangesUpdatedPayload)
+			this.handleWorkspaceChangesUpdated(payload as WorkspaceChangesUpdatedNotification)
 			return true
 		}
 		if (method === "queue/updated") {
@@ -2403,67 +2333,63 @@ class NativeClient {
 		if (method === "turn/superseded") {
 			const sessionId = String(value.sessionId ?? "")
 			const supersededTurnId = String(value.supersededTurnId ?? "")
-			if (sessionId && supersededTurnId) this.removeMessagesForTurn(sessionId, supersededTurnId)
+			if (sessionId && supersededTurnId) this.removeItemsForTurn(sessionId, supersededTurnId)
 			return true
 		}
 		return false
 	}
 
+	/**
+	 * Identity upsert of Native ItemEnvelope — no Message/Part projection.
+	 * Side channels (approval, userInput, compaction status, plan todos) stay as events.
+	 */
 	private handleNativeItemEnvelope(envelope: Record<string, unknown>, method: string): void {
-		const id = String(envelope.id ?? "")
-		const sessionId = String(envelope.sessionId ?? "")
-		const item = objectRecord(envelope.item)
-		if (!id || !sessionId || !item) return
+		const parsed = envelopeFromWire(envelope)
+		if (!parsed) return
+		const item = parsed.item
+		const itemType = nativeItemType(parsed)
+		const directory = this.sessionDirectories.get(parsed.sessionId) ?? this.options.directory ?? defaultCwd()
 		const completed =
 			method === "item/completed" ||
-			envelope.state === "completed" ||
-			envelope.state === "failed" ||
-			envelope.state === "interrupted"
-		const itemType = String(item.type ?? "")
-		const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
-		if (itemType === "contextCompaction" || itemType === "context_compaction") {
-			const envelopeState = String(envelope.state ?? "")
+			parsed.state === "completed" ||
+			parsed.state === "failed" ||
+			parsed.state === "interrupted"
+
+		if (itemType === "contextCompaction") {
+			const envelopeState = parsed.state
 			const failed = envelopeState === "failed" || item.status === "failed"
 			const status = failed ? "failed" : completed || envelopeState === "completed" ? "completed" : "started"
 			this.emit(directory, {
 				type: `session.compaction.${status}`,
-				properties: { sessionID: sessionId },
+				properties: { sessionId: parsed.sessionId },
 			})
-			this.upsertCompaction(sessionId, directory, {
-				itemId: id,
-				status,
-				turnId: String(envelope.turnId ?? ""),
-			})
-			if (completed) this.renderedNativeItems.add(renderedNativeItemKey(sessionId, id))
+			// Transcript marker is the Native envelope itself (no synthetic text Message).
+			this.emitNativeItem(directory, this.storeNativeItem(parsed))
 			return
 		}
 		if (itemType === "plan") {
-			this.upsertPlan(sessionId, directory, id, item, String(envelope.turnId ?? ""))
-			if (completed) this.renderedNativeItems.add(renderedNativeItemKey(sessionId, id))
+			const entries = Array.isArray(item.entries) ? item.entries : []
+			const mapped = expandPlanEntries(entries)
+			if (mapped.length > 0) {
+				this.emit(directory, {
+					type: "todo.updated",
+					properties: { sessionId: parsed.sessionId, todos: mapped },
+				})
+			}
+			this.emitNativeItem(directory, this.storeNativeItem(parsed))
 			return
 		}
-		const renderedKey = renderedNativeItemKey(sessionId, id)
-		if (completed && this.renderedNativeItems.has(renderedKey)) {
-			// History dual-writes ToolResult then FileChange under the same item id.
-			// Allow a richer FileChange (or file-shaped ToolResult) to upgrade the
-			// nameless generic tool that won the first pass.
-			const canUpgrade =
-				itemType === "fileChange" ||
-				(itemType === "toolResult" && fileChangeInputFromToolOutput(item.output) != null)
-			if (!canUpgrade) return
-		}
-
 		if (itemType === "approval") {
 			const approvalId = String(item.approvalId ?? "")
 			if (!approvalId) return
-			const availableScopes = normalizeApprovalScopes(
+			const availableScopes = knownApprovalScopes(
 				Array.isArray(item.availableScopes) ? item.availableScopes.map(String) : undefined,
 			)
 			if (item.decision) {
 				this.pendingPermissions.delete(approvalId)
 				this.emit(directory, {
 					type: "permission.replied",
-					properties: { sessionID: sessionId, requestID: approvalId },
+					properties: { sessionId: parsed.sessionId, requestId: approvalId },
 				})
 				return
 			}
@@ -2471,12 +2397,12 @@ class NativeClient {
 			this.pendingPermissions.set(approvalId, {
 				id: existing?.id,
 				method: existing?.method ?? approvalMethodFromResource(item.resource),
-				sessionId,
+				sessionId: parsed.sessionId,
 				options: existing?.options ?? [],
 				availableScopes,
 				native: true,
 			})
-			this.emitPermissionAsked(sessionId, directory, approvalId, item, availableScopes)
+			this.emitPermissionAsked(parsed.sessionId, directory, approvalId, item, availableScopes)
 			return
 		}
 		if (itemType === "userInputRequest") {
@@ -2488,7 +2414,7 @@ class NativeClient {
 				if (pending) {
 					this.emit(directory, {
 						type: "question.replied",
-						properties: { sessionID: pending.sessionId || sessionId, requestID: requestId },
+						properties: { sessionId: pending.sessionId || parsed.sessionId, requestId },
 					})
 				}
 			} else {
@@ -2496,164 +2422,130 @@ class NativeClient {
 				this.pendingQuestions.set(requestId, {
 					id: pending?.id,
 					method: pending?.method ?? "userInput/request",
-					sessionId,
+					sessionId: parsed.sessionId,
 					questions,
 				})
 				this.emit(directory, {
 					type: "question.asked",
-					properties: { id: requestId, requestID: requestId, sessionID: sessionId, questions },
+					properties: { id: requestId, sessionId: parsed.sessionId, questions },
 				})
 			}
 			return
 		}
-		if (itemType === "assistantMessage" || itemType === "reasoning") {
-			const partType = itemType === "reasoning" ? "reasoning" : "text"
-			const existing = this.parts.get(partCacheKey(sessionId, id))?.some((part) => part.type === partType)
-			const text = String(item.text ?? "")
-			if (!existing) {
-				if (text || partType === "reasoning") {
-					this.appendText(sessionId, directory, "assistant", partType, {
-						messageId: id,
-						content: { text },
-						allowEmpty: partType === "reasoning",
-						...nativeItemTimingFields(envelope, { includeCompletedAt: completed }),
-					})
-				}
-			} else if (completed) {
-				this.finalizeNativeAssistantItem(sessionId, directory, id, envelope, partType)
-			}
-		} else if (itemType === "userMessage") {
-			const text = (Array.isArray(item.content) ? item.content : []).map((part) => objectRecord(part)).filter(Boolean).filter((part) => part?.type === "text").map((part) => String(part?.text ?? "")).join("\n")
-			const existing = this.parts.get(partCacheKey(sessionId, id))?.some((part) => part.type === "text")
-			if (!existing) {
-				this.appendText(sessionId, directory, "user", "text", {
-					messageId: id,
-					content: { text },
-					...nativeItemTimingFields(envelope),
-				})
-			}
-		} else if (
-			itemType === "toolCall" ||
-			itemType === "commandExecution" ||
-			itemType === "toolResult" ||
-			itemType === "fileChange" ||
-			itemType === "hostedToolCall"
-		) {
-			if (item.callId) this.nativeItemCallIds.set(id, String(item.callId))
-			const fromFileChange = itemType === "fileChange" ? fileChangeInput(item) : undefined
-			const fromToolOutput =
-				itemType === "toolResult" || (!item.input && !fromFileChange)
-					? fileChangeInputFromToolOutput(item.output)
-					: undefined
-			const projectedInput = item.input
-				? objectRecord(item.input)
-				: (fromFileChange ?? fromToolOutput)
-			const inferredFileChangeKind =
-				(!item.toolName
-					? itemType === "fileChange"
-						? fileChangeToolKind(item)
-						: fileChangeToolKindFromInput(projectedInput)
-					: undefined) ?? fileChangeToolKindFromInput(projectedInput)
-			const toolKind =
-				item.toolName ??
-				(itemType === "commandExecution" ? "execute" : undefined) ??
-				inferredFileChangeKind
-			this.appendTool(sessionId, directory, {
-				toolCallId: item.callId,
-				title:
-					item.toolName ??
-					item.command ??
-					(inferredFileChangeKind === "write"
-						? "Write"
-						: inferredFileChangeKind === "edit"
-							? "Edit"
-							: itemType === "fileChange"
-								? "Write"
-								: "Tool"),
-				...(toolKind ? { kind: toolKind } : {}),
-				status: completed ? (item.isError || envelope.state === "failed" ? "failed" : "completed") : "in_progress",
-				rawInput: projectedInput,
-				rawOutput: toolResultDisplayOutput(item),
-				...nativeItemTimingFields(envelope, { includeCompletedAt: completed }),
-			})
-		}
-		if (completed) this.renderedNativeItems.add(renderedNativeItemKey(sessionId, id))
+
+		if (item.callId) this.nativeItemCallIds.set(parsed.id, String(item.callId))
+		this.emitNativeItem(directory, this.storeNativeItem(parsed))
 	}
 
-	private finalizeNativeAssistantItem(
+	private storeNativeItem(envelope: NativeItemEnvelope): NativeItemEnvelope {
+		let byId = this.items.get(envelope.sessionId)
+		if (!byId) {
+			byId = new Map()
+			this.items.set(envelope.sessionId, byId)
+		}
+		const merged = mergeNativeEnvelope(byId.get(envelope.id), envelope)
+		byId.set(envelope.id, merged)
+		return merged
+	}
+
+	private emitNativeItem(directory: string, envelope: NativeItemEnvelope): void {
+		this.emit(directory, {
+			type: "item.updated",
+			properties: { info: envelope },
+		})
+	}
+
+	private applyNativeTextDelta(
 		sessionId: string,
 		directory: string,
-		messageId: string,
-		envelope: Record<string, unknown>,
-		partType: "reasoning" | "text",
+		itemId: string,
+		itemType: "assistantMessage" | "reasoning",
+		delta: string,
 	): void {
-		const item = objectRecord(envelope.item) ?? {}
-		const createdAt = parseTimestampMs(envelope.createdAt)
-		const completedAt = parseTimestampMs(envelope.updatedAt)
-		const messages = this.messages.get(sessionId)
-		const messageIndex = messages?.findIndex((message) => message.id === messageId) ?? -1
-		const message = messageIndex >= 0 ? messages?.[messageIndex] : undefined
-		if (message && messages && message.role === "assistant" && completedAt !== undefined) {
-			const nextCreated =
-				typeof createdAt === "number" &&
-				(typeof message.time?.created !== "number" || createdAt < message.time.created)
-					? createdAt
-					: message.time.created
-			const updated = {
-				...message,
-				time: {
-					...message.time,
-					created: nextCreated,
-					completed: message.time?.completed ?? completedAt,
-				},
-			} as Message
-			messages[messageIndex] = updated
-			this.emit(directory, {
-				type: "message.updated",
-				properties: { info: updated, message: updated },
-			})
-		}
-
-		const partId = `${messageId}-${partType === "reasoning" ? "reasoning" : "text"}`
-		const parts = this.parts.get(partCacheKey(sessionId, messageId))
-		const partIndex = parts?.findIndex((part) => part.id === partId) ?? -1
-		const existingPart = partIndex >= 0 ? parts?.[partIndex] : undefined
-		if (!parts || !existingPart) return
-		const completedText = typeof item.text === "string" ? item.text : ""
-		const existingText =
-			typeof (existingPart as { text?: unknown }).text === "string"
-				? (existingPart as { text: string }).text
-				: ""
-		const nextText =
-			completedText && (!existingText || completedText.startsWith(existingText) || existingText.startsWith(completedText))
-				? completedText.length >= existingText.length
-					? completedText
-					: existingText
-				: existingText || completedText
-		const start =
-			typeof createdAt === "number"
-				? createdAt
-				: typeof existingPart.time?.start === "number"
-					? existingPart.time.start
-					: (completedAt ?? this.nextEventTime())
-		const updatedPart = {
-			...existingPart,
-			text: nextText,
-			time: partTime(existingPart, start, {
-				start,
-				...(completedAt !== undefined ? { end: completedAt } : {}),
-			}),
-		} as Part
-		parts[partIndex] = updatedPart
-		this.emit(directory, { type: "message.part.updated", properties: { part: updatedPart } })
+		const existing = this.items.get(sessionId)?.get(itemId)
+		const prevText =
+			typeof existing?.item?.text === "string" ? existing.item.text : ""
+		const next: NativeItemEnvelope = existing
+			? {
+					...existing,
+					updatedAt: existing.updatedAt || new Date().toISOString(),
+					item: { ...existing.item, type: itemType, text: prevText + delta },
+				}
+			: {
+					id: itemId,
+					sessionId,
+					turnId: "",
+					seq: 0,
+					revision: 0,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+					state: "running",
+					item: { type: itemType, text: delta },
+				}
+		this.emitNativeItem(directory, this.storeNativeItem(next))
 	}
 
-	private applySubscriptionSessionSnapshot(snapshot: Record<string, unknown>): void {
+	private applyNativeCommandOutputDelta(
+		sessionId: string,
+		directory: string,
+		itemId: string,
+		delta: string,
+	): void {
+		const existing = this.items.get(sessionId)?.get(itemId)
+		const prevOutput =
+			typeof existing?.item?.output === "string"
+				? existing.item.output
+				: typeof existing?.item?.displayContent === "string"
+					? existing.item.displayContent
+					: ""
+		const callId = this.nativeItemCallIds.get(itemId) ?? (existing?.item?.callId ? String(existing.item.callId) : itemId)
+		const next: NativeItemEnvelope = existing
+			? {
+					...existing,
+					item: {
+						...existing.item,
+						type: existing.item.type ?? "commandExecution",
+						callId,
+						output: prevOutput + delta,
+					},
+				}
+			: {
+					id: itemId,
+					sessionId,
+					turnId: "",
+					seq: 0,
+					revision: 0,
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+					state: "running",
+					item: { type: "commandExecution", callId, output: delta, command: "", isError: false },
+				}
+		this.emitNativeItem(directory, this.storeNativeItem(next))
+	}
+
+	private removeItemsForTurn(sessionId: string, turnId: string): void {
+		this.loadedSessionLimits.delete(sessionId)
+		this.historyCursors.delete(sessionId)
+		const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
+		const byId = this.items.get(sessionId)
+		if (!byId) return
+		for (const [itemId, envelope] of [...byId.entries()]) {
+			if (envelope.turnId !== turnId) continue
+			byId.delete(itemId)
+			this.nativeItemCallIds.delete(itemId)
+			this.emit(directory, {
+				type: "item.removed",
+				properties: { sessionId, itemId },
+			})
+		}
+	}
+
+	private applySubscriptionSessionSnapshot(snapshot: Record<string, unknown>): boolean {
 		const data = objectRecord(snapshot.data)
 		const session = objectRecord(data?.session)
 		if (session) this.rememberNativeSession(session)
 		const sessionId = String(session?.id ?? snapshot.sessionId ?? "")
-		if (!sessionId) return
+		if (!sessionId) return false
 		const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
 		if (data?.queue !== undefined) {
 			this.emitQueueSnapshot(sessionId, parseQueueWireEntries(data.queue), "sync")
@@ -2665,44 +2557,106 @@ class NativeClient {
 			this.sessionStatuses.set(sessionId, { type: "busy" })
 			this.emit(directory, {
 				type: "session.status",
-				properties: { sessionID: sessionId, status: { type: "busy" } },
+				properties: { sessionId: sessionId, status: { type: "busy" } },
 			})
 			this.emit(directory, {
 				type: "session.activeTurn",
-				properties: { sessionID: sessionId, turnID: turnId },
+				properties: { sessionId: sessionId, turnId: turnId },
 			})
+			return true
 		}
+		// Registry-empty snapshot: durable InProgress is not live work.
+		this.activeTurnIds.delete(sessionId)
+		this.sessionStatuses.set(sessionId, { type: "idle" })
+		this.emit(directory, {
+			type: "session.status",
+			properties: { sessionId: sessionId, status: { type: "idle" } },
+		})
+		this.emit(directory, {
+			type: "session.activeTurn",
+			properties: { sessionId: sessionId, turnId: null },
+		})
+		return false
 	}
 
 	private async ensureSessionSubscription(sessionId: string): Promise<void> {
 		if (this.subscriptions.has(sessionId)) return
-		const after = this.subscriptionCursors.get(sessionId) ?? []
-		const result = (await this.requestCanonical("subscription/create", {
-			selectors: [{ kind: "session", sessionId }],
-			includeSnapshot: true,
-			after,
-		})) as {
+		const pending = this.subscriptionLoads.get(sessionId)
+		if (pending) return pending
+		const load = this.subscribeSession(sessionId)
+		this.subscriptionLoads.set(sessionId, load)
+		try { await load } finally {
+			if (this.subscriptionLoads.get(sessionId) === load) this.subscriptionLoads.delete(sessionId)
+		}
+	}
+
+	private async subscribeSession(sessionId: string): Promise<void> {
+		if (this.subscriptions.has(sessionId)) return
+		let result: {
 			subscriptionId: string
 			snapshots?: Array<Record<string, unknown>>
 			replay?: Array<Record<string, unknown>>
 			cursors?: Array<{ streamId: string; seq: number }>
 			pendingControlRequests?: Array<Record<string, unknown>>
+			recoverySnapshots?: Array<{ item: Record<string, unknown> }>
+		}
+		try {
+			result = (await this.requestCanonical("subscription/create", {
+				selectors: [{ kind: "session", sessionId }],
+				includeSnapshot: true,
+				replay: "snapshotOnly",
+				after: [],
+			})) as typeof result
+		} catch (error) {
+			if (isSessionNotFoundError(error)) {
+				this.dropMissingSession(sessionId)
+				return
+			}
+			throw error
 		}
 		const cursors = result.cursors ?? []
 		this.subscriptions.set(sessionId, { subscriptionId: result.subscriptionId, cursors })
 		this.subscriptionCursors.set(sessionId, cursors)
+		let snapshotHasActiveTurn = false
+		let sawRegistryEmptySnapshot = false
 		for (const snapshot of result.snapshots ?? []) {
-			this.applySubscriptionSessionSnapshot(snapshot)
-		}
-		for (const envelope of result.replay ?? []) {
-			const notification = objectRecord(envelope.notification)
-			if (notification && typeof notification.method === "string") {
-				this.handleNativeNotification(notification.method, notification.params)
+			const hasActiveTurn = this.applySubscriptionSessionSnapshot(snapshot)
+			if (hasActiveTurn) {
+				snapshotHasActiveTurn = true
+			} else if (objectRecord(objectRecord(snapshot.data)?.session)?.id || snapshot.sessionId) {
+				sawRegistryEmptySnapshot = true
 			}
 		}
-		for (const pending of result.pendingControlRequests ?? []) {
-			const item = objectRecord(pending.item)
-			if (item) this.handleNativeItemEnvelope(item, "item/started")
+		this.subscriptionReplayDepth += 1
+		try {
+			for (const envelope of result.replay ?? []) {
+				const notification = objectRecord(envelope.notification)
+				if (notification && typeof notification.method === "string") {
+					this.handleNativeNotification(notification.method, notification.params)
+				}
+			}
+			for (const recovery of result.recoverySnapshots ?? []) {
+				this.handleNativeItemEnvelope(recovery.item, nativeItemNotificationMethod(recovery.item))
+			}
+			for (const pending of result.pendingControlRequests ?? []) {
+				const item = objectRecord(pending.item)
+				if (item) this.handleNativeItemEnvelope(item, "item/started")
+			}
+		} finally {
+			this.subscriptionReplayDepth -= 1
+		}
+		if (sawRegistryEmptySnapshot && !snapshotHasActiveTurn) {
+			const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
+			this.activeTurnIds.delete(sessionId)
+			this.sessionStatuses.set(sessionId, { type: "idle" })
+			this.emit(directory, {
+				type: "session.status",
+				properties: { sessionId: sessionId, status: { type: "idle" } },
+			})
+			this.emit(directory, {
+				type: "session.activeTurn",
+				properties: { sessionId: sessionId, turnId: null },
+			})
 		}
 		if (cursors.length > 0) {
 			await this.requestCanonical("subscription/ack", { subscriptionId: result.subscriptionId, cursors })
@@ -2710,8 +2664,43 @@ class NativeClient {
 	}
 
 	private async ensureKnownSessionSubscriptions(): Promise<void> {
-		const sessions = await this.listSessions()
-		for (const session of sessions) await this.ensureSessionSubscription(session.id)
+		const sessions = this.options.directory ? [] : await this.listSessions()
+		const directories = this.options.directory ? [this.options.directory] : [...new Set(sessions.map(s => s.directory).filter(Boolean))]
+		for (const cwd of directories) {
+			let load = this.directorySubscriptions.get(cwd)
+			if (!load) {
+				load = this.subscribeDirectory(cwd)
+				this.directorySubscriptions.set(cwd, load)
+			}
+			try { await load } catch (error) {
+				if (this.directorySubscriptions.get(cwd) === load) this.directorySubscriptions.delete(cwd)
+				throw error
+			}
+		}
+		for (const session of this.sessions.values()) {
+			if (this.options.directory && session.directory !== this.options.directory) continue
+			if (this.sessionStatuses.get(session.id)?.type === "busy") await this.ensureSessionSubscription(session.id)
+		}
+	}
+
+	private async subscribeDirectory(cwd: string): Promise<void> {
+		const result = await this.requestCanonical("subscription/create", {
+			selectors: [{ kind: "sessionsByCwd", cwd }], includeSnapshot: true, replay: "snapshotOnly", after: [],
+		}) as { subscriptionId: string; snapshots?: Array<Record<string, unknown>>; cursors?: Array<{ streamId: string; seq: number }> }
+		for (const snapshot of result.snapshots ?? []) {
+			const data = objectRecord(snapshot.data)
+			for (const session of (data?.sessions ?? []) as Array<Record<string, unknown>>) {
+				// Folder rosters project the lightweight index. Preserve richer
+				// canonical model/settings already obtained from resume or reads.
+				const existing = this.sessions.get(String(session.id ?? ""))
+				this.rememberNativeSession({
+					...session,
+					model: existing?.model ?? session.model,
+					settings: existing?.settings ?? session.settings,
+				})
+			}
+		}
+		if (result.cursors?.length) await this.requestCanonical("subscription/ack", { subscriptionId: result.subscriptionId, cursors: result.cursors })
 	}
 
 	private emitPermissionAsked(
@@ -2728,8 +2717,7 @@ class NativeClient {
 			type: "permission.asked",
 			properties: {
 				id: approvalId,
-				requestID: approvalId,
-				sessionID: sessionId,
+				sessionId: sessionId,
 				permission: String(item.actionSummary ?? "Agent requested permission"),
 				metadata: {
 					tool: item.resource,
@@ -2760,7 +2748,7 @@ class NativeClient {
 			throw new Error("Permission request is not answerable yet; wait for the connection to restore")
 		}
 		this.pendingPermissions.delete(permissionId)
-		const scopes = normalizeApprovalScopes(pending.availableScopes)
+		const scopes = knownApprovalScopes(pending.availableScopes)
 		const requestedScope = response === "always"
 			? ["commandPrefixPersist", "commandPrefix", "pathPrefix", "host", "tool", "session", "turn", "once"]
 				.find((candidate) => scopes.includes(candidate as PermissionResponse)) ?? "once"
@@ -2785,8 +2773,8 @@ class NativeClient {
 			{
 				type: "permission.replied",
 				properties: {
-					sessionID: pending.sessionId ?? "",
-					requestID: permissionId,
+					sessionId: pending.sessionId ?? "",
+					requestId: permissionId,
 				},
 			},
 		)
@@ -2827,8 +2815,8 @@ class NativeClient {
 		this.emit(this.sessionDirectories.get(pending.sessionId) ?? this.options.directory ?? defaultCwd(), {
 			type: eventType,
 			properties: {
-				sessionID: pending.sessionId,
-				requestID: requestId,
+				sessionId: pending.sessionId,
+				requestId: requestId,
 			},
 		})
 	}
@@ -2844,48 +2832,58 @@ class NativeClient {
 			this.sessionStatuses.has(sessionId) ||
 			this.sessionDirectories.has(sessionId) ||
 			this.loadedSessionLimits.has(sessionId) ||
-			this.messages.has(sessionId)
+			this.items.has(sessionId)
 		this.sessions.delete(sessionId)
 		this.sessionStatuses.delete(sessionId)
 		this.promptStartedAtBySession.delete(sessionId)
 		this.sessionDirectories.delete(sessionId)
 		this.loadedSessionLimits.delete(sessionId)
-		this.messages.delete(sessionId)
-		this.activeTurnIds.delete(sessionId)
-		this.queueEntriesBySession.delete(sessionId)
-		for (const [messageId, parts] of this.parts) {
-			if (parts.some((part) => part.sessionID === sessionId)) {
-				this.parts.delete(messageId)
+		this.historyCursors.delete(sessionId)
+		this.resumedSessions.delete(sessionId)
+		const sessionItems = this.items.get(sessionId)
+		if (sessionItems) {
+			for (const itemId of sessionItems.keys()) {
+				this.nativeItemCallIds.delete(itemId)
 			}
 		}
+		this.items.delete(sessionId)
+		this.activeTurnIds.delete(sessionId)
+		this.queueEntriesBySession.delete(sessionId)
 		return { directory, known }
 	}
 
-	private removeMessagesForTurn(sessionId: string, turnId: string): void {
-		const directory = this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd()
-		const messages = this.messages.get(sessionId)
-		if (!messages) return
-		const remaining: Message[] = []
-		for (const message of messages) {
-			const key = partCacheKey(sessionId, message.id)
-			const messageTurnId = this.messageTurnIds.get(key) ?? message.turnID
-			if (messageTurnId !== turnId) {
-				remaining.push(message)
+	/** Mark in-flight Native assistant/reasoning/tool items completed when a turn ends. */
+	private completeOpenAssistantMessages(
+		sessionId: string,
+		directory: string,
+		_promptStartedAt: number,
+		error?: { name: string; data: Record<string, unknown> },
+	): void {
+		const byId = this.items.get(sessionId)
+		if (!byId) return
+		for (const [itemId, envelope] of [...byId.entries()]) {
+			if (envelope.state === "completed" || envelope.state === "failed" || envelope.state === "interrupted") {
 				continue
 			}
-			this.parts.delete(key)
-			this.messageTurnIds.delete(key)
-			this.renderedNativeItems.delete(renderedNativeItemKey(sessionId, message.id))
-			if (this.lastUserMessageBySession.get(sessionId) === message.id) {
-				this.lastUserMessageBySession.delete(sessionId)
+			const itemType = String(envelope.item?.type ?? "")
+			if (
+				itemType !== "assistantMessage" &&
+				itemType !== "reasoning" &&
+				itemType !== "toolCall" &&
+				itemType !== "commandExecution" &&
+				itemType !== "hostedToolCall"
+			) {
+				continue
 			}
-			this.emit(directory, {
-				type: "message.removed",
-				properties: { sessionID: sessionId, messageID: message.id },
-			})
+			const updated: NativeItemEnvelope = {
+				...envelope,
+				state: error ? "failed" : "completed",
+				updatedAt: envelope.updatedAt || new Date().toISOString(),
+				item: error ? { ...envelope.item, error } : envelope.item,
+			}
+			byId.set(itemId, updated)
+			this.emitNativeItem(directory, updated)
 		}
-		this.messages.set(sessionId, remaining)
-		this.userMessageByTurn.delete(this.turnKey(sessionId, turnId))
 	}
 
 	private emitSessionDeleted(sessionId: string, directory: string): void {
@@ -2896,13 +2894,27 @@ class NativeClient {
 	}
 
 	private handleWorkspaceChangesUpdated(
-		payload: WorkspaceChangesUpdatedPayload,
+		payload: WorkspaceChangesUpdatedNotification,
 		directory?: string,
 	): void {
-		const event = workspaceChangesUpdatedEventProperties(payload)
-		if (!event.sessionID) return
+		if (!payload.sessionId) return
+		const event: WorkspaceChangesUpdatedEventProperties = {
+			sessionId: payload.sessionId,
+			turnId: payload.turnId,
+			scope: payload.scope,
+			status: payload.status,
+			coverage: payload.coverage,
+			changeSetStatus: payload.changeSetStatus,
+			stats: {
+				filesChanged: numberFromProtocol(payload.stats.filesChanged),
+				additions: numberFromProtocol(payload.stats.additions),
+				deletions: numberFromProtocol(payload.stats.deletions),
+			},
+			version: numberFromProtocol(payload.version),
+			generatedAt: payload.generatedAt,
+		}
 		const emitDirectory =
-			directory ?? this.sessionDirectories.get(event.sessionID) ?? this.options.directory ?? defaultCwd()
+			directory ?? this.sessionDirectories.get(event.sessionId) ?? this.options.directory ?? defaultCwd()
 		this.emit(emitDirectory, {
 			type: "workspace.changes.updated",
 			properties: event,
@@ -2931,428 +2943,10 @@ class NativeClient {
 			type: "question.asked",
 			properties: {
 				id: requestId,
-				requestID: requestId,
-				sessionID: requestSessionId,
+				sessionId: requestSessionId,
 				questions,
 			},
 		})
-	}
-
-	private turnKey(sessionId: string, turnId: string): string {
-		return `${sessionId}\u001f${turnId}`
-	}
-
-	private turnIdForUpdate(update: Record<string, unknown>): string | undefined {
-		return (
-			updateMetaString(update, DEVO_TURN_ID_META) ??
-			(typeof update.turnId === "string" && update.turnId ? update.turnId : undefined)
-		)
-	}
-
-	private parentMessageIdForUpdate(
-		sessionId: string,
-		update: Record<string, unknown>,
-		existingMessage?: Message,
-	): string | undefined {
-		const turnId = this.turnIdForUpdate(update)
-		return (
-			updateMetaString(update, DEVO_PARENT_MESSAGE_ID_META) ??
-			(turnId ? this.userMessageByTurn.get(this.turnKey(sessionId, turnId)) : undefined) ??
-			existingMessage?.parentID ??
-			this.lastUserMessageBySession.get(sessionId)
-		)
-	}
-
-	private earliestMessageCreatedForTurn(sessionId: string, turnId: string): number | undefined {
-		let earliest: number | undefined
-		for (const message of this.messages.get(sessionId) ?? []) {
-			if (this.messageTurnIds.get(partCacheKey(sessionId, message.id)) !== turnId) continue
-			const created = message.time?.created
-			if (typeof created !== "number" || !Number.isFinite(created)) continue
-			earliest = earliest === undefined ? created : Math.min(earliest, created)
-		}
-		return earliest
-	}
-
-	private messageCreatedAtForUpdate(
-		sessionId: string,
-		role: "assistant" | "user",
-		messageId: string,
-		update: Record<string, unknown>,
-		existingMessage: Message | undefined,
-		now: number,
-	): number {
-		let created =
-			existingMessage?.time?.created ??
-			parseTimestampMs(update.createdAt) ??
-			updateHistoryCreatedAt(update) ??
-			historyMessageCreatedAt(messageId) ??
-			now
-		const turnId = this.turnIdForUpdate(update)
-		if (role === "user" && turnId) {
-			const earliest = this.earliestMessageCreatedForTurn(sessionId, turnId)
-			if (earliest !== undefined && earliest <= created) {
-				created = Math.max(0, earliest - 1)
-			}
-		}
-		return created
-	}
-
-	private rememberMessageTurn(
-		sessionId: string,
-		directory: string,
-		messageId: string,
-		role: "assistant" | "user",
-		update: Record<string, unknown>,
-	): void {
-		const turnId = this.turnIdForUpdate(update)
-		if (!turnId) return
-		this.messageTurnIds.set(partCacheKey(sessionId, messageId), turnId)
-		if (role !== "user") return
-		this.userMessageByTurn.set(this.turnKey(sessionId, turnId), messageId)
-		this.reparentTurnMessages(sessionId, directory, turnId, messageId)
-	}
-
-	private reparentTurnMessages(
-		sessionId: string,
-		directory: string,
-		turnId: string,
-		userMessageId: string,
-	): void {
-		const messages = this.messages.get(sessionId)
-		if (!messages) return
-		for (let index = 0; index < messages.length; index++) {
-			const message = messages[index]
-			if (message.role !== "assistant") continue
-			if (this.messageTurnIds.get(partCacheKey(sessionId, message.id)) !== turnId) continue
-			if (message.parentID === userMessageId) continue
-			const updated = { ...message, parentID: userMessageId } as Message
-			messages[index] = updated
-			this.emit(directory, { type: "message.updated", properties: { info: updated, message: updated } })
-		}
-	}
-
-	private upsertCompaction(
-		sessionId: string,
-		directory: string,
-		update: {
-			itemId: string
-			status: "started" | "completed" | "failed"
-			turnId?: string
-		},
-	): void {
-		if (update.status === "failed") return
-		const messageId = `compaction-${update.itemId}`
-		const label = update.status === "completed" ? COMPACTION_COMPLETED_LABEL : COMPACTION_STARTED_LABEL
-		this.replaceText(sessionId, directory, "assistant", {
-			messageId,
-			content: { text: label },
-			_meta: {
-				[DEVO_ITEM_KIND_META]: "context_compaction",
-				[DEVO_COMPACTION_STATUS_META]: update.status,
-				...(update.turnId ? { [DEVO_TURN_ID_META]: update.turnId } : {}),
-			},
-		})
-	}
-
-	private upsertPlan(
-		sessionId: string,
-		directory: string,
-		itemId: string,
-		item: Record<string, unknown>,
-		turnId: string,
-	): void {
-		const entries = Array.isArray(item.entries) ? item.entries : []
-		const mapped = entries.map((entry) => {
-			const value = objectRecord(entry) ?? {}
-			return {
-				content: String(value.step ?? value.content ?? value.title ?? ""),
-				status: String(value.status ?? "pending"),
-			}
-		})
-		if (mapped.length === 0) return
-		this.emit(directory, {
-			type: "todo.updated",
-			properties: { sessionID: sessionId, todos: mapped },
-		})
-		const proposed = mapped.length === 1 && mapped[0].content.includes("\n")
-		this.replaceText(sessionId, directory, "assistant", {
-			messageId: itemId,
-			content: {
-				text: proposed
-					? mapped[0].content
-					: mapped.map((entry) => `- [${entry.status}] ${entry.content}`).join("\n"),
-			},
-			_meta: {
-				[DEVO_ITEM_KIND_META]: proposed ? "proposed_plan" : "plan",
-				planEntries: mapped,
-				...(turnId ? { [DEVO_TURN_ID_META]: turnId } : {}),
-			},
-		})
-	}
-
-	private replaceText(
-		sessionId: string,
-		directory: string,
-		role: "assistant" | "user",
-		update: Record<string, unknown>,
-	): void {
-		const text = textFromUpdate(update)
-		if (!text) return
-		const now = this.nextEventTime()
-		const messageId =
-			typeof update.messageId === "string" ? update.messageId : `${role}-${sessionId}-${now}`
-		const existingMessage = this.messages.get(sessionId)?.find((message) => message.id === messageId)
-		const parentID =
-			role === "assistant" ? this.parentMessageIdForUpdate(sessionId, update, existingMessage) : undefined
-		const created = this.messageCreatedAtForUpdate(
-			sessionId,
-			role,
-			messageId,
-			update,
-			existingMessage,
-			now,
-		)
-		const turnId = this.turnIdForUpdate(update)
-		const completedAt =
-			role === "assistant"
-				? (existingMessage?.time?.completed ?? parseTimestampMs(update.completedAt))
-				: undefined
-		const message = {
-			...(existingMessage ?? {}),
-			id: messageId,
-			sessionID: sessionId,
-			role,
-			...(parentID ? { parentID } : {}),
-			...(turnId ? { turnID: turnId } : {}),
-			time: {
-				...(existingMessage?.time ?? {}),
-				created,
-				...(completedAt !== undefined ? { completed: completedAt } : {}),
-			},
-		} as Message
-		this.appendMessage(sessionId, message)
-		if (role === "user") this.lastUserMessageBySession.set(sessionId, messageId)
-		this.emit(directory, { type: "message.updated", properties: { info: message, message } })
-		this.rememberMessageTurn(sessionId, directory, messageId, role, update)
-
-		const partId = `${messageId}-text`
-		const existingPart = this.parts
-			.get(partCacheKey(sessionId, messageId))
-			?.find((part) => part.id === partId)
-		const partEventTime = updateEventTimeMs(update, now)
-		const metadata = textPartMetadataFromUpdate(update, existingPart)
-		const part = {
-			id: partId,
-			sessionID: sessionId,
-			messageID: messageId,
-			type: "text",
-			text,
-			...(metadata ? { metadata } : {}),
-			time: partTime(existingPart, partEventTime),
-		} as TextPart
-		this.appendPart(sessionId, messageId, part)
-		this.emit(directory, { type: "message.part.updated", properties: { part } })
-	}
-
-	private appendText(
-		sessionId: string,
-		directory: string,
-		role: "assistant" | "user",
-		partType: "reasoning" | "text",
-		update: Record<string, unknown>,
-	): void {
-		const text = textFromUpdate(update)
-		if (!text && update.allowEmpty !== true) return
-		const now = this.nextEventTime()
-		const messageId =
-			typeof update.messageId === "string"
-				? update.messageId
-				: `${role}-${sessionId}-${now}`
-		const existingMessage = this.messages.get(sessionId)?.find((message) => message.id === messageId)
-		const parentID =
-			role === "assistant" ? this.parentMessageIdForUpdate(sessionId, update, existingMessage) : undefined
-		const created = this.messageCreatedAtForUpdate(
-			sessionId,
-			role,
-			messageId,
-			update,
-			existingMessage,
-			now,
-		)
-		const turnId = this.turnIdForUpdate(update)
-		const completedAt =
-			role === "assistant"
-				? (existingMessage?.time?.completed ?? parseTimestampMs(update.completedAt))
-				: undefined
-		const message = {
-			...(existingMessage ?? {}),
-			id: messageId,
-			sessionID: sessionId,
-			role,
-			...(parentID ? { parentID } : {}),
-			...(turnId ? { turnID: turnId } : {}),
-			time: {
-				...(existingMessage?.time ?? {}),
-				created,
-				...(completedAt !== undefined ? { completed: completedAt } : {}),
-			},
-		} as Message
-		this.appendMessage(sessionId, message)
-		if (role === "user") this.lastUserMessageBySession.set(sessionId, messageId)
-		this.emit(directory, { type: "message.updated", properties: { info: message, message } })
-		this.rememberMessageTurn(sessionId, directory, messageId, role, update)
-
-		const partId = `${messageId}-${partType === "reasoning" ? "reasoning" : "text"}`
-		const existingPart = this.parts
-			.get(partCacheKey(sessionId, messageId))
-			?.find((part) => part.id === partId)
-		const field = partType === "reasoning" ? "text" : "text"
-		const existingText =
-			messageId.startsWith("history-") || typeof existingPart?.[field] !== "string"
-				? ""
-				: existingPart[field]
-		const nextText =
-			role === "user" && existingText && (existingText === text || existingText.endsWith(text))
-				? existingText
-				: role === "user" && existingText && text.startsWith(existingText)
-					? text
-					: `${existingText}${text}`
-		if (existingPart && nextText === existingText && completedAt === undefined) return
-		const partEventTime = updateEventTimeMs(update, now)
-		const metadata = textPartMetadataFromUpdate(update, existingPart)
-		const part = {
-			id: partId,
-			sessionID: sessionId,
-			messageID: messageId,
-			type: partType,
-			[field]: nextText,
-			...(metadata ? { metadata } : {}),
-			time: partTime(existingPart, partEventTime, {
-				start: parseTimestampMs(update.createdAt) ?? created,
-				...(completedAt !== undefined ? { end: completedAt } : {}),
-			}),
-		} as TextPart | ReasoningPart
-		this.appendPart(sessionId, messageId, part)
-		this.emit(directory, { type: "message.part.updated", properties: { part } })
-	}
-
-	private appendTool(sessionId: string, directory: string, update: Record<string, unknown>): void {
-		const now = this.nextEventTime()
-		const toolCallId = toolCallIdFromUpdate(update, now)
-		const messageId = `tool-${toolCallId}`
-		const existingMessage = this.messages.get(sessionId)?.find((message) => message.id === messageId)
-		const existingPart = this.parts
-			.get(partCacheKey(sessionId, messageId))
-			?.find((part) => part.id === `${messageId}-part`)
-		const parentID = this.parentMessageIdForUpdate(sessionId, update, existingMessage)
-		const created = this.messageCreatedAtForUpdate(
-			sessionId,
-			"assistant",
-			messageId,
-			update,
-			existingMessage,
-			now,
-		)
-		const turnId = this.turnIdForUpdate(update)
-		const completedAt =
-			existingMessage?.time?.completed ?? parseTimestampMs(update.completedAt)
-		const message = {
-			...(existingMessage ?? {}),
-			id: messageId,
-			sessionID: sessionId,
-			role: "assistant",
-			...(parentID ? { parentID } : {}),
-			...(turnId ? { turnID: turnId } : {}),
-			time: {
-				...(existingMessage?.time ?? {}),
-				created,
-				...(completedAt !== undefined ? { completed: completedAt } : {}),
-			},
-		} as Message
-		const partEventTime = updateEventTimeMs(update, now)
-		const part = toolPartFromUpdate(sessionId, update, existingPart, partEventTime) as ToolPart
-		this.appendMessage(sessionId, message)
-		this.rememberMessageTurn(sessionId, directory, messageId, "assistant", update)
-		this.appendPart(sessionId, message.id, part)
-		this.emit(directory, { type: "message.updated", properties: { info: message, message } })
-		this.emit(directory, { type: "message.part.updated", properties: { part } })
-	}
-
-	private completeOpenAssistantMessages(
-		sessionId: string,
-		directory: string,
-		promptStartedAt: number,
-	): void {
-		const messages = this.messages.get(sessionId)
-		if (!messages) return
-		let completedAt: number | null = null
-		for (let index = 0; index < messages.length; index++) {
-			const message = messages[index]
-			if (message.role !== "assistant" || message.time.completed != null) continue
-			if (message.time.created < promptStartedAt) continue
-			completedAt ??= this.nextEventTime()
-			const updated = {
-				...message,
-				time: { ...message.time, completed: completedAt },
-			} as Message
-			messages[index] = updated
-			this.emit(directory, { type: "message.updated", properties: { info: updated, message: updated } })
-			this.completeInFlightToolParts(sessionId, directory, updated.id, completedAt)
-		}
-	}
-
-	private completeInFlightToolParts(
-		sessionId: string,
-		directory: string,
-		messageId: string,
-		completedAt: number,
-	): void {
-		const parts = this.parts.get(partCacheKey(sessionId, messageId))
-		if (!parts) return
-		for (let index = 0; index < parts.length; index++) {
-			const part = parts[index]
-			if (part.type !== "tool") continue
-			if (part.state.status !== "running" && part.state.status !== "pending") continue
-			const runningOutput =
-				part.state.status === "running" && typeof part.state.metadata?.output === "string"
-					? part.state.metadata.output
-					: ""
-			const next = {
-				...part,
-				state: {
-					...part.state,
-					status: "completed",
-					output: runningOutput,
-					time: { ...part.state.time, end: part.state.time.end ?? completedAt },
-				},
-			} as ToolPart
-			parts[index] = next
-			this.emit(directory, { type: "message.part.updated", properties: { part: next } })
-		}
-	}
-
-	private appendMessage(sessionId: string, message: Message): void {
-		const messages = this.messages.get(sessionId) ?? []
-		const index = messages.findIndex((existing) => existing.id === message.id)
-		if (index >= 0) {
-			messages[index] = message
-		} else {
-			messages.push(message)
-		}
-		this.messages.set(sessionId, messages)
-	}
-
-	private appendPart(sessionId: string, messageId: string, part: Part): void {
-		const key = partCacheKey(sessionId, messageId)
-		const parts = this.parts.get(key) ?? []
-		const index = parts.findIndex((existing) => existing.id === part.id)
-		if (index >= 0) {
-			parts[index] = part
-		} else {
-			parts.push(part)
-		}
-		this.parts.set(key, parts)
 	}
 
 	private nextEventTime(): number {
@@ -3372,39 +2966,58 @@ class NativeClient {
 		this.emit(directory, {
 			type: "session.queue.updated",
 			properties: {
-				sessionID: sessionId,
+				sessionId: sessionId,
 				change,
 				entries,
 			},
 		})
 	}
 
+	private readonly sessionsNeedingResume = new Set<string>()
+
 	private async pushSessionQueue(params: {
-		sessionID: string
+		sessionId: string
 		parts: PromptPartInput[]
 		collaborationMode?: string
 	}): Promise<PromptAsyncOutcome> {
+		if (this.sessionsNeedingResume.has(params.sessionId)) {
+			await this.ensureSessionReady(params.sessionId)
+		}
 		if (params.collaborationMode) {
 			const settingsPatch: SessionSettingsPatch = {
 				mode: params.collaborationMode,
 			}
-			await this.enqueueSessionSettings(params.sessionID, settingsPatch)
+			await this.enqueueSessionSettings(params.sessionId, settingsPatch)
 		}
-		await this.ensureSessionSubscription(params.sessionID)
-		const result = (await this.requestCanonical("session/queue/push", {
-			sessionId: params.sessionID,
-			input: inputItemsFromPromptParts(params.parts),
+		await this.ensureSessionSubscription(params.sessionId)
+		const request = {
+			sessionId: params.sessionId,
+			input: userInputsFromPromptParts(params.parts),
 			idempotencyKey: crypto.randomUUID(),
-		})) as Record<string, unknown>
+		}
+		let result: Record<string, unknown>
+		try {
+			result = await this.requestCanonical("session/queue/push", request) as Record<string, unknown>
+		} catch (error) {
+			if (!isSessionNotFoundError(error)) throw error
+			// An evicted actor or a missed transport-close event can invalidate
+			// the client cache. Restore once, then retry with the same input/key.
+			this.loadedSessionLimits.delete(params.sessionId)
+			this.historyCursors.delete(params.sessionId)
+			this.resumedSessions.delete(params.sessionId)
+			this.subscriptions.delete(params.sessionId)
+			await this.ensureSessionReady(params.sessionId)
+			result = await this.requestCanonical("session/queue/push", request) as Record<string, unknown>
+		}
 		const outcome = String(result.outcome ?? "")
 		if (outcome === "queued" || result.entry) {
 			const entry = objectRecord(result.entry) ?? result
 			const entries = parseQueueWireEntries([entry])
 			if (entries[0]) {
-				const current = this.queueEntriesForSession(params.sessionID)
+				const current = this.queueEntriesForSession(params.sessionId)
 				const merged = [...current.filter((item) => item.queueItemId !== entries[0].queueItemId), entries[0]]
 				this.emitQueueSnapshot(
-					params.sessionID,
+					params.sessionId,
 					merged.sort((left, right) => left.position - right.position),
 					"added",
 				)
@@ -3414,14 +3027,14 @@ class NativeClient {
 		}
 		const turn = objectRecord(result.turn)
 		if (turn?.id) {
-			this.activeTurnIds.set(params.sessionID, String(turn.id))
-			const directory = this.sessionDirectories.get(params.sessionID) ?? this.options.directory ?? defaultCwd()
+			this.activeTurnIds.set(params.sessionId, String(turn.id))
+			const directory = this.sessionDirectories.get(params.sessionId) ?? this.options.directory ?? defaultCwd()
 			this.emit(directory, {
 				type: "session.activeTurn",
-				properties: { sessionID: params.sessionID, turnID: String(turn.id) },
+				properties: { sessionId: params.sessionId, turnId: String(turn.id) },
 			})
 		}
-		return { outcome: "started" }
+		return { outcome: "started", ...(turn?.id ? { turnId: String(turn.id) } : {}) }
 	}
 
 	private rememberConfigOptions(
@@ -3553,6 +3166,10 @@ class NativeClient {
 				if (!result.session) throw new Error("session/metadata/update returned no session")
 				return this.rememberNativeSession(result.session)
 			} catch (error) {
+				if (isSessionNotFoundError(error)) {
+					this.dropMissingSession(sessionId)
+					throw error
+				}
 				const delay = SESSION_SETTINGS_RETRY_DELAYS_MS[retry]
 				if (delay === undefined || !isTransientSessionSettingsError(error)) throw error
 				await waitForSessionSettingsRetry(delay)
@@ -3565,7 +3182,6 @@ class NativeClient {
 		value: string,
 	): Promise<SessionConfigOption[]> {
 		await this.ensureInitialized()
-		const directory = this.options.directory ?? defaultCwd()
 		// Canonical model/preferences/write (ratified #12): configId maps to
 		// the patch fields; the result converts back to the select shape the
 		// config UI renders.
@@ -3573,13 +3189,7 @@ class NativeClient {
 		if (configId === "model") patch.model = value
 		else if (configId === "thought_level") patch.reasoningEffort = value
 		else throw new Error(`unknown model config option '${configId}'`)
-		const params: Record<string, unknown> = { patch }
-		if (this.options.directory) params.cwd = this.options.directory
-		const result = (await this.requestCanonical("model/preferences/write", params)) as {
-			preferences?: ModelPreferencesWire
-		}
-		const options = sessionConfigOptionsFromModelPreferences(result.preferences ?? {})
-		this.rememberDirectoryConfigOptions(directory, options)
+		await this.model.preferences.write({ patch })
 		return this.currentConfigOptions()
 	}
 
@@ -3620,7 +3230,7 @@ class NativeClient {
 		if (!occupancy) return false
 		this.emit(this.sessionDirectories.get(sessionId) ?? this.options.directory ?? defaultCwd(), {
 			type: "context.usage.updated",
-			properties: { sessionID: sessionId, occupancy },
+			properties: { sessionId: sessionId, occupancy },
 		})
 		return true
 	}

@@ -7,7 +7,7 @@ The server runtime uses **one session actor per session**. Durable session state
 - **Mutate durable session state only through `SessionHandle` → `SessionCommand`.** Do not reach into `SessionActorState` from handlers or turn tasks except inside the actor loop or via explicit snapshot/command APIs.
 - **Actor mailbox commands must be short.** No unbounded I/O (`query()`, tool waits, client reverse-RPC) inside the actor task. See `L2-DES-SERVER-002`.
 - **Turns execute on a spawned task** with a checked-out `TurnWorkingSet`. Checkout / `MergeTurn` are the only turn↔actor crossings for conversation ownership.
-- **`ActiveTurnRegistry` is the single source for in-flight turn execution handles** (cancel tokens, abort handles, connection routing, spawn snapshots, active stream state). Register on turn start. Use `clear_active_turn_interrupt_handles` during finalization so stream/spawn mirrors stay available until merge; use `clear_active_turn_runtime_handles` for full teardown.
+- **`ActiveTurnRegistry` is the single source for in-flight turn execution handles** (cancel tokens, abort handles, connection routing, spawn snapshots, active stream state). Register on turn start. Retain stream/spawn mirrors and turn metadata until merge; use one `clear_active_turn_runtime_handles` after merge to release admission and consume an explicit pending goal activation atomically.
 - **Use `turn_lifecycle` helpers** (`register_active_turn_execution`, `spawn_active_turn_task`, `signal_active_turn_interrupt`) instead of touching `ActiveTurnRegistry` fields ad hoc from handlers.
 - **Interactive waits (approval, `request_user_input`) live in `SessionInteractiveLanes`, not the session actor.**
 - **Post-turn scheduling runs outside the turn task and actor.** After `MergeTurn`, continuation (queued follow-ups, goal continuation) is spawned via `spawn_post_turn_scheduling`—never inline in the mailbox handler.
@@ -42,11 +42,13 @@ The server runtime uses **one session actor per session**. Durable session state
 
 ### Session persistence layers
 
-- **Rollout JSONL** under `~/.devo/sessions/` is the canonical conversation history.
+- **Rollout JSONL** is the canonical conversation history (agent layout):
+  - Roots/forks: `~/.devo/sessions/<session_id>.jsonl`
+  - Subagents: `~/.devo/session-artifacts/<root_id>/sub-xxxxxxxx/<child_id>.jsonl` (nested `sub-…` dirs for deeper children)
 - **SQLite** (`devo.db` `sessions` table) stores a lightweight index (`rollout_path`, `parent_session_id`, title, cwd, timestamps) used by `session/list` and resume decisions.
 - **In-memory session actors** are loaded on demand via `get_or_load_parent_session`; root sessions are LRU-evicted (capacity 16) when unpinned.
 - **`session/list`** returns durable user-visible sessions only (non-ephemeral, no `agent_path`; includes forks with `parent_session_id`); subagent rows are indexed but hidden from list.
-- **`session/resume`** loads parent sessions lazily from rollout files. Subagent session ids cannot be resumed directly; missing rollout files fail with an explicit restore error.
+- **`session/resume`** loads sessions lazily from rollout files (roots and subagents). Subagent actors stay off the root LRU. Missing rollout files fail with an explicit restore error.
 - **Startup** runs `index_rollout_metadata` in the background instead of replaying every rollout into memory.
 
 ### Session title generation

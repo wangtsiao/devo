@@ -193,6 +193,12 @@ function fireNotification(request: NotificationRequest): void {
 				permissionId,
 				response,
 				directory: request.directory,
+			}).catch((err) => {
+				log.error(
+					"Permission notification action failed",
+					{ sessionId: request.sessionId, permissionId, response },
+					err,
+				)
 			})
 		})
 	}
@@ -214,6 +220,7 @@ function navigateToSession(sessionId: string): void {
 	const win = BrowserWindow.getAllWindows()[0]
 	if (win) {
 		if (win.isMinimized()) win.restore()
+		if (!win.isVisible()) win.show()
 		win.focus()
 		win.webContents.send("notification:navigate", { sessionId })
 	}

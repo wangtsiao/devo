@@ -22,7 +22,7 @@ const isElectron = typeof window !== "undefined" && "devo" in window
 
 export function GeneralSettings() {
 	return (
-		<div className="space-y-10">
+		<div className="space-y-8">
 			<SettingsHeader title="General" />
 
 			<OpenDestinationRow />
@@ -67,11 +67,12 @@ function OpenDestinationRow() {
 			>
 				<Select
 					value={preferred ?? undefined}
+					items={Object.fromEntries(targets.map((target) => [target.id, target.label]))}
 					onValueChange={(v) => {
 						if (v !== null) handleChange(v)
 					}}
 				>
-					<SelectTrigger className="min-w-[180px]">
+					<SelectTrigger aria-label="Default open destination" className="min-w-[180px]">
 						<SelectValue placeholder="Select..." />
 					</SelectTrigger>
 					<SelectContent>
@@ -145,7 +146,11 @@ function OpaqueWindowsRow() {
 			label="Use opaque background"
 			description="Make windows use a solid background rather than system translucency"
 		>
-			<Switch checked={opaque} onCheckedChange={handleChange} />
+			<Switch
+				checked={opaque}
+				onCheckedChange={handleChange}
+				aria-label="Use opaque background"
+			/>
 		</SettingsRow>
 	)
 }
@@ -166,7 +171,7 @@ function DisplayModeRow() {
 				}}
 				items={{ default: "Default", verbose: "Verbose" }}
 			>
-				<SelectTrigger className="min-w-[140px]">
+				<SelectTrigger aria-label="Display mode" className="min-w-[140px]">
 					<SelectValue />
 				</SelectTrigger>
 				<SelectContent>
@@ -190,6 +195,7 @@ function HideThinkingWhileWorkingRow() {
 			<Switch
 				checked={hideThinkingWhileWorking}
 				onCheckedChange={setHideThinkingWhileWorking}
+				aria-label="Hide thinking while working"
 			/>
 		</SettingsRow>
 	)

@@ -1,3 +1,5 @@
+import { useTurnRecovery } from "../../hooks/use-turn-recovery"
+import { TurnRecoveryPanel } from "./turn-recovery-panel"
 import {
 	Conversation,
 	ConversationContent,
@@ -9,7 +11,6 @@ import {
 	PromptInputButton,
 	PromptInputFooter,
 	PromptInputProvider,
-	PromptInputSubmit,
 	PromptInputTextarea,
 	PromptInputTools,
 	usePromptInputAttachments,
@@ -41,8 +42,7 @@ import {
 	useState,
 } from "react"
 import { collaborationModeFamily, type CollaborationMode } from "../../atoms/collaboration-mode"
-import { compactionStatusFamily } from "../../atoms/compaction"
-import { messagesFamily } from "../../atoms/messages"
+import { itemsFamily } from "../../atoms/messages"
 import { projectModelsAtom, setProjectModelAtom } from "../../atoms/preferences"
 import {
 	composerFromSessionModel,
@@ -50,7 +50,7 @@ import {
 	sessionComposerFamily,
 	setSessionComposerAtom,
 } from "../../atoms/session-composer"
-import type { ProviderRetryStatus, SessionSetupPhase } from "../../atoms/sessions"
+import type { ProviderErrorEntry, ProviderRetryStatus, SessionSetupPhase } from "../../atoms/sessions"
 import { sessionFamily } from "../../atoms/sessions"
 import {
 	effectivePermissionFamily,
@@ -105,17 +105,23 @@ const SELECTION_PERSIST_DEBOUNCE_MS = 500
 const VIRTUALIZE_TURN_THRESHOLD = 30
 const VIRTUAL_TURN_GAP = 40
 
+/** Stable empty array so historical ChatTurn memo is not busted every stream tick. */
+const EMPTY_PROVIDER_ERRORS: ProviderErrorEntry[] = []
+
 import {
 	type DiffComment,
 	diffCommentsFamily,
 	serializeCommentsForChat,
 } from "../review/review-comments"
+import { ComposerSubmitControls } from "./composer-submit-controls"
 import { ChatPermissionFlow } from "./chat-permission"
 import { ChatQuestionFlow } from "./chat-question"
+import { isAssistantItemError } from "./assistant-item-error"
 import { ChatTurnComponent, isSyntheticMessage } from "./chat-turn"
 import { ForkBoundaryDivider } from "./fork-boundary-divider"
 import { forkBoundaryAfterTurnIndex } from "./fork-boundary"
 import { ChatLoadingSkeleton } from "./chat-turn-skeleton"
+import { ProviderErrorRow } from "./provider-error-row"
 import {
 	ComposerStatusStack,
 	type ComposerGoal,
@@ -141,6 +147,7 @@ import {
 	DEFAULT_COMPOSER_PERMISSION_PROFILE,
 	type ComposerPermissionProfile,
 	parseComposerPermissionProfile,
+	PERMISSION_PICKER_ENABLED,
 	takeComposerPermissionForSession,
 } from "./composer-permission"
 import { goalPromptText, parseComposerSlash } from "./composer-slash"
@@ -427,50 +434,18 @@ const TURN_ESTIMATE_MIN = 120
 const TURN_ESTIMATE_MAX = 12_000
 
 function estimateTurnSize(turn: ChatTurn): number {
-	let partCount = turn.userMessage.parts.length
-	for (const message of turn.assistantMessages) {
-		partCount += message.parts.length
-	}
+	const itemCount = 1 + turn.assistantMessages.length
 	const assistantTextLength = turn.assistantMessages.reduce((total, message) => {
-		return (
-			total +
-			message.parts.reduce((messageTotal, part) => {
-				return messageTotal + (part.type === "text" || part.type === "reasoning" ? part.text.length : 0)
-			}, 0)
-		)
+		const item = message.info.item
+		const text = typeof item?.text === "string" ? item.text : ""
+		return total + text.length
 	}, 0)
-	const toolCount = turn.assistantMessages.reduce((total, message) => {
-		return total + message.parts.filter((part) => part.type === "tool").length
-	}, 0)
-	const reasoningCount = turn.assistantMessages.reduce((total, message) => {
-		return total + message.parts.filter((part) => part.type === "reasoning").length
-	}, 0)
-	const estimated =
-		180 +
-		turn.assistantMessages.length * 72 +
-		partCount * 36 +
-		toolCount * 96 +
-		reasoningCount * 48 +
-		assistantTextLength / 10
+	const estimated = 180 + itemCount * 72 + assistantTextLength / 10
 	return Math.max(TURN_ESTIMATE_MIN, Math.min(TURN_ESTIMATE_MAX, estimated))
 }
 
-function turnListRevision(turns: ChatTurn[]): string {
-	return turns
-		.map((turn) => {
-			let partCount = turn.userMessage.parts.length
-			let textLength = 0
-			for (const message of turn.assistantMessages) {
-				partCount += message.parts.length
-				for (const part of message.parts) {
-					if (part.type === "text" || part.type === "reasoning") {
-						textLength += part.text.length
-					}
-				}
-			}
-			return `${turn.id}:${partCount}:${textLength}`
-		})
-		.join("|")
+function turnListStructureRevision(turns: ChatTurn[]): string {
+	return turns.map((turn) => `${turn.id}:${1 + turn.assistantMessages.length}`).join("|")
 }
 
 interface VirtualizedTurnListProps {
@@ -481,7 +456,7 @@ interface VirtualizedTurnListProps {
 
 function VirtualizedTurnList({ turns, renderTurn, sessionId }: VirtualizedTurnListProps) {
 	const { scrollRef } = useStickToBottomContext()
-	const turnsRevision = useMemo(() => turnListRevision(turns), [turns])
+	const turnsRevision = useMemo(() => turnListStructureRevision(turns), [turns])
 	const virtualizer = useVirtualizer({
 		count: turns.length,
 		getScrollElement: () => scrollRef.current,
@@ -719,8 +694,6 @@ interface ChatViewProps {
 	onForkFromTurn?: (turnId?: string) => Promise<void>
 	/** Edit and resend the latest user message */
 	onEditUserMessage?: (messageId: string, text: string) => Promise<void>
-	/** Delete a specific part from a message (for error recovery) */
-	onDeletePart?: (sessionId: string, messageId: string, partId: string) => Promise<void>
 	/** Whether the review panel is open (removes max-w constraint) */
 	reviewPanelOpen?: boolean
 	/** Parent session title for fork boundary marker */
@@ -787,7 +760,6 @@ export function ChatView({
 	isReverted,
 	onForkFromTurn,
 	onEditUserMessage,
-	onDeletePart,
 	reviewPanelOpen,
 	parentSessionName,
 	isActive = true,
@@ -797,7 +769,8 @@ export function ChatView({
 	composerInsetPx,
 	sideQuestionHandlerRef,
 }: ChatViewProps) {
-	const isWorking = agent.status === "running"
+	const recoveryState = useTurnRecovery(agent.sessionId, agent.directory, agent.status)
+	const isWorking = agent.status === "running" && !recoveryState.recovery
 	const settingsOverlayOpen = useAtomValue(settingsOverlayOpenAtom)
 
 	useEffect(() => {
@@ -833,7 +806,6 @@ export function ChatView({
 	const sessionEntry = useAtomValue(sessionFamily(agent.sessionId))
 	const sessionError = sessionEntry?.error
 	const setupPhase = sessionEntry?.setupPhase
-	const compactionStatus = useAtomValue(compactionStatusFamily(agent.sessionId))
 	const [sideCards, setSideCards] = useState<SideCard[]>([])
 
 	const startSideQuestion = useCallback(
@@ -858,7 +830,7 @@ export function ChatView({
 				`Side question:\n${question}`
 			try {
 				const result = await client.task.startAgent({
-					sessionID: agent.sessionId,
+					sessionId: agent.sessionId,
 					prompt,
 					forkTurns: "all",
 					maxTurns: 1,
@@ -872,16 +844,14 @@ export function ChatView({
 					await new Promise((resolve) => setTimeout(resolve, 250))
 					try {
 						const messages = await client.session.messages({
-							sessionID: childSessionId,
+							sessionId: childSessionId,
 							limit: 50,
 						})
 						const texts: string[] = []
 						for (const entry of messages.data ?? []) {
-							if (entry.info.role !== "assistant") continue
-							for (const part of entry.parts ?? []) {
-								if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
-									texts.push(part.text)
-								}
+							const item = entry.info?.item
+							if (item?.type === "assistantMessage" && typeof item.text === "string" && item.text.trim()) {
+								texts.push(item.text)
 							}
 						}
 						answer = texts.join("\n").trim()
@@ -983,7 +953,7 @@ export function ChatView({
 
 	// Format the session-level error for display. Only shown when the last
 	// turn doesn't already carry an assistant-level error (the server emits
-	// both session.error and message.updated for the same failure, so showing
+	// both session.error and item.updated for the same failure, so showing
 	// both would duplicate the message).
 	const sessionErrorText = useMemo(() => {
 		if (!sessionError) return undefined
@@ -996,12 +966,11 @@ export function ChatView({
 	const lastTurnHasError = useMemo(() => {
 		const lastTurn = turns.at(-1)
 		if (!lastTurn) return false
-		return lastTurn.assistantMessages.some(
-			(m) => m.info.role === "assistant" && m.info.error != null,
-		)
+		return lastTurn.assistantMessages.some(({ info }) => isAssistantItemError(info))
 	}, [turns])
 
-	const showSessionError = !!sessionErrorText && !lastTurnHasError
+	const showSessionError =
+		!!sessionErrorText && !lastTurnHasError && (sessionEntry?.providerErrors?.length ?? 0) === 0
 
 	// Stable callbacks for question/permission handlers — agent is stable
 	// per render, but wrapping in useCallback avoids creating new inline
@@ -1069,6 +1038,16 @@ export function ChatView({
 		: "mx-auto w-full min-w-0 max-w-3xl"
 
 	const retryStatus = sessionEntry?.retryStatus
+	const providerErrors = sessionEntry?.providerErrors ?? EMPTY_PROVIDER_ERRORS
+	const lastTurnProviderErrors = useMemo(() => {
+		if (providerErrors.length === 0) return EMPTY_PROVIDER_ERRORS
+		const lastTurn = turns[turns.length - 1]
+		if (!lastTurn?.turnId) return providerErrors
+		const filtered = providerErrors.filter(
+			(entry) => !entry.turnId || entry.turnId === lastTurn.turnId,
+		)
+		return filtered.length === providerErrors.length ? providerErrors : filtered
+	}, [providerErrors, turns])
 	const latestEditableUserTurnIndex = useMemo(() => {
 		for (let index = turns.length - 1; index >= 0; index--) {
 			if (!isSyntheticMessage(turns[index].userMessage)) return index
@@ -1102,6 +1081,7 @@ export function ChatView({
 						: isWorking
 							? retryStatus
 							: undefined
+			const turnProviderErrors = !isLastTurn ? EMPTY_PROVIDER_ERRORS : lastTurnProviderErrors
 			return (
 			<Fragment key={turn.id}>
 			<ChatTurnComponent
@@ -1110,8 +1090,8 @@ export function ChatView({
 				isWorking={isWorking}
 				agent={agent}
 				isConnected={isConnected}
-				compactionStatus={compactionStatus}
 				retryStatus={activeRetryStatus}
+				providerErrors={turnProviderErrors}
 				onForkFromTurn={
 					onForkFromTurn
 						? () => onForkFromTurn(turn.turnId)
@@ -1122,18 +1102,6 @@ export function ChatView({
 						? (text) => onEditUserMessage(turn.userMessage.info.id, text)
 						: undefined
 				}
-				onDeletePart={onDeletePart}
-				onImplementPlan={
-					onSendMessage
-						? () => {
-								appStore.set(collaborationModeFamily(agent.sessionId), "build")
-								void onSendMessage(agent, "Implement Plan", { collaborationMode: "build" })
-							}
-						: undefined
-				}
-				onRevisePlan={() => {
-					appStore.set(collaborationModeFamily(agent.sessionId), "plan")
-				}}
 			/>
 			{index === forkBoundaryAfterIndex ? (
 				<ForkBoundaryDivider
@@ -1148,18 +1116,17 @@ export function ChatView({
 		[
 			agent,
 			effectivePermission,
-			compactionStatus,
 			forkBoundaryAfterIndex,
 			handleApprovePermission,
 			handleDenyPermission,
 			isConnected,
 			isWorking,
 			latestEditableUserTurnIndex,
-			onDeletePart,
 			onForkFromTurn,
 			onEditUserMessage,
 			onSendMessage,
 			parentSessionName,
+			lastTurnProviderErrors,
 			retryStatus,
 			turns,
 		],
@@ -1183,6 +1150,7 @@ export function ChatView({
 				<Conversation
 					key={agent.sessionId}
 					className="h-full"
+					streaming={isWorking}
 					targetScrollTop={conversationTargetScrollTop}
 				>
 					<ScrollOnLoad loading={loading} sessionId={agent.sessionId} isActive={isActive} />
@@ -1191,9 +1159,9 @@ export function ChatView({
 					<ScrollBridge scrollRef={scrollRef} />
 					<ConversationContent
 						scrollClassName="scrollbar-chat"
-						className="gap-12 px-6 pt-4 pb-[calc(var(--chat-composer-inset)+1rem)] sm:px-10 sm:pt-8 sm:pb-[calc(var(--chat-composer-inset)+1.5rem)] lg:px-12"
+						className="gap-12 px-6 pt-4 pb-4 sm:px-10 sm:pt-8 sm:pb-6 lg:px-12"
 					>
-						<div className={cn(contentWidthClass, "animate-in fade-in space-y-12 duration-150")}>
+						<div className={cn(contentWidthClass, "animate-in fade-in space-y-6 duration-150")}>
 							<LoadEarlierOnScroll
 								hasEarlierMessages={hasEarlierMessages}
 								loadingEarlier={loadingEarlier}
@@ -1241,15 +1209,23 @@ export function ChatView({
 								</div>
 							))}
 
-							{/* Session-level error from session.error events */}
+							{/* Session-level error when no turn-scoped expandable rows exist */}
 							{showSessionError && sessionErrorText && (
-								<div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
-									{sessionErrorText}
+								<div className="py-0.5">
+									<ProviderErrorRow
+										entry={{
+											id: "session-error",
+											turnId: "",
+											message: sessionErrorText,
+											phase: "failed",
+											code: sessionError?.name,
+										}}
+									/>
 								</div>
 							)}
 						</div>
 					</ConversationContent>
-					<ConversationScrollButton className="!bottom-[calc(var(--chat-composer-inset)+1rem)]" />
+					<ConversationScrollButton className="!bottom-3" />
 				</Conversation>
 
 				{/* Top fade */}
@@ -1262,7 +1238,7 @@ export function ChatView({
 				<div
 					data-slot="scroll-fade"
 					aria-hidden="true"
-					className="pointer-events-none absolute inset-x-0 bottom-[var(--chat-composer-inset)] z-10 h-6 bg-gradient-to-t from-background/30 to-transparent"
+					className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-6 bg-gradient-to-t from-background/30 to-transparent"
 				/>
 			</div>
 			) : null}
@@ -1274,9 +1250,9 @@ export function ChatView({
 				>
 					<ChatInputSection
 						agent={agent}
-						turns={turns}
 						isConnected={isConnected}
 						isWorking={isWorking}
+						recoveryState={recoveryState}
 						onSendMessage={onSendMessage}
 						onStop={onStop}
 						providers={providers}
@@ -1306,9 +1282,9 @@ export function ChatView({
 
 interface ChatInputSectionProps {
 	agent: Agent
-	turns: ChatTurn[]
 	isConnected: boolean
 	isWorking: boolean
+	recoveryState?: ReturnType<typeof useTurnRecovery>
 	onSendMessage?: ChatViewProps["onSendMessage"]
 	onStop?: ChatViewProps["onStop"]
 	providers?: ProvidersData | null
@@ -1338,8 +1314,8 @@ interface ChatInputSectionProps {
 }
 
 export function ChatInputSection({
+	recoveryState,
 	agent,
-	turns,
 	isConnected,
 	isWorking,
 	onSendMessage,
@@ -1363,6 +1339,7 @@ export function ChatInputSection({
 	const [activeTrigger, setActiveTrigger] = useState<ComposerTrigger | null>(null)
 	const [activeGoal, setActiveGoal] = useState<ComposerGoal | null>(null)
 	const [goalAction, setGoalAction] = useState<ComposerGoalAction | null>(null)
+	const [modelPickerOpen, setModelPickerOpen] = useState(false)
 	const [skillPickerOpen, setSkillPickerOpen] = useState(false)
 	const {
 		queueItems,
@@ -1395,7 +1372,7 @@ export function ChatInputSection({
 		if (!agent.directory) return null
 		const client = getProjectClient(agent.directory)
 		if (!client?.goal?.status) return null
-		const result = await client.goal.status({ sessionID: agent.sessionId })
+		const result = await client.goal.status({ sessionId: agent.sessionId })
 		return normalizeComposerGoal(result.data)
 	}, [agent.directory, agent.sessionId])
 
@@ -1506,7 +1483,7 @@ export function ChatInputSection({
 	const interruptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
 	// Per-session composer settings (model / variant / agent).
-	const sessionMessages = useAtomValue(messagesFamily(agent.sessionId))
+	const sessionMessages = useAtomValue(itemsFamily(agent.sessionId))
 	const projectModels = useAtomValue(projectModelsAtom)
 	const composerState = useAtomValue(sessionComposerFamily(agent.sessionId))
 	const setComposerState = useSetAtom(setSessionComposerAtom)
@@ -1573,7 +1550,7 @@ export function ChatInputSection({
 		})
 		const next = hydrateSessionComposerState(
 			composerState,
-			sessionMessages,
+			sessionMessages.length,
 			projectDefault,
 			sessionSeed,
 		)
@@ -1738,7 +1715,7 @@ export function ChatInputSection({
 			// been logged — callers await this to order the flush ahead of a
 			// turn without taking on error handling.
 			return Promise.resolve()
-				.then(() => updateSettings.call(client.session, { sessionID: agent.sessionId, ...pending }))
+				.then(() => updateSettings.call(client.session, { sessionId: agent.sessionId, ...pending }))
 				.then(() => {
 					if (pending.permissionProfile) {
 						permissionProfileDirtyRef.current = false
@@ -1837,7 +1814,7 @@ export function ChatInputSection({
 		if (!client?.goal?.pause) return
 		setGoalAction("pause")
 		try {
-			const result = await client.goal.pause({ sessionID: agent.sessionId })
+			const result = await client.goal.pause({ sessionId: agent.sessionId })
 			setActiveGoal(normalizeComposerGoal(result.data))
 		} catch (err) {
 			log.error("goal.pause failed", { sessionId: agent.sessionId }, err)
@@ -1852,7 +1829,7 @@ export function ChatInputSection({
 		if (!client?.goal?.resume) return
 		setGoalAction("resume")
 		try {
-			const result = await client.goal.resume({ sessionID: agent.sessionId })
+			const result = await client.goal.resume({ sessionId: agent.sessionId })
 			setActiveGoal(normalizeComposerGoal(result.data))
 		} catch (err) {
 			log.error("goal.resume failed", { sessionId: agent.sessionId }, err)
@@ -1867,7 +1844,7 @@ export function ChatInputSection({
 		if (!client?.goal?.clear) return
 		setGoalAction("clear")
 		try {
-			await client.goal.clear({ sessionID: agent.sessionId })
+			await client.goal.clear({ sessionId: agent.sessionId })
 			setActiveGoal(null)
 		} catch (err) {
 			log.error("goal.clear failed", { sessionId: agent.sessionId }, err)
@@ -1893,7 +1870,7 @@ export function ChatInputSection({
 						if (client) {
 							try {
 								await client.session.summarize({
-									sessionID: agent.sessionId,
+									sessionId: agent.sessionId,
 								})
 							} catch (err) {
 								log.error("session.summarize failed", { sessionId: agent.sessionId }, err)
@@ -1923,6 +1900,9 @@ export function ChatInputSection({
 					return true
 				case "plan":
 					changeCollaborationMode("plan")
+					return true
+				case "model":
+					setModelPickerOpen(true)
 					return true
 				case "skills":
 					setSkillPickerOpen(true)
@@ -1967,7 +1947,7 @@ export function ChatInputSection({
 			// overwrite the persisted per-session choice.
 			await flushSelectionPersist()
 			await client.session.promptAsync({
-				sessionID: agent.sessionId,
+				sessionId: agent.sessionId,
 				parts,
 				model: selectedModel
 					? { providerID: selectedModel.providerID, modelID: selectedModel.modelID }
@@ -2006,7 +1986,7 @@ export function ChatInputSection({
 				sending,
 				sessionId: agent.sessionId,
 			})
-			if (!text.trim() || (!onSendMessage && !activeTrigger) || sending) {
+			if (recoveryState?.recovery || recoveryState?.pending || !text.trim() || (!onSendMessage && !activeTrigger) || sending) {
 				log.warn("handleSend bailed", {
 					emptyText: !text.trim(),
 					noOnSendMessage: !onSendMessage,
@@ -2092,11 +2072,13 @@ export function ChatInputSection({
 				})
 			} catch (err) {
 				log.error("handleSend failed", { sessionId: agent.sessionId }, err)
+				throw err // PromptInput retains the text and attachments when submission rejects.
 			} finally {
 				setSending(false)
 			}
 		},
 		[
+			recoveryState,
 			onSendMessage,
 			sending,
 			agent,
@@ -2122,7 +2104,7 @@ export function ChatInputSection({
 			: "Queue a follow-up…"
 		: "What would you like to do?"
 
-	const canSend = isConnected && !sending
+	const canSend = isConnected && !sending && !recoveryState?.recovery && !recoveryState?.pending
 
 	const handleStop = useCallback(() => {
 		if (onStop && isWorking) {
@@ -2367,7 +2349,8 @@ export function ChatInputSection({
 											handleSend(message.text, message.files.length > 0 ? message.files : undefined)
 									}}
 								>
-									<ComposerStatusStack
+									{recoveryState && <TurnRecoveryPanel state={recoveryState} />}
+                                    <ComposerStatusStack
 										goal={activeGoal}
 										goalAction={goalAction}
 										queueItems={queueItems}
@@ -2404,14 +2387,16 @@ export function ChatInputSection({
 									/>
 
 									{/* Toolbar inside the card — agent + model + variant selectors + submit */}
-									<PromptInputFooter>
+									<PromptInputFooter className="flex-wrap">
 										<PromptInputTools>
 											<AttachButton disabled={!isConnected} />
-											<ComposerPermissionPicker
-												value={permissionProfile}
-												onChange={handlePermissionProfileChange}
-												disabled={!isConnected}
-											/>
+											{PERMISSION_PICKER_ENABLED && (
+												<ComposerPermissionPicker
+													value={permissionProfile}
+													onChange={handlePermissionProfileChange}
+													disabled={!isConnected}
+												/>
+											)}
 											{collaborationMode === "plan" && (
 												<ComposerModeChip
 													variant="plan"
@@ -2437,15 +2422,13 @@ export function ChatInputSection({
 												effectiveModel={effectiveModel}
 												hasModelOverride={!!selectedModel}
 												onSelectModel={handleModelSelect}
+												modelPickerOpen={modelPickerOpen}
+												onModelPickerOpenChange={setModelPickerOpen}
 												selectedVariant={selectedVariant}
 												onSelectVariant={handleVariantSelect}
 												disabled={!isConnected}
 											/>
-											<PromptInputSubmit
-												disabled={!canSend}
-												status={isWorking ? "streaming" : undefined}
-												onStop={handleStop}
-											/>
+											<ComposerSubmitControls isWorking={isWorking} isConnected={isConnected} canSend={canSend} onStop={handleStop} />
 										</div>
 									</PromptInputFooter>
 								</PromptInput>

@@ -157,11 +157,32 @@ impl WebSocketServerClient {
         self.core.provider_upsert(params).await
     }
 
+    pub async fn provider_disconnect(
+        &mut self,
+        params: devo_protocol::native::rpc_admin::ProviderDisconnectParams,
+    ) -> Result<devo_protocol::native::rpc_admin::ProviderDisconnectResult> {
+        self.core.provider_disconnect(params).await
+    }
+
+    pub async fn provider_model_remove(
+        &mut self,
+        params: devo_protocol::native::rpc_admin::ProviderModelRemoveParams,
+    ) -> Result<devo_protocol::native::rpc_admin::ProviderModelRemoveResult> {
+        self.core.provider_model_remove(params).await
+    }
+
     pub async fn provider_validate(
         &mut self,
         params: devo_protocol::native::rpc_admin::ProviderValidateParams,
     ) -> Result<devo_protocol::native::rpc_admin::ProviderValidateResult> {
         self.core.provider_validate(params).await
+    }
+
+    pub async fn provider_discover(
+        &mut self,
+        params: devo_protocol::native::rpc_admin::ProviderDiscoverParams,
+    ) -> Result<devo_protocol::native::rpc_admin::ProviderDiscoverResult> {
+        self.core.provider_discover(params).await
     }
 
     pub async fn command_exec(&mut self, params: CommandExecParams) -> Result<CommandExecResult> {
@@ -216,11 +237,11 @@ impl WebSocketServerClient {
         self.core.session_queue_remove(params).await
     }
 
-    pub async fn session_queue_steer(
+    pub async fn turn_steer(
         &mut self,
-        params: native::rpc_turn::SessionQueueSteerParams,
-    ) -> Result<native::rpc_turn::SessionQueueSteerResult> {
-        self.core.session_queue_steer(params).await
+        params: native::rpc_turn::TurnSteerParams,
+    ) -> Result<native::rpc_turn::TurnSteerResult> {
+        self.core.turn_steer(params).await
     }
 
     pub async fn subscription_create(

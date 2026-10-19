@@ -32,12 +32,14 @@ pub enum PermissionMode {
 pub enum PermissionPreset {
     /// Read and edit workspace files and run shell commands; network and outside
     /// workspace writes ask.
-    #[default]
     Default,
     /// Same base policy as default, but eligible approvals may be routed through
     /// an automatic reviewer before the user is interrupted.
     AutoReview,
     /// Allow all tool requests without approval.
+    /// Temporarily the product default while OS sandboxing is disabled; move
+    /// `#[default]` back to `Default` to re-enable the asking default.
+    #[default]
     FullAccess,
 }
 
@@ -643,6 +645,8 @@ pub struct PolicySnapshot {
 }
 
 /// Asynchronous permission policy contract used by the runtime.
+// `async_trait` expands the method to a boxed future that is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PermissionPolicy: Send + Sync {
     /// Produces the permission decision for one request within one policy snapshot.

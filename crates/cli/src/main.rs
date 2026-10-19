@@ -3,8 +3,8 @@
 //!
 //! This binary owns command-line parsing, startup update checks, logging
 //! bootstrap, and final exit messages. Long-lived runtime behavior is delegated
-//! to the server, TUI, and core crates so CLI changes stay focused on process
-//! orchestration and display.
+//! to the server, InteractiveMode client, and core crates so CLI changes stay
+//! focused on process orchestration and display.
 
 use anyhow::Result;
 use clap::Parser;
@@ -29,12 +29,16 @@ use devo_util_paths::find_devo_home;
 use tracing_subscriber::filter::LevelFilter;
 
 mod agent_command;
+mod app_exit;
 mod doctor_command;
 mod mcp_command;
 mod prompt_command;
+mod prompt_host;
 mod upgrade_command;
 
+use agent_command::launch_interactive_mode_client;
 use agent_command::run_agent;
+use app_exit::AppExit;
 use doctor_command::run_doctor;
 use mcp_command::McpCommand;
 use mcp_command::run_mcp;
@@ -98,7 +102,7 @@ fn format_with_separators(value: usize) -> String {
     out
 }
 
-fn format_token_usage_line(exit: &devo_tui::AppExit, color_enabled: bool) -> Option<String> {
+fn format_token_usage_line(exit: &AppExit, color_enabled: bool) -> Option<String> {
     let total = exit.total_tokens;
     let non_cached_input = exit
         .total_input_tokens
@@ -140,12 +144,12 @@ fn format_token_usage_line(exit: &devo_tui::AppExit, color_enabled: bool) -> Opt
     ))
 }
 
-fn exit_messages(exit: &devo_tui::AppExit, color_enabled: bool) -> Vec<String> {
+fn exit_messages(exit: &AppExit, color_enabled: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(line) = format_token_usage_line(exit, color_enabled) {
         lines.push(line);
     }
-    if let Some(session_id) = exit.session_id {
+    if let Some(ref session_id) = exit.session_id {
         let command = format!("devo resume {session_id}");
         let command = if color_enabled {
             format!("\u{1b}[1;36m{command}\u{1b}[0m")
@@ -162,50 +166,11 @@ fn exit_messages(exit: &devo_tui::AppExit, color_enabled: bool) -> Vec<String> {
     lines
 }
 
-fn onboarding_exit_messages(exit: &devo_tui::AppExit, color_enabled: bool) -> Vec<String> {
-    if !exit.onboarding_completed {
-        return Vec::new();
-    }
-    let complete = if color_enabled {
-        "\u{1b}[1;32mConfiguration complete\u{1b}[0m".to_string()
-    } else {
-        "Configuration complete".to_string()
-    };
-    let command = if color_enabled {
-        "\u{1b}[1;36mdevo\u{1b}[0m".to_string()
-    } else {
-        "devo".to_string()
-    };
-    vec![
-        complete,
-        String::new(),
-        "Next step:".to_string(),
-        format!("  {command}"),
-    ]
-}
-
 async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     let log_level = cli.log_level.map(|level| level.to_string());
 
     match &cli.command {
-        Some(Command::Onboard) => {
-            // Resolve logging config early, install the process-wide file subscriber,
-            // and keep its non-blocking writer guard alive for the command lifetime.
-            let _logging = install_logging(&cli)?;
-            let exit = run_agent(
-                /*force_onboarding*/ true,
-                /*exit_after_onboarding*/ true,
-                log_level.as_deref(),
-                None,
-                cli.dangerously_skip_permissions,
-            )
-            .await?;
-            for line in onboarding_exit_messages(&exit, /*color_enabled*/ true) {
-                println!("{line}");
-            }
-            Ok(())
-        }
         Some(Command::Prompt { input, format }) => {
             maybe_print_startup_update(&cli).await;
             let _logging = install_logging(&cli)?;
@@ -224,8 +189,6 @@ async fn run_cli() -> Result<()> {
             maybe_print_startup_update(&cli).await;
             let _logging = install_logging(&cli)?;
             let exit = run_agent(
-                /*force_onboarding*/ false,
-                /*exit_after_onboarding*/ false,
                 log_level.as_deref(),
                 Some(*session_id),
                 cli.dangerously_skip_permissions,
@@ -253,12 +216,15 @@ async fn run_cli() -> Result<()> {
         None => {
             maybe_print_startup_update(&cli).await;
             let _logging = install_logging(&cli)?;
-            tracing::info!("default interactive command starting");
+            if std::env::var_os("DEVO_TUI").is_some_and(|v| v == "legacy" || v == "tui") {
+                anyhow::bail!(
+                    "DEVO_TUI=legacy is no longer supported; crates/tui was removed. Use InteractiveMode (default) or DEVO_TUI=interactive-mode (apps/tui)."
+                );
+            }
+            tracing::info!("launching InteractiveMode client (product TUI)");
             let exit = run_agent(
-                /*force_onboarding*/ false,
-                /*exit_after_onboarding*/ false,
                 log_level.as_deref(),
-                None,
+                /*initial_session_id*/ None,
                 cli.dangerously_skip_permissions,
             )
             .await?;
@@ -278,6 +244,32 @@ async fn run_cli() -> Result<()> {
 
 fn direct_server_early_dispatch() -> devo_arg0::EarlyDispatch {
     let args: Vec<String> = std::env::args().collect();
+    // One-shot Windows sandbox provisioning: `devo sandbox-setup` pops the
+    // UAC consent and provisions the sandbox accounts/firewall/ACLs so the
+    // RLM kernel fence can be raised (design doc §5.3 setup entry).
+    if args.get(1).is_some_and(|arg| arg == "sandbox-setup") {
+        #[cfg(windows)]
+        {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let devo_home = devo_util_paths::find_devo_home().unwrap_or_else(|_| {
+                // Fall back to ~/.devo; setup writes the marker there.
+                std::env::var_os("USERPROFILE")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join(".devo")
+            });
+            match devo_windows_sandbox::request_default_sandbox_setup(&devo_home, &cwd) {
+                Ok(()) => {
+                    println!("Windows sandbox setup complete. Run devo to start a session.");
+                    return devo_arg0::EarlyDispatch::Handled(Ok(()));
+                }
+                Err(error) => {
+                    eprintln!("windows sandbox setup failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     match devo_windows_sandbox::run_as_windows_sandbox_if_requested(&args) {
         Ok(true) => {
             // The helper exits the process on success; reaching here is unexpected.
@@ -304,8 +296,7 @@ fn server_process_args_from_cli(cli: &Cli) -> Option<ServerProcessArgs> {
             status: *status,
             shutdown: *shutdown,
         }),
-        Some(Command::Onboard)
-        | Some(Command::Resume { .. })
+        Some(Command::Resume { .. })
         | Some(Command::Prompt { .. })
         | Some(Command::Doctor)
         | Some(Command::Mcp { .. })
@@ -316,8 +307,6 @@ fn server_process_args_from_cli(cli: &Cli) -> Option<ServerProcessArgs> {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Launch the interactive onboarding flow to configure a model provider.
-    Onboard,
     /// Resume a saved interactive session by id.
     Resume {
         /// Session identifier printed by Devo at exit time.
@@ -431,6 +420,16 @@ fn cli_logging_overrides(cli: &Cli) -> toml::Value {
     )]))
 }
 
+/// Launch helper re-exported for tests / clarity — implementation lives in
+/// [`agent_command::launch_interactive_mode_client`].
+#[allow(dead_code)]
+fn launch_interactive_mode_client_for_tests() -> Result<()> {
+    launch_interactive_mode_client(
+        /*resume_session_id*/ None, /*dangerously_skip_permissions*/ false,
+        /*log_level*/ None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -439,6 +438,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tracing_subscriber::filter::LevelFilter;
 
+    use super::AppExit;
     use super::Cli;
     use super::Command;
     use super::McpCommand;
@@ -447,7 +447,6 @@ mod tests {
     use super::exit_messages;
     use super::format_token_usage_line;
     use super::mcp_command::McpTransportKind;
-    use super::onboarding_exit_messages;
 
     #[test]
     fn cli_parses_supported_log_levels() {
@@ -485,7 +484,7 @@ mod tests {
     #[test]
     fn cli_parses_yolo_alias_on_resume_subcommand() {
         let session_id = SessionId::new();
-        let cli = Cli::try_parse_from(["devo", "resume", &session_id.to_string(), "--yolo"])
+        let cli = Cli::try_parse_from(["devo", "resume", session_id.as_ref(), "--yolo"])
             .expect("parse resume with yolo");
 
         assert!(matches!(cli.command, Some(Command::Resume { .. })));
@@ -538,12 +537,6 @@ mod tests {
                 dangerously_skip_permissions: false,
             },
             Cli {
-                command: Some(Command::Onboard),
-                model: None,
-                log_level: None,
-                dangerously_skip_permissions: false,
-            },
-            Cli {
                 command: Some(Command::Prompt {
                     input: "hello".to_string(),
                     format: PromptOutputFormat::Text,
@@ -554,10 +547,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                matches!(
-                    cli.command,
-                    None | Some(Command::Onboard) | Some(Command::Prompt { .. })
-                ),
+                matches!(cli.command, None | Some(Command::Prompt { .. })),
                 true
             );
         }
@@ -584,17 +574,11 @@ mod tests {
         };
 
         assert_eq!(
-            matches!(
-                doctor.command,
-                None | Some(Command::Onboard) | Some(Command::Prompt { .. })
-            ),
+            matches!(doctor.command, None | Some(Command::Prompt { .. })),
             false
         );
         assert_eq!(
-            matches!(
-                server.command,
-                None | Some(Command::Onboard) | Some(Command::Prompt { .. })
-            ),
+            matches!(server.command, None | Some(Command::Prompt { .. })),
             false
         );
     }
@@ -603,7 +587,7 @@ mod tests {
     fn cli_parses_resume_subcommand() {
         let session_id = SessionId::new();
         let cli =
-            Cli::try_parse_from(["devo", "resume", &session_id.to_string()]).expect("parse resume");
+            Cli::try_parse_from(["devo", "resume", session_id.as_ref()]).expect("parse resume");
 
         match cli.command {
             Some(Command::Resume { session_id: actual }) => assert_eq!(actual, session_id),
@@ -878,9 +862,8 @@ mod tests {
     #[test]
     fn exit_messages_includes_usage_and_resume_hint() {
         let session_id = SessionId::new();
-        let exit = devo_tui::AppExit {
+        let exit = AppExit {
             session_id: Some(session_id),
-            onboarding_completed: false,
             turn_count: 1,
             total_input_tokens: 10,
             total_output_tokens: 2,
@@ -902,9 +885,8 @@ mod tests {
     #[test]
     fn colorized_exit_messages_include_ansi_sequences() {
         let session_id = SessionId::new();
-        let exit = devo_tui::AppExit {
+        let exit = AppExit {
             session_id: Some(session_id),
-            onboarding_completed: false,
             turn_count: 1,
             total_input_tokens: 10,
             total_output_tokens: 2,
@@ -921,9 +903,8 @@ mod tests {
 
     #[test]
     fn exit_usage_uses_accumulated_display_total() {
-        let exit = devo_tui::AppExit {
+        let exit = AppExit {
             session_id: Some(SessionId::new()),
-            onboarding_completed: false,
             turn_count: 1,
             total_input_tokens: 10,
             total_output_tokens: 2,
@@ -938,66 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_exit_messages_include_next_step_after_success() {
-        let session_id = SessionId::new();
-        let exit = devo_tui::AppExit {
-            session_id: Some(session_id),
-            onboarding_completed: true,
-            turn_count: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_tokens: 0,
-            total_cache_read_tokens: 0,
-        };
-
-        let lines = onboarding_exit_messages(&exit, /*color_enabled*/ false);
-
-        assert_eq!(
-            lines,
-            vec![
-                "Configuration complete".to_string(),
-                String::new(),
-                "Next step:".to_string(),
-                "  devo".to_string(),
-            ]
-        );
-        assert_eq!(lines.iter().any(|line| line.contains("devo resume")), false);
-    }
-
-    #[test]
-    fn onboarding_exit_messages_are_empty_without_success() {
-        let session_id = SessionId::new();
-        let exit = devo_tui::AppExit {
-            session_id: Some(session_id),
-            onboarding_completed: false,
-            turn_count: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_tokens: 0,
-            total_cache_read_tokens: 0,
-        };
-
-        assert_eq!(
-            onboarding_exit_messages(&exit, /*color_enabled*/ false),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn colorized_onboarding_exit_messages_include_ansi_sequences() {
-        let exit = devo_tui::AppExit {
-            session_id: None,
-            onboarding_completed: true,
-            turn_count: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_tokens: 0,
-            total_cache_read_tokens: 0,
-        };
-
-        let lines = onboarding_exit_messages(&exit, /*color_enabled*/ true);
-
-        assert!(lines[0].contains("\u{1b}["));
-        assert!(lines[3].contains("\u{1b}["));
+    fn removed_onboard_command_is_rejected() {
+        assert!(Cli::try_parse_from(["devo", "onboard"]).is_err());
     }
 }

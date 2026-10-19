@@ -34,6 +34,8 @@ import {
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { sessionMetricsFamily } from "../atoms/derived/session-metrics"
+import { setSessionsAtom } from "../atoms/sessions"
+import { appStore } from "../atoms/store"
 import { automationsEnabledAtom, toggleAutomationsAtom } from "../atoms/feature-flags"
 import { isMockModeAtom, toggleMockModeAtom } from "../atoms/mock-mode"
 import { lastProjectDirectoryAtom, opaqueWindowsAtom } from "../atoms/preferences"
@@ -50,9 +52,10 @@ import {
 import { createLogger } from "../lib/logger"
 import { formatShortcut } from "../lib/shortcut-display"
 import { navigateToNewChat } from "../lib/project-selection"
+import { shouldToggleCommandPalette } from "./root-layout-keyboard"
 import type { ColorScheme } from "../lib/themes"
 import type { Agent } from "../lib/types"
-import { reloadConfig } from "../services/connection-manager"
+import { getBaseClient, reloadConfig } from "../services/connection-manager"
 
 interface CommandPaletteProps {
 	open: boolean
@@ -98,6 +101,9 @@ export function CommandPalette({ open, onOpenChange, agents, onForkSession }: Co
 	const automationsEnabled = useAtomValue(automationsEnabledAtom)
 	const toggleAutomations = useSetAtom(toggleAutomationsAtom)
 	const [reloading, setReloading] = useState(false)
+	const [query, setQuery] = useState("")
+	const [searching, setSearching] = useState(false)
+	const [searchFailed, setSearchFailed] = useState(false)
 	const newSessionShortcut = formatShortcut(["mod", "N"])
 	const undoShortcut = formatShortcut(["mod", "Z"])
 	const redoShortcut = formatShortcut(["shift", "mod", "Z"])
@@ -136,7 +142,7 @@ export function CommandPalette({ open, onOpenChange, agents, onForkSession }: Co
 
 	useEffect(() => {
 		function handleKeyDown(e: KeyboardEvent) {
-			if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
+			if (shouldToggleCommandPalette(e, open)) {
 				e.preventDefault()
 				onOpenChange(!open)
 			}
@@ -144,6 +150,42 @@ export function CommandPalette({ open, onOpenChange, agents, onForkSession }: Co
 		document.addEventListener("keydown", handleKeyDown)
 		return () => document.removeEventListener("keydown", handleKeyDown)
 	}, [open, onOpenChange])
+
+	// Sidebar pagination must not limit the conversations searchable here.
+	useEffect(() => {
+		const search = query.trim()
+		if (!open || search.length < 2) {
+			setSearching(false)
+			setSearchFailed(false)
+			if (!open) setQuery("")
+			return
+		}
+		let cancelled = false
+		setSearching(true)
+		setSearchFailed(false)
+		const timeout = window.setTimeout(async () => {
+			try {
+				const client = getBaseClient()
+				if (!client) throw new Error("Not connected to the server")
+				const { data: sessions } = await client.session.list({ search, limit: 50 })
+				if (!cancelled) {
+					// Preserve existing live statuses and sidebar pagination state.
+					appStore.set(setSessionsAtom, { sessions, statuses: {}, directory: "" })
+				}
+			} catch (err) {
+				if (!cancelled) {
+					setSearchFailed(true)
+					log.error("Session search failed", {}, err)
+				}
+			} finally {
+				if (!cancelled) setSearching(false)
+			}
+		}, 250)
+		return () => {
+			cancelled = true
+			window.clearTimeout(timeout)
+		}
+	}, [open, query])
 
 	const activeSessions = useMemo(
 		() => (open ? agents.filter((a) => a.status === "running" || a.status === "waiting") : []),
@@ -157,11 +199,13 @@ export function CommandPalette({ open, onOpenChange, agents, onForkSession }: Co
 		<CommandDialog
 			open={open}
 			onOpenChange={onOpenChange}
-			className="w-[calc(100%-2rem)] sm:max-w-2xl"
+			className="devo-command-palette w-[calc(100%-2rem)] sm:max-w-2xl"
 		>
-			<CommandInput placeholder="Type a command or search..." />
+			<CommandInput placeholder="Type a command or search..." value={query} onValueChange={setQuery} />
 			<CommandList className="max-h-[min(32rem,60vh)]">
-				<CommandEmpty>No results found.</CommandEmpty>
+				<CommandEmpty>
+					{searching ? "Searching sessions…" : searchFailed ? "Session search failed. Try again." : "No results found."}
+				</CommandEmpty>
 
 				<CommandGroup heading="Actions">
 					<CommandItem
@@ -335,6 +379,8 @@ export function CommandPalette({ open, onOpenChange, agents, onForkSession }: Co
 							{activeSessions.map((agent) => (
 								<CommandItem
 									key={agent.id}
+									value={`active-session:${agent.id}`}
+									keywords={[agent.name, agent.project]}
 									onSelect={() => {
 										navigate({
 											to: "/project/$projectSlug/session/$sessionId",
@@ -365,6 +411,8 @@ export function CommandPalette({ open, onOpenChange, agents, onForkSession }: Co
 							{agents.map((agent) => (
 								<CommandItem
 									key={agent.id}
+									value={`session:${agent.id}`}
+									keywords={[agent.name, agent.project]}
 									onSelect={() => {
 										navigate({
 											to: "/project/$projectSlug/session/$sessionId",

@@ -58,13 +58,32 @@ export function defaultCwd(): string {
 
 let sharedIpcTransport: DevoNativeTransport | null = null
 
+/** Must match `DEVO_NATIVE_IPC_ERROR` in apps/desktop/src/shared/native-ipc-error.ts */
+const DEVO_NATIVE_IPC_ERROR = "$devoNativeError"
+
+function throwIfNativeIpcError(result: unknown): void {
+	if (!result || typeof result !== "object") return
+	const envelope = (result as Record<string, unknown>)[DEVO_NATIVE_IPC_ERROR]
+	if (!envelope || typeof envelope !== "object") return
+	const record = envelope as Record<string, unknown>
+	const error = new Error(
+		typeof record.message === "string" ? record.message : "Devo Native request failed",
+	) as Error & { code?: string }
+	if (typeof record.code === "string") error.code = record.code
+	throw error
+}
+
 export function createIpcTransport(): DevoNativeTransport {
 	if (sharedIpcTransport) return sharedIpcTransport
 
 	const api = globalThis.window?.devo?.native
 	if (!api) throw new Error("window.devo.native is not available")
 	sharedIpcTransport = {
-		request: (method, params, directory) => api.request({ method, params, directory }),
+		request: async (method, params, directory) => {
+			const result = await api.request({ method, params, directory })
+			throwIfNativeIpcError(result)
+			return result
+		},
 		notify: (method, params, directory) => api.notify({ method, params, directory }),
 		respond: (id, result) => api.respond({ id, result }),
 		subscribe: (listener) => api.subscribe(listener),
@@ -172,7 +191,7 @@ export function partTime(
 }
 
 export function toolCallIdFromUpdate(update: Record<string, unknown>, now: number): string {
-	return String(update.toolCallId ?? update.callID ?? update.id ?? `tool-${now}`)
+	return String(update.toolCallId ?? update.callId ?? update.id ?? `tool-${now}`)
 }
 
 export function toolPartFromUpdate(
@@ -182,7 +201,12 @@ export function toolPartFromUpdate(
 	now: number,
 ): any {
 	const toolCallId = toolCallIdFromUpdate(update, now)
-	const messageID = `tool-${toolCallId}`
+	const itemId =
+		typeof update.itemId === "string" && update.itemId
+			? update.itemId
+			: typeof existingPart?.itemId === "string" && existingPart.itemId
+				? existingPart.itemId
+				: `tool-${toolCallId}`
 	const legacyContent = Array.isArray(update.content) ? update.content : undefined
 	const legacyLocations = Array.isArray(update.locations) ? update.locations : undefined
 	const incomingInput = objectFromValue(update.rawInput ?? update.input)
@@ -218,11 +242,11 @@ export function toolPartFromUpdate(
 							time: { ...time, end: time.end ?? now },
 						}
 	return {
-		id: `${messageID}-part`,
-		sessionID: sessionId,
-		messageID,
+		id: `${itemId}-part`,
+		sessionId: sessionId,
+		itemId,
 		type: "tool",
-		callID: toolCallId,
+		callId: toolCallId,
 		tool,
 		state,
 	}
@@ -267,11 +291,11 @@ export function statusFromDevo(status?: string): any {
 	}
 }
 
-export function sessionErrorEvent(sessionID: string, error: unknown): any {
+export function sessionErrorEvent(sessionId: string, error: unknown): any {
 	return {
 		type: "session.error",
 		properties: {
-			sessionID,
+			sessionId,
 			error: {
 				name: "Error",
 				data: { message: error instanceof Error ? error.message : String(error) },
@@ -303,7 +327,7 @@ function resolvedToolName(
 	if (kind) return toolNameFromUpdateKind(kind, input)
 
 	const existingTool = stringFromValue(existingPart?.tool)
-	if (existingTool && existingTool !== toolCallId && existingTool !== existingPart?.callID) {
+	if (existingTool && existingTool !== toolCallId && existingTool !== existingPart?.callId) {
 		return existingTool
 	}
 
@@ -321,7 +345,7 @@ function resolvedToolTitle(
 	if (title) return title
 
 	const existingTitle = stringFromValue(existingPart?.state?.title)
-	if (existingTitle && existingTitle !== toolCallId && existingTitle !== existingPart?.callID) {
+	if (existingTitle && existingTitle !== toolCallId && existingTitle !== existingPart?.callId) {
 		return existingTitle
 	}
 
@@ -340,11 +364,23 @@ function toolNameFromUpdateKind(kind: string, input: Record<string, unknown>): s
 		case "apply_patch":
 			return kind === "apply_patch" ? "apply_patch" : "edit"
 		case "search":
+		case "grep":
 			return "grep"
+		case "glob":
+		case "find":
+		case "list":
+			return kind === "list" ? "list" : "glob"
 		case "execute":
-			return "bash"
+		case "bash":
+		case "shell_command":
+		case "exec_command":
+		case "write_stdin":
+			return kind === "execute" ? "bash" : kind
 		case "fetch":
+		case "webfetch":
 			return "webfetch"
+		case "skill":
+			return "skill"
 		case "think":
 			return "think"
 		case "question":
@@ -372,15 +408,38 @@ function inferToolNameFromInput(input: Record<string, unknown>, title?: string):
 		return "read"
 	}
 	const normalizedTitle = title?.trim().toLowerCase()
-	if (normalizedTitle?.startsWith("read")) return "read"
-	if (normalizedTitle?.startsWith("edit") || normalizedTitle?.startsWith("patch")) return "edit"
-	if (normalizedTitle?.startsWith("write")) return "write"
-	if (normalizedTitle?.startsWith("search")) return "grep"
-	if (normalizedTitle?.startsWith("fetch")) return "webfetch"
-	if (normalizedTitle?.startsWith("run") || normalizedTitle?.startsWith("execute")) return "bash"
-	if (normalizedTitle === "question" || normalizedTitle === "request_user_input") {
-		return "request_user_input"
+	if (!normalizedTitle) return "tool"
+	switch (normalizedTitle) {
+		case "grep":
+			return "grep"
+		case "glob":
+		case "find":
+			return "glob"
+		case "list":
+			return "list"
+		case "bash":
+		case "shell":
+		case "shell_command":
+		case "exec_command":
+		case "write_stdin":
+			return normalizedTitle === "shell" || normalizedTitle === "bash" ? "bash" : normalizedTitle
+		case "skill":
+			return "skill"
+		case "webfetch":
+		case "web_fetch":
+			return "webfetch"
+		case "question":
+		case "request_user_input":
+			return "request_user_input"
+		default:
+			break
 	}
+	if (normalizedTitle.startsWith("read")) return "read"
+	if (normalizedTitle.startsWith("edit") || normalizedTitle.startsWith("patch")) return "edit"
+	if (normalizedTitle.startsWith("write")) return "write"
+	if (normalizedTitle.startsWith("search") || normalizedTitle.startsWith("grep")) return "grep"
+	if (normalizedTitle.startsWith("fetch")) return "webfetch"
+	if (normalizedTitle.startsWith("run") || normalizedTitle.startsWith("execute")) return "bash"
 	return "tool"
 }
 

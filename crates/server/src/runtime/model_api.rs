@@ -1,4 +1,6 @@
+use devo_core::ModelCatalog;
 use devo_core::ModelCatalogEntry;
+use devo_core::PresetModelCatalog;
 use devo_protocol::native::rpc_admin::ModelPreferences;
 use devo_protocol::native::rpc_admin::PreferencesOption;
 
@@ -63,6 +65,35 @@ fn model_preferences_from_config_options(
             _ => {}
         }
     }
+    // Connection files are sparse overlays: a credential-only provider inherits
+    // its models from the directory. Native preferences must include those
+    // resolved models, rather than only models explicitly written to the overlay.
+    let configured_providers = runtime_context
+        .config_store
+        .lock()
+        .expect("app config store mutex should not be poisoned")
+        .effective_config()
+        .provider_catalog_config()
+        .providers;
+    for model in runtime_context.model_catalog.list_visible() {
+        let Some((provider_id, model_id)) = model.slug.split_once('/') else {
+            continue;
+        };
+        if !configured_providers.contains_key(provider_id)
+            || preferences
+                .available_models
+                .iter()
+                .any(|option| option.value == model.slug)
+        {
+            continue;
+        }
+        preferences.available_models.push(PreferencesOption {
+            value: model.slug.clone(),
+            label: model.display_name.clone(),
+            description: Some(format!("{provider_id}: {model_id}")),
+            available_efforts: Vec::new(),
+        });
+    }
     enrich_available_models_with_efforts(&mut preferences, runtime_context);
     preferences
 }
@@ -72,10 +103,11 @@ fn enrich_available_models_with_efforts(
     runtime_context: &SessionRuntimeContext,
 ) {
     for model_option in &mut preferences.available_models {
-        let turn_config =
-            runtime_context.resolve_turn_config(Some(model_option.value.as_str()), None);
-        model_option.available_efforts = turn_config
-            .model
+        // Effort choices are catalog metadata. Resolving a complete turn here
+        // rereads the remote overlay and credentials for every row, making a
+        // large catalog block preference saves and unrelated Native requests.
+        let model = runtime_context.resolve_turn_model(Some(model_option.value.as_str()));
+        model_option.available_efforts = model
             .effective_reasoning_capability()
             .options()
             .into_iter()
@@ -217,7 +249,7 @@ impl ServerRuntime {
                     .expect("app config store mutex should not be poisoned");
                 store
                     .user_config_dir()
-                    .join("config.toml")
+                    .join(devo_core::PROVIDER_CONFIG_FILE_NAME)
                     .display()
                     .to_string()
             };
@@ -274,19 +306,80 @@ impl ServerRuntime {
                 format!("invalid canonical model/list params: {error}"),
             );
         }
-        let models = self
-            .deps
-            .model_catalog
-            .list_visible()
-            .into_iter()
-            .map(|model| {
-                devo_protocol::native::rpc_admin::ModelInfo::from(ModelCatalogEntry::from(model))
-            })
-            .collect();
+        let configured = {
+            let store = self
+                .deps
+                .config_store
+                .lock()
+                .expect("app config store mutex should not be poisoned");
+            let config = store.effective_config();
+            (
+                config.provider_catalog.clone(),
+                config.provider.model_overrides.clone(),
+            )
+        };
+        let home = {
+            let store = self
+                .deps
+                .config_store
+                .lock()
+                .expect("app config store mutex should not be poisoned");
+            store.user_config_dir().to_path_buf()
+        };
+        let models = if let Ok(catalog) = PresetModelCatalog::load_from_provider_config_with_home(
+            &configured.0,
+            &configured.1,
+            Some(home.as_path()),
+        ) {
+            catalog
+                .list_visible()
+                .into_iter()
+                .map(|model| model_info_from_catalog_model(model, &catalog))
+                .collect()
+        } else {
+            self.deps
+                .model_catalog
+                .list_visible()
+                .into_iter()
+                .map(|model| model_info_from_catalog_model(model, self.deps.model_catalog.as_ref()))
+                .collect()
+        };
         serde_json::to_value(SuccessResponse {
             id: request_id,
             result: devo_protocol::native::rpc_admin::ModelListResult { models },
         })
         .expect("serialize canonical model/list response")
     }
+}
+
+fn model_info_from_catalog_model(
+    model: &devo_protocol::Model,
+    catalog: &dyn ModelCatalog,
+) -> devo_protocol::native::rpc_admin::ModelInfo {
+    // Prefer the catalog Model's authored thinkingLevelMap (pi-ai
+    // getSupportedThinkingLevels), not capability-only derivation from
+    // ModelCatalogEntry which drops the map.
+    let (reasoning, thinking_level_map, available_thinking_levels) =
+        devo_protocol::resolve_thinking_fields_for_model_info(
+            &model.reasoning_capability,
+            model.reasoning,
+            model.thinking_level_map.as_ref(),
+        );
+    let mut info =
+        devo_protocol::native::rpc_admin::ModelInfo::from(ModelCatalogEntry::from(model));
+    info.reasoning = reasoning;
+    info.thinking_level_map = if thinking_level_map.is_empty() {
+        None
+    } else {
+        Some(thinking_level_map)
+    };
+    info.available_thinking_levels = available_thinking_levels;
+    let Some((provider_id, model_id)) = model.slug.split_once('/') else {
+        return info;
+    };
+    let mut provider_models = catalog.list_provider_models(provider_id);
+    let Some(metadata) = provider_models.remove(model_id) else {
+        return info;
+    };
+    info.with_provider_metadata(provider_id.to_string(), model_id.to_string(), metadata)
 }

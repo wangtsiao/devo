@@ -33,6 +33,7 @@ export function ServerSettings({ initialNativeTrafficLogState = null }: ServerSe
 	const url = useAtomValue(serverUrlAtom)
 	const { settings, updateSettings } = useSettings()
 	const [restarting, setRestarting] = useState(false)
+	const [restartError, setRestartError] = useState<string | null>(null)
 	const [nativeTrafficLogState, setNativeTrafficLogState] = useState<NativeTrafficLogState | null>(
 		initialNativeTrafficLogState,
 	)
@@ -58,15 +59,18 @@ export function ServerSettings({ initialNativeTrafficLogState = null }: ServerSe
 	async function restart() {
 		if (!isElectron) return
 		setRestarting(true)
+		setRestartError(null)
 		try {
 			await window.devo.restartDevo()
+		} catch (error) {
+			setRestartError(error instanceof Error ? error.message : "Failed to restart runtime")
 		} finally {
 			setRestarting(false)
 		}
 	}
 
 	return (
-		<div className="space-y-10">
+		<div className="space-y-8">
 			<SettingsHeader
 				title="Server"
 				description="Devo Desktop manages a private local stdio Native process."
@@ -111,7 +115,7 @@ export function ServerSettings({ initialNativeTrafficLogState = null }: ServerSe
 							off: "Off",
 						}}
 					>
-						<SelectTrigger className="min-w-[140px]">
+						<SelectTrigger aria-label="Proxy mode" className="min-w-[140px]">
 							<SelectValue />
 						</SelectTrigger>
 						<SelectContent>
@@ -177,7 +181,7 @@ export function ServerSettings({ initialNativeTrafficLogState = null }: ServerSe
 					label="Restart runtime"
 					description="Stop the current child process and start a fresh Devo stdio server"
 				>
-					<Button size="sm" variant="outline" onClick={restart} disabled={restarting}>
+					<Button size="sm" variant="outline" onClick={restart} disabled={restarting || (networkProxy.mode === "custom" && !customProxyUrl)}>
 						<RefreshCwIcon
 							aria-hidden="true"
 							className={`size-3.5 ${restarting ? "animate-spin" : ""}`}
@@ -186,6 +190,7 @@ export function ServerSettings({ initialNativeTrafficLogState = null }: ServerSe
 					</Button>
 				</SettingsRow>
 			</SettingsSection>
+			{restartError && <p role="alert" className="text-sm text-destructive">{restartError}</p>}
 
 			<NativeTrafficLogStatus state={nativeTrafficLogState} />
 		</div>
@@ -226,8 +231,8 @@ export function NativeTrafficLogStatus({
 				</Button>
 			</SettingsRow>
 			{expanded && (
-				<div className="space-y-2 px-5 py-3.5">
-					<div className="text-[15px] font-normal tracking-[-0.01em]">Current log file</div>
+				<div className="space-y-2 px-4 py-3">
+					<div className="text-sm tracking-tight">Current log file</div>
 					{state.path ? (
 						<code className="block truncate rounded-md bg-muted px-2 py-1.5 text-[13px] text-muted-foreground">
 							{state.path}

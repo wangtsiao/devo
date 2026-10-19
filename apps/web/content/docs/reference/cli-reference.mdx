@@ -20,7 +20,7 @@ Force onboarding:
 devo onboard
 ```
 
-Start with a specific configured model binding or model name:
+Start with a specific configured `provider/model` reference:
 
 ```bash
 devo --model deepseek-v4-pro
@@ -67,7 +67,9 @@ devo prompt --format jsonl "List the main config files."
 ```
 
 `devo prompt` runs with an always-allow permission checker. Use it for trusted
-automation where the prompt and working tree are controlled.
+automation where the prompt and working tree are controlled. Its regular model
+tool list contains only `ipython`; configured provider-hosted web search/fetch
+remain separate provider capabilities.
 
 ## Server Protocols
 

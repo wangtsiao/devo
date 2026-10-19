@@ -33,21 +33,32 @@ type PendingRequest = {
 }
 
 const REQUEST_TIMEOUT_MS = 10_000
-/** Cold-starting the managed `devo server` process can exceed the default RPC budget. */
+/** Cold startup and session restore can exceed the default RPC budget on Windows. */
 export const INITIALIZE_REQUEST_TIMEOUT_MS = 60_000
 /** MCP admin RPCs may start a lazy server before listing tools. */
 export const MCP_ADMIN_REQUEST_TIMEOUT_MS = 60_000
+/** Git-backed workspace diffs can exceed the default 10s budget on large trees. */
+export const WORKSPACE_CHANGES_REQUEST_TIMEOUT_MS = 60_000
+/** Remote catalog refresh (30s HTTP budget) and discovery must finish before IPC expires. */
+export const MODEL_CATALOG_REQUEST_TIMEOUT_MS = 60_000
 
 export function requestTimeoutMsForMethod(method: string, fallbackMs: number): number | undefined {
-	if (method === "initialize") {
+	if (method === "initialize" || method === "session/new" || method === "session/resume") {
 		return Math.max(fallbackMs, INITIALIZE_REQUEST_TIMEOUT_MS)
 	}
 	if (method === "provider/validate") {
 		return undefined
 	}
+	if (method === "model/catalog/refresh" || method === "provider/discover") {
+		return Math.max(fallbackMs, MODEL_CATALOG_REQUEST_TIMEOUT_MS)
+	}
 	if (method === "mcp/tools" || method === "mcp/set_enabled") {
 		return Math.max(fallbackMs, MCP_ADMIN_REQUEST_TIMEOUT_MS)
 	}
+	if (method === "workspace/changes/read") {
+		return Math.max(fallbackMs, WORKSPACE_CHANGES_REQUEST_TIMEOUT_MS)
+	}
+	if (method.startsWith("workspace/worktree/")) return Math.max(fallbackMs, 90_000)
 	return fallbackMs
 }
 
@@ -243,29 +254,34 @@ export class StdioNativeClient implements NativeTransport {
 		this.stopped = false
 
 		const stdout = createInterface({ input: child.stdout })
-		stdout.on("line", (line) => this.handleLine(line))
+		stdout.on("line", (line) => {
+			if (this.child === child) this.handleLine(line)
+		})
 
 		const stderr = createInterface({ input: child.stderr })
 		stderr.on("line", (line) => {
+			if (this.child !== child) return
 			if (line.trim()) log.warn(`[stderr] ${line}`)
 		})
 
 		child.stdin.on("error", (error) => {
+			if (this.child !== child) return
 			const reason = toError(error)
 			log.warn("Devo Native stdio stdin failed", reason)
-			this.close(reason)
+			this.close(reason, child)
 		})
 
 		child.on("error", (error) => {
+			if (this.child !== child) return
 			log.error("Devo Native stdio process failed", error)
-			this.close(error)
+			this.close(error, child)
 		})
 
 		child.on("exit", (code, signal) => {
-			if (this.stopped) return
+			if (this.child !== child || this.stopped) return
 			const reason = `Devo Native stdio process exited with code ${code ?? "null"} signal ${signal ?? "null"}`
 			log.warn(reason)
-			this.close(new Error(reason))
+			this.close(new Error(reason), child)
 		})
 	}
 
@@ -314,8 +330,16 @@ export class StdioNativeClient implements NativeTransport {
 						this.pendingMethods.delete(id)
 						reject(new Error(`${method} request ${id} timed out`))
 					}, timeoutMs)
-			this.pending.set(id, { resolve, reject, timer })
+			this.pending.set(id, {
+				resolve,
+				reject,
+				timer,
+			})
 		})
+		// Server may reply (and reject) before the caller awaits — attach a
+		// no-op handler so Node does not log UnhandledPromiseRejectionWarning.
+		// Real callers still observe the rejection via await / .catch.
+		void response.catch(() => {})
 		this.pendingMethods.set(id, method)
 		try {
 			await this.writeJson(child, payload)
@@ -332,7 +356,7 @@ export class StdioNativeClient implements NativeTransport {
 			if (pending?.timer !== undefined) clearTimeout(pending.timer)
 			this.pending.delete(id)
 			this.pendingMethods.delete(id)
-			this.close(reason)
+			this.close(reason, child)
 			throw reason
 		}
 		return response
@@ -353,16 +377,17 @@ export class StdioNativeClient implements NativeTransport {
 			})
 		} catch (error) {
 			const reason = toError(error)
-			this.close(reason)
+			this.close(reason, child)
 			throw reason
 		}
 	}
 
 	async respond(id: JsonRpcId, result: unknown): Promise<void> {
 		this.start()
+		const child = this.requireChild()
 		const payload = { jsonrpc: "2.0", id, result }
 		try {
-			await this.writeJson(this.requireChild(), payload)
+			await this.writeJson(child, payload)
 			this.recordTraffic({
 				direction: "desktop-to-server",
 				kind: "response",
@@ -371,7 +396,7 @@ export class StdioNativeClient implements NativeTransport {
 			})
 		} catch (error) {
 			const reason = toError(error)
-			this.close(reason)
+			this.close(reason, child)
 			throw reason
 		}
 	}
@@ -414,9 +439,13 @@ export class StdioNativeClient implements NativeTransport {
 				if (!pending) return
 				this.pending.delete(routed.id)
 				if (pending.timer !== undefined) clearTimeout(pending.timer)
-				const error = routed.message.error as { message?: string } | undefined
+				const error = routed.message.error as { message?: string; code?: string } | undefined
 				if (error) {
-					pending.reject(new Error(error.message ?? "Devo Native request failed"))
+					const rejected = new Error(error.message ?? "Devo Native request failed") as Error & {
+						code?: string
+					}
+					if (typeof error.code === "string") rejected.code = error.code
+					pending.reject(rejected)
 				} else {
 					pending.resolve(routed.message.result)
 				}
@@ -489,7 +518,8 @@ export class StdioNativeClient implements NativeTransport {
 		return this.child
 	}
 
-	private close(error: Error): void {
+	private close(error: Error, child?: ChildProcessWithoutNullStreams): void {
+		if (child && this.child !== child) return
 		this.child = null
 		this.initializeResult = undefined
 		this.initializeInFlight = null

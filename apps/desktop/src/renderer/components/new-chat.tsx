@@ -59,6 +59,7 @@ import { ComposerPermissionPicker } from "./chat/composer-permission-picker"
 import {
 	DEFAULT_COMPOSER_PERMISSION_PROFILE,
 	type ComposerPermissionProfile,
+	PERMISSION_PICKER_ENABLED,
 	stashComposerPermissionForSession,
 } from "./chat/composer-permission"
 import { goalPromptText, parseComposerSlash } from "./chat/composer-slash"
@@ -254,6 +255,7 @@ export function NewChat() {
 	const [activeTrigger, setActiveTrigger] = useState<"goal" | null>(null)
 	const [permissionProfile, setPermissionProfile] =
 		useState<ComposerPermissionProfile>(DEFAULT_COMPOSER_PERMISSION_PROFILE)
+	const [modelPickerOpen, setModelPickerOpen] = useState(false)
 	const [skillPickerOpen, setSkillPickerOpen] = useState(false)
 
 	// Slash command and mention popover state
@@ -267,20 +269,16 @@ export function NewChat() {
 	const slashPopoverRef = useRef<SlashCommandPopoverHandle>(null)
 	const mentionPopoverRef = useRef<MentionPopoverHandle>(null)
 
-	// Project model preferences are a UI fallback for older local state.
+	// Native preferences own model/effort defaults, shared with Settings.
+	// Local project state only restores the agent preference.
 	const projectModels = useAtomValue(projectModelsAtom)
 	const prevDirectoryRef = useRef<string>("")
 	useEffect(() => {
 		if (!selectedDirectory || selectedDirectory === prevDirectoryRef.current) return
 		prevDirectoryRef.current = selectedDirectory
 		const stored = projectModels[selectedDirectory]
-		if (stored?.providerID && stored?.modelID) {
-			setSelectedModel(stored)
-			setSelectedVariant(stored.variant)
-		} else {
-			setSelectedModel(null)
-			setSelectedVariant(undefined)
-		}
+		setSelectedModel(null)
+		setSelectedVariant(undefined)
 		// Restore the per-project agent preference (null = use config default)
 		setSelectedAgent(stored?.agent ?? null)
 	}, [selectedDirectory, projectModels])
@@ -323,6 +321,7 @@ export function NewChat() {
 			if (!model) return
 			addRecentModel(model)
 			if (!selectedDirectory) return
+			setError(null)
 			void persistRuntimeModelSelection(selectedDirectory, model).catch((err) => {
 				console.error("Failed to persist model selection:", err)
 				setError("Failed to save model setting")
@@ -335,6 +334,7 @@ export function NewChat() {
 		(variant: string | undefined) => {
 			setSelectedVariant(variant)
 			if (!variant || !selectedDirectory) return
+			setError(null)
 			void persistRuntimeModelConfigOption(selectedDirectory, "thought_level", variant).catch((err) => {
 				console.error("Failed to persist reasoning effort selection:", err)
 				setError("Failed to save reasoning effort setting")
@@ -383,6 +383,10 @@ export function NewChat() {
 				return true
 			case "goal":
 				setActiveTrigger("goal")
+				controllerRef.current?.setText("")
+				return true
+			case "model":
+				setModelPickerOpen(true)
 				controllerRef.current?.setText("")
 				return true
 			case "skills":
@@ -556,7 +560,7 @@ export function NewChat() {
 			if (!client?.session?.updateSettings) return
 			try {
 				await client.session.updateSettings({
-					sessionID: sessionId,
+					sessionId: sessionId,
 					permissionProfile,
 					mode: collaborationMode,
 				})
@@ -843,11 +847,13 @@ export function NewChat() {
 								<PromptInputFooter className="px-4 pb-2">
 									<PromptInputTools>
 										<AttachButton disabled={launching || !selectedDirectory} />
-										<ComposerPermissionPicker
-											value={permissionProfile}
-											onChange={setPermissionProfile}
-											disabled={launching || !selectedDirectory}
-										/>
+										{PERMISSION_PICKER_ENABLED && (
+											<ComposerPermissionPicker
+												value={permissionProfile}
+												onChange={setPermissionProfile}
+												disabled={launching || !selectedDirectory}
+											/>
+										)}
 										{collaborationMode === "plan" && (
 											<ComposerModeChip
 												variant="plan"
@@ -874,6 +880,8 @@ export function NewChat() {
 												effectiveModel={effectiveModel}
 												hasModelOverride={!!selectedModel}
 												onSelectModel={handleModelSelect}
+												modelPickerOpen={modelPickerOpen}
+												onModelPickerOpenChange={setModelPickerOpen}
 												selectedVariant={selectedVariant}
 												onSelectVariant={handleVariantSelect}
 												disabled={launching || !selectedDirectory}

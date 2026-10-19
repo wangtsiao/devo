@@ -21,10 +21,13 @@ pub(super) fn query_event_delivery_policy(event: &QueryEvent) -> QueryEventDeliv
         | QueryEvent::UsageDelta { .. }
         | QueryEvent::Usage { .. } => QueryEventDeliveryPolicy::BestEffort,
         QueryEvent::ProviderRetryStatus(_)
+        | QueryEvent::ProviderQueryFailed { .. }
         | QueryEvent::ContextCompactionStarted
         | QueryEvent::ContextCompactionCompleted { .. }
         | QueryEvent::ContextCompactionFailed { .. }
+        | QueryEvent::ContextEstimate { .. }
         | QueryEvent::TextDelta(_)
+        | QueryEvent::ModelResponseCompleted
         | QueryEvent::ReasoningDelta(_)
         | QueryEvent::ReasoningCompleted
         | QueryEvent::ToolUseStart { .. }
@@ -46,10 +49,13 @@ pub(super) fn stream_trace_elapsed_ms() -> u128 {
 pub(super) fn query_event_trace_kind(event: &QueryEvent) -> &'static str {
     match event {
         QueryEvent::ProviderRetryStatus(_) => "provider_retry_status",
+        QueryEvent::ProviderQueryFailed { .. } => "provider_query_failed",
         QueryEvent::ContextCompactionStarted => "context_compaction_started",
         QueryEvent::ContextCompactionCompleted { .. } => "context_compaction_completed",
         QueryEvent::ContextCompactionFailed { .. } => "context_compaction_failed",
+        QueryEvent::ContextEstimate { .. } => "context_estimate",
         QueryEvent::TextDelta(_) => "text_delta",
+        QueryEvent::ModelResponseCompleted => "model_response_completed",
         QueryEvent::ReasoningDelta(_) => "reasoning_delta",
         QueryEvent::ReasoningCompleted => "reasoning_completed",
         QueryEvent::ToolUseStart { .. } => "tool_use_start",
@@ -74,10 +80,13 @@ pub(super) fn query_event_trace_delta_len(event: &QueryEvent) -> usize {
             ..
         } => delta.len(),
         QueryEvent::ProviderRetryStatus(_)
+        | QueryEvent::ProviderQueryFailed { .. }
         | QueryEvent::ContextCompactionStarted
         | QueryEvent::ContextCompactionCompleted { .. }
         | QueryEvent::ContextCompactionFailed { .. }
+        | QueryEvent::ContextEstimate { .. }
         | QueryEvent::ReasoningCompleted
+        | QueryEvent::ModelResponseCompleted
         | QueryEvent::ToolUseStart { .. }
         | QueryEvent::ToolUseInputDelta { .. }
         | QueryEvent::ToolExecutionStart { .. }
@@ -92,11 +101,14 @@ pub(super) fn query_event_trace_token_preview(event: &QueryEvent) -> Option<Stri
     match event {
         QueryEvent::TextDelta(text) => assistant_token_log_preview(text),
         QueryEvent::ProviderRetryStatus(_)
+        | QueryEvent::ProviderQueryFailed { .. }
         | QueryEvent::ContextCompactionStarted
         | QueryEvent::ContextCompactionCompleted { .. }
         | QueryEvent::ContextCompactionFailed { .. }
+        | QueryEvent::ContextEstimate { .. }
         | QueryEvent::ReasoningDelta(_)
         | QueryEvent::ReasoningCompleted
+        | QueryEvent::ModelResponseCompleted
         | QueryEvent::ToolUseStart { .. }
         | QueryEvent::ToolUseInputDelta { .. }
         | QueryEvent::ToolExecutionStart { .. }

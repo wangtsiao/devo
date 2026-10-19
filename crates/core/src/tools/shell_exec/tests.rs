@@ -14,6 +14,7 @@ async fn execute_shell_command_non_tty_sends_progress() {
 
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: cmd.to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "test".into(),
@@ -43,6 +44,7 @@ async fn execute_shell_command_progress_none_does_not_crash() {
     let cmd = "echo test";
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: cmd.to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "test".into(),
@@ -75,6 +77,7 @@ async fn execute_shell_command_cancels_non_tty_process() {
     let started = Instant::now();
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: "echo cancelled_output; sleep 5; echo should_not_print".to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "cancel test".into(),
@@ -126,6 +129,7 @@ async fn execute_shell_command_cancels_tty_process() {
     let started = Instant::now();
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: "echo cancelled_output; sleep 5; echo should_not_print".to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "pty cancel test".into(),
@@ -166,6 +170,65 @@ async fn execute_shell_command_cancels_tty_process() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn execute_shell_command_pty_times_out_reports_decision_instant_duration() {
+    let started = Instant::now();
+    let result = execute_shell_command(
+        ShellExecRequest {
+            output_capture: None,
+            command: "echo before_timeout; sleep 5".to_string(),
+            workdir: std::env::current_dir().unwrap_or_default(),
+            description: "pty timeout test".into(),
+            shell_override: Some("bash".to_string()),
+            tty: true,
+            login: false,
+            timeout_ms: 200,
+            yield_time_ms: 50,
+            max_output_tokens: 100,
+            sandbox_profile: None,
+            sandbox_permission_overlay: None,
+        },
+        None,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("execute shell command");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "timeout should not wait for descendant sleep to finish"
+    );
+    assert!(result.is_error);
+    let text = result.content.clone().into_string();
+    assert!(
+        text.contains("command timed out after 200ms"),
+        "expected timeout prefix, got {text:?}"
+    );
+    assert!(
+        text.contains("before_timeout"),
+        "expected retained pty stdout, got {text:?}"
+    );
+    match &result.content {
+        ToolContent::Mixed {
+            json: Some(metadata),
+            ..
+        } => {
+            assert_eq!(metadata["timeout_ms"], serde_json::json!(200));
+            assert_eq!(metadata["tty"], serde_json::json!(true));
+            // duration_ms is captured at the decision instant, before
+            // kill-and-wait teardown, so it must stay near the timeout.
+            assert!(
+                metadata["duration_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| (180..=1000).contains(&ms)),
+                "duration_ms missing or outside the decision-instant window: {metadata}"
+            );
+        }
+        other => panic!("expected Mixed timeout content, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn aborting_tty_command_kills_pty_child() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let started_marker = temp_dir.path().join("started");
@@ -181,6 +244,7 @@ async fn aborting_tty_command_kills_pty_child() {
     let task_cancel_token = cancel_token.clone();
     let task = tokio::spawn(execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command,
             workdir: temp_dir.path().to_path_buf(),
             description: "abort PTY test".into(),
@@ -219,6 +283,7 @@ async fn aborting_tty_command_kills_pty_child() {
 async fn execute_shell_command_success_metadata_is_mixed() {
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: "echo metadata_test".to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "metadata test".into(),
@@ -238,7 +303,7 @@ async fn execute_shell_command_success_metadata_is_mixed() {
     .expect("execute shell command");
 
     assert!(!result.is_error);
-    match result.content {
+    match result.content.clone() {
         ToolContent::Mixed {
             text: Some(text),
             json: Some(metadata),
@@ -246,6 +311,14 @@ async fn execute_shell_command_success_metadata_is_mixed() {
             assert!(text.contains("metadata_test"));
             assert_eq!(metadata["description"], "metadata test");
             assert!(metadata.get("output").is_none());
+            // The model must be told how long the command ran so it can
+            // reason about slow or hung commands.
+            assert!(
+                metadata["duration_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms <= 5000),
+                "duration_ms missing or implausible: {metadata}"
+            );
             assert_eq!(
                 ToolContent::Mixed {
                     text: Some(text.clone()),
@@ -265,6 +338,7 @@ async fn execute_shell_command_success_metadata_is_mixed() {
 async fn execute_shell_command_error_output_is_text_only() {
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: "exit 7".to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "error test".into(),
@@ -284,7 +358,27 @@ async fn execute_shell_command_error_output_is_text_only() {
     .expect("execute shell command");
 
     assert!(result.is_error);
-    assert!(matches!(result.content, ToolContent::Text(text) if text.contains("exit code 7")));
+    // Failed runs keep structured metadata so the model sees how long the
+    // failing command actually ran (mirrors the success path).
+    match &result.content {
+        ToolContent::Mixed {
+            text: Some(text),
+            json: Some(metadata),
+        } => {
+            assert!(
+                text.contains("exit code 7"),
+                "expected exit text, got {text:?}"
+            );
+            assert_eq!(metadata["exit"], serde_json::json!(7));
+            assert!(
+                metadata["duration_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms <= 5000),
+                "duration_ms missing or implausible: {metadata}"
+            );
+        }
+        other => panic!("expected Mixed error content, got {other:?}"),
+    }
 }
 
 use super::{platform_shell_program, resolve_shell, truncate_output};
@@ -295,6 +389,7 @@ async fn execute_shell_command_pipe_times_out() {
     let started = Instant::now();
     let result = execute_shell_command(
         ShellExecRequest {
+            output_capture: None,
             command: "echo before_timeout; sleep 5".to_string(),
             workdir: std::env::current_dir().unwrap_or_default(),
             description: "timeout test".into(),
@@ -318,7 +413,7 @@ async fn execute_shell_command_pipe_times_out() {
         "timeout should not wait for descendant sleep to finish"
     );
     assert!(result.is_error);
-    let text = result.content.into_string();
+    let text = result.content.clone().into_string();
     assert!(
         text.contains("command timed out after 200ms"),
         "expected timeout prefix, got {text:?}"
@@ -327,6 +422,21 @@ async fn execute_shell_command_pipe_times_out() {
         text.contains("before_timeout"),
         "expected retained stdout, got {text:?}"
     );
+    match &result.content {
+        ToolContent::Mixed {
+            json: Some(metadata),
+            ..
+        } => {
+            assert_eq!(metadata["timeout_ms"], serde_json::json!(200));
+            assert!(
+                metadata["duration_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms <= 2000),
+                "duration_ms missing or implausible: {metadata}"
+            );
+        }
+        other => panic!("expected Mixed timeout content, got {other:?}"),
+    }
 }
 
 #[cfg(target_os = "macos")]

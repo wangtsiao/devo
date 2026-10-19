@@ -131,7 +131,6 @@ progress through server notifications.
 - `turn/start`: start a Devo turn with the Native turn request shape.
 - `turn/steer`: send steering input directly to the active turn.
 - `turn/read`: read a turn snapshot.
-- `session/queue/steer`: send steering input into a running turn.
 
 ### Queue methods
 
@@ -153,12 +152,26 @@ progress through server notifications.
 ### Provider and model methods
 
 - `provider/list`: list configured providers using the Native camelCase
-  result.
-- `provider/upsert`: add or update a provider and optional model binding.
+  result. The result separates read-only directory templates from connected
+  user providers.
+- `provider/upsert`: add or update a provider Connection and its nested model directory.
+- `provider/disconnect`: remove a user provider Connection while preserving
+  its built-in directory template.
+- `provider/model/remove`: remove one saved model from a user provider
+  Connection while preserving the provider template and built-in directory.
 - `provider/validate`: validate provider credentials and model settings.
+- `provider/discover`: fetch a connected provider's model directory and persist
+  the discovered metadata into its `providers.json` Connection record.
+
+`provider/list` returns `connectionModels` separately from each provider's
+effective `models` map. The former contains only models explicitly saved in
+each user Connection and is the source for Connection model management in
+onboarding.
 - `model/list` and `model/preferences/*`: read and update the Native model
   catalog and preferences.
 - `context/usage/read`: read the context-window usage for a session.
+- `session/systemPrompt/read`: read the exact system prompt the server would
+  send on the next model call for a session.
 
 ### MCP methods
 
@@ -211,14 +224,11 @@ progress through server notifications.
 source for generated schemas and client bindings. The server runtime is not yet
 fully aligned with that contract:
 
-- Registered but not routed by the server: `session/cwd/change`,
-  `session/archive`, `turn/steer`, `turn/read`, `tool/list`,
-  `permission/profile/read`, `permission/profile/update`, `credential/list`,
-  `credential/set`, and `credential/delete`. Clients cannot currently call
-  these methods successfully despite their Native registration.
-- Routed by the server but absent from `NATIVE_METHODS`: `task/start` and
-  `task/resize`. They work at runtime, but are omitted from generated Native
-  schemas and client bindings.
+- Registered but not routed by the server: none of the remaining
+  `NATIVE_METHODS` entries. `session/cwd/change`, `session/archive`,
+  `turn/read`, `tool/list`, and `credential/*` are live.
+- `task/start` and `task/resize` are registered and routed. Process list
+  and kill live on `task/list` and `task/interrupt`.
 - Transitional routes outside the Native registry: `session/start` and
-  `command/exec`. New clients should use the registered Native surface rather
-  than depending on these routes.
+  `command/exec` (plus `command/exec/write|resize|terminate` aliases).
+  New clients should use `task/*` rather than depending on these routes.

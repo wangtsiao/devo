@@ -129,7 +129,7 @@ export function McpSettings({
 			type="button"
 			size="sm"
 			variant="secondary"
-			className="h-8 rounded-full px-3"
+			className="h-7"
 			disabled={openingConfig}
 			onClick={() => void openMcpConfig()}
 			aria-label="Add MCP"
@@ -140,7 +140,7 @@ export function McpSettings({
 	)
 
 	return (
-		<div className={embedded ? "space-y-6 px-8 py-8" : "space-y-10"}>
+		<div className={embedded ? "space-y-6" : "space-y-8"}>
 			{!embedded && (
 				<SettingsHeader
 					title="MCP"
@@ -188,7 +188,7 @@ export function McpSettings({
 							<SettingsRow
 								label={server.name}
 								description={
-									enabled ? `${server.status} · ${server.toolCount} tools` : server.status
+									enabled ? `${server.status} · ${server.toolCount} tool${server.toolCount === 1 ? "" : "s"}` : server.status
 								}
 							>
 								<div className="flex items-center gap-2">
@@ -206,6 +206,7 @@ export function McpSettings({
 									)}
 									<Switch
 										checked={enabled}
+										aria-label={`${enabled ? "Disable" : "Enable"} ${server.name}`}
 										onCheckedChange={(checked) => {
 											const nextEnabled = checked === true
 											if (!nextEnabled) {
@@ -217,7 +218,7 @@ export function McpSettings({
 								</div>
 							</SettingsRow>
 							{enabled && expandedThis && (
-								<div className="space-y-1 px-5 pb-3.5 text-[13px] leading-5 text-muted-foreground">
+								<div className="space-y-1 px-4 pb-3 text-xs leading-5 text-muted-foreground">
 									{toolsError ? (
 										<p>Failed to load tools: {String(toolsError)}</p>
 									) : toolsLoading ? (

@@ -198,11 +198,32 @@ impl StdioServerClient {
         self.core.provider_upsert(params).await
     }
 
+    pub async fn provider_disconnect(
+        &mut self,
+        params: devo_protocol::native::rpc_admin::ProviderDisconnectParams,
+    ) -> Result<devo_protocol::native::rpc_admin::ProviderDisconnectResult> {
+        self.core.provider_disconnect(params).await
+    }
+
+    pub async fn provider_model_remove(
+        &mut self,
+        params: devo_protocol::native::rpc_admin::ProviderModelRemoveParams,
+    ) -> Result<devo_protocol::native::rpc_admin::ProviderModelRemoveResult> {
+        self.core.provider_model_remove(params).await
+    }
+
     pub async fn provider_validate(
         &mut self,
         params: devo_protocol::native::rpc_admin::ProviderValidateParams,
     ) -> Result<devo_protocol::native::rpc_admin::ProviderValidateResult> {
         self.core.provider_validate(params).await
+    }
+
+    pub async fn provider_discover(
+        &mut self,
+        params: devo_protocol::native::rpc_admin::ProviderDiscoverParams,
+    ) -> Result<devo_protocol::native::rpc_admin::ProviderDiscoverResult> {
+        self.core.provider_discover(params).await
     }
 
     pub async fn command_exec(&mut self, params: CommandExecParams) -> Result<CommandExecResult> {
@@ -408,6 +429,31 @@ impl StdioServerClient {
         self.core.session_delete_native(session_id).await
     }
 
+    /// Continue an interrupted turn without materializing another user message.
+    pub async fn turn_resume_native(
+        &mut self,
+        params: devo_protocol::native::rpc_turn::TurnResumeParams,
+    ) -> Result<devo_protocol::native::rpc_turn::TurnResumeResult> {
+        self.core.request("turn/resume", params).await
+    }
+
+    /// Read authoritative recovery availability, separately from live task status.
+    pub async fn turn_recovery_native(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<devo_protocol::native::rpc_turn::TurnRecoveryReadResult> {
+        self.core
+            .request(
+                "turn/recovery/read",
+                devo_protocol::native::rpc_turn::TurnRecoveryReadParams {
+                    session_id: devo_protocol::native::ids::SessionId::from_string(
+                        session_id.to_string(),
+                    ),
+                },
+            )
+            .await
+    }
+
     /// Native `session/resume`; see `client_core::session_resume_native`.
     pub async fn session_resume_native(
         &mut self,
@@ -557,11 +603,11 @@ impl StdioServerClient {
         self.core.session_queue_remove(params).await
     }
 
-    pub async fn session_queue_steer(
+    pub async fn turn_steer(
         &mut self,
-        params: native::rpc_turn::SessionQueueSteerParams,
-    ) -> Result<native::rpc_turn::SessionQueueSteerResult> {
-        self.core.session_queue_steer(params).await
+        params: native::rpc_turn::TurnSteerParams,
+    ) -> Result<native::rpc_turn::TurnSteerResult> {
+        self.core.turn_steer(params).await
     }
 
     pub async fn subscription_create(

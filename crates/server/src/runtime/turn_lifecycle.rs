@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
-use devo_core::SessionId;
+use devo_protocol::native::ids::SessionId;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn::TurnMetadata;
+use crate::turn::RuntimeTurn;
 
 use super::ServerRuntime;
 
 impl ServerRuntime {
     /// Registers cancellation, metadata, and optional connection ownership for a
     /// turn that is about to run on a background task.
-    pub(crate) async fn register_active_turn_execution(
+    pub(crate) async fn register_active_runtime_turn_execution(
         &self,
         session_id: SessionId,
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         connection_id: Option<u64>,
     ) -> CancellationToken {
         let cancel_token = CancellationToken::new();
@@ -59,21 +59,40 @@ impl ServerRuntime {
         }
     }
 
-    pub(crate) async fn spawn_active_turn_task<F>(
+    pub(crate) async fn spawn_active_runtime_turn_task<F>(
         self: &Arc<Self>,
         session_id: SessionId,
-        turn: TurnMetadata,
+        turn: RuntimeTurn,
         connection_id: Option<u64>,
         task: F,
     ) where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.register_active_turn_execution(session_id, turn, connection_id)
+        self.register_active_runtime_turn_execution(session_id, turn, connection_id)
             .await;
+        drop(
+            self.spawn_registered_active_turn_task(session_id, task)
+                .await,
+        );
+    }
+
+    /// Spawns work after its cancellation token and turn metadata are registered.
+    /// Queued turns register during admission, before publishing `turn/started`.
+    /// The returned handle lets a post-turn chain wait without losing the
+    /// dedicated abort handle required by interrupt timeout recovery.
+    pub(crate) async fn spawn_registered_active_turn_task<F>(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        task: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let runtime = Arc::clone(self);
         let join_handle = tokio::spawn(task);
         runtime
             .attach_active_turn_abort_handle(session_id, join_handle.abort_handle())
             .await;
+        join_handle
     }
 }

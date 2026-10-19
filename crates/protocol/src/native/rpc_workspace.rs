@@ -1,10 +1,7 @@
 //! Native `workspace/changes/read`.
 //!
-//! The desktop client consumes this read model (branch / uncommitted /
-//! turn-scoped diffs). Types mirror the legacy `workspace_changes` shapes
-//! with native camelCase field names and ids; the legacy enums are reused
-//! directly (their wire values stay snake_case inside otherwise camelCase
-//! payloads — an accepted inconsistency to keep one vocabulary).
+//! Params use Native session/turn ids. The read-model view type is
+//! [`crate::WorkspaceChangeView`] (camelCase wire) — one type, no `From` dual.
 
 use std::path::PathBuf;
 
@@ -15,14 +12,8 @@ use ts_rs::TS;
 
 use super::ids::SessionId;
 use super::ids::TurnId;
-use crate::WorkspaceChangeAttribution;
-use crate::WorkspaceChangeBase;
-use crate::WorkspaceChangeCoverage;
 use crate::WorkspaceChangeScope;
-use crate::WorkspaceChangeSetStatus;
-use crate::WorkspaceChangeStats;
-use crate::WorkspaceChangeViewStatus;
-use crate::WorkspaceChangedFile;
+use crate::WorkspaceChangeView;
 use crate::WorkspaceDiffDetail;
 
 // ── workspace/changes/read ──
@@ -42,68 +33,24 @@ pub struct WorkspaceChangesReadParams {
     pub diff_detail: WorkspaceDiffDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_diff_bytes: Option<u64>,
+    /// Server-side `--ignore-all-space` for the git-backed scopes
+    /// (branch/staged/unstaged/uncommitted). Ignored for the turn scope,
+    /// whose finalized diffs are precomputed artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_whitespace: Option<bool>,
+    /// When set, Full (and Summary filtering) only considers these relative
+    /// paths. Used by expand-on-demand so clients never wait on a whole-tree
+    /// unified diff over stdio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<PathBuf>>,
+    /// When true with path-scoped Full, attach per-file `oldText`/`newText`
+    /// so clients can mount expandable MultiFileDiff views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_file_sides: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceChangesReadResult {
     pub views: Vec<WorkspaceChangeView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceChangeView {
-    pub scope: WorkspaceChangeScope,
-    pub status: WorkspaceChangeViewStatus,
-    pub workspace_root: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base: Option<WorkspaceChangeBase>,
-    pub coverage: WorkspaceChangeCoverage,
-    pub attribution: WorkspaceChangeAttribution,
-    pub change_set_status: WorkspaceChangeSetStatus,
-    pub files: Vec<WorkspaceChangedFile>,
-    pub stats: WorkspaceChangeStats,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unified_diff: Option<String>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-    pub generated_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl From<crate::WorkspaceChangeView> for WorkspaceChangeView {
-    fn from(view: crate::WorkspaceChangeView) -> Self {
-        Self {
-            scope: view.scope,
-            status: view.status,
-            workspace_root: view.workspace_root,
-            base: view.base,
-            coverage: view.coverage,
-            attribution: view.attribution,
-            change_set_status: view.change_set_status,
-            files: view.files,
-            stats: view.stats,
-            unified_diff: view.unified_diff,
-            warnings: view.warnings,
-            generated_at: view.generated_at,
-        }
-    }
-}
-
-impl From<WorkspaceChangeView> for crate::WorkspaceChangeView {
-    fn from(view: WorkspaceChangeView) -> Self {
-        Self {
-            scope: view.scope,
-            status: view.status,
-            workspace_root: view.workspace_root,
-            base: view.base,
-            coverage: view.coverage,
-            attribution: view.attribution,
-            change_set_status: view.change_set_status,
-            files: view.files,
-            stats: view.stats,
-            unified_diff: view.unified_diff,
-            warnings: view.warnings,
-            generated_at: view.generated_at,
-        }
-    }
 }

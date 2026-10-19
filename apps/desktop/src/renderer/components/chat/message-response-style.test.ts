@@ -10,6 +10,8 @@ const uiStylesSource = readFileSync(
 	"utf8",
 )
 const rendererCssSource = readFileSync(new URL("../../index.css", import.meta.url), "utf8")
+const activitySource = readFileSync(new URL("./turn-activity.tsx", import.meta.url), "utf8")
+const activityCssSource = readFileSync(new URL("../../turn-activity.css", import.meta.url), "utf8")
 
 describe("MessageResponse markdown surfaces", () => {
 	test("wires Inter Variable, Noto Sans SC Variable, and IBM Plex Mono into theme font tokens", () => {
@@ -130,6 +132,26 @@ describe("MessageResponse markdown surfaces", () => {
 		})
 	})
 
+	test("uses a lighter Streamdown plugin set while streaming", () => {
+		expect({
+			streamingProp: messageSource.includes("streaming?: boolean"),
+			streamingPlugins: messageSource.includes("streamdownPluginsStreaming"),
+			disablesAnimatedWhileStreaming: messageSource.includes(
+				"animated={streaming ? false : animated}",
+			),
+			streamingClass: messageSource.includes("devo-message-response--streaming"),
+			streamFadeCss: rendererCssSource.includes("devo-stream-surface-in"),
+			streamTailCss: rendererCssSource.includes("devo-stream-tail-in"),
+		}).toEqual({
+			streamingProp: true,
+			streamingPlugins: true,
+			disablesAnimatedWhileStreaming: true,
+			streamingClass: true,
+			streamFadeCss: true,
+			streamTailCss: true,
+		})
+	})
+
 	test("includes streamdown sources so code highlighting classes are generated", () => {
 		expect({
 			streamdownSource: uiStylesSource.includes('@source "../../../../node_modules/streamdown/dist/*.js";'),
@@ -151,6 +173,32 @@ describe("MessageResponse markdown surfaces", () => {
 			cjkPluginSource: true,
 			mathPluginSource: true,
 			mermaidPluginSource: true,
+		})
+	})
+
+	test("renders thinking Markdown and Python tool input as code blocks", () => {
+		expect({
+			thinkingUsesMarkdown: activitySource.includes('className="devo-reasoning-response"'),
+			reasoningKeepsMutedCompactStyle: rendererCssSource.includes(
+				".devo-message-response.devo-reasoning-response",
+			),
+			pythonToolUsesCodeBlock: activitySource.includes('<CodeBlock code={code} language="python"'),
+			pythonCodeClass: activitySource.includes('className="devo-activity-code"'),
+			pythonCodeWrapsLongLines: /devo-activity-code code\s*\{[^}]*white-space:\s*pre-wrap/.test(
+				activityCssSource,
+			),
+			pythonCodeUsesCompactType: /devo-activity-code pre\s*\{[^}]*font-size:\s*0\.8125rem/.test(
+				activityCssSource,
+			),
+			pythonCopyHasAccessibleName: activitySource.includes('aria-label="Copy Python code"'),
+		}).toEqual({
+			thinkingUsesMarkdown: true,
+			reasoningKeepsMutedCompactStyle: true,
+			pythonToolUsesCodeBlock: true,
+			pythonCodeClass: true,
+			pythonCodeWrapsLongLines: true,
+			pythonCodeUsesCompactType: true,
+			pythonCopyHasAccessibleName: true,
 		})
 	})
 })

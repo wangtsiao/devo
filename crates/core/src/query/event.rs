@@ -12,6 +12,7 @@ use crate::response_item::ResponseItem;
 use crate::tools::ToolContent;
 use devo_protocol::ModelRequest;
 use devo_protocol::StopReason;
+use devo_protocol::native::event::ModelQueryRetryPhase;
 use devo_provider::ModelProviderSDK;
 
 /// Events emitted during a query for the caller (CLI/UI) to observe.
@@ -19,13 +20,18 @@ use devo_provider::ModelProviderSDK;
 pub enum QueryEvent {
     /// Provider request retry status.
     ProviderRetryStatus(ProviderRetryStatus),
+    /// Provider retries were exhausted; terminal failure follows.
+    ProviderQueryFailed {
+        attempt: usize,
+        max_attempts: usize,
+        message: String,
+    },
     /// Context compaction is about to begin.
     ContextCompactionStarted,
     /// Context compaction replaced the current prompt history.
     ContextCompactionCompleted {
         /// Full compacted history (summary + preserved suffix), including tool
-        /// pairs. Callers persist snapshots from this before Message-only
-        /// prompt conversion drops non-message items.
+        /// pairs. Prompt reconstruction preserves every retained variant.
         compacted_items: Vec<ResponseItem>,
     },
     /// Context compaction did not replace the current prompt history.
@@ -33,8 +39,19 @@ pub enum QueryEvent {
         /// Human-readable reason the compaction did not complete.
         message: String,
     },
+    /// Assembled request context estimate (before / between model legs).
+    ///
+    /// Emitted after each prompt build so UIs can refresh context occupancy
+    /// when tools finish and the next request is assembled — not only at
+    /// turn end.
+    ContextEstimate {
+        breakdown: crate::RawContextBreakdown,
+    },
     /// Incremental text from the assistant.
     TextDelta(String),
+    /// The current response ended and steering will continue the same turn.
+    /// Close its message before rendering the next provider response.
+    ModelResponseCompleted,
     /// Incremental reasoning text from the assistant.
     ReasoningDelta(String),
     /// Current reasoning block completed.
@@ -112,18 +129,15 @@ pub struct ProviderRetryStatus {
     /// canonical `model/queryRetrying` notification).
     pub max_attempts: usize,
     pub backoff_ms: u64,
-    pub phase: QueryProviderRetryPhase,
+    pub phase: ModelQueryRetryPhase,
     pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryProviderRetryPhase {
-    Scheduled,
-    Resumed,
 }
 
 #[derive(Clone, Default)]
 pub struct QueryOptions {
+    pub output_store: Option<Arc<devo_tools::output_store::OutputStore>>,
+    /// Acknowledged journal for durable sessions; absent for ephemeral callers.
+    pub journal: Option<Arc<dyn crate::durable_execution::ToolIntentJournal>>,
     pub cancel_token: Option<CancellationToken>,
     /// Optional provider used only for compaction summaries. Servers use this
     /// seam to attach Compaction metering without misclassifying the main
@@ -133,9 +147,15 @@ pub struct QueryOptions {
     /// Phase 4). The query loop re-reads it once per iteration so a mid-turn
     /// settings change applies at the next model call or compaction check.
     pub live_settings: Option<SharedLiveTurnSettings>,
+    /// Host goal changes visible at the next model-request boundary. The
+    /// shared outer `None` keeps the turn-start goal; `Some(None)` clears it.
+    pub live_goal: Option<SharedLiveGoal>,
     /// Slot written before each provider attempt so in-turn callers (auto-review)
     /// can reuse the same request prefix for prompt-cache hits.
     pub last_model_request: Option<SharedLastModelRequest>,
+    /// Continual Harness digest (after skills, before goal). Empty/None skips.
+    /// Host loads via `devo_harness::HarnessDigestInjector` at turn start.
+    pub harness_digest: Option<String>,
 }
 
 /// Live per-session settings shared with a running turn. The server writes
@@ -151,6 +171,9 @@ pub struct LiveTurnSettings {
     /// check (mirrors the session-level `ApplyEffectiveContextWindow`
     /// semantics: both the context window and the compact limit move).
     pub auto_compact_token_limit: Option<usize>,
+    /// Python cell first-wait override (ms). Decision point: next `ipython`
+    /// cell wait after the patch applies (L2-DES-CONV-002 DD-6).
+    pub python_cell_first_wait_ms: Option<u64>,
     /// Bumped by the writer on every change; the loop re-applies only when
     /// the generation advances.
     pub generation: u64,
@@ -158,6 +181,10 @@ pub struct LiveTurnSettings {
 
 /// Shared handle to a turn's live settings override.
 pub type SharedLiveTurnSettings = Arc<std::sync::Mutex<LiveTurnSettings>>;
+
+/// Goal override shared with a checked-out turn. An unset outer option means
+/// no host change; a set option replaces or clears the turn's goal context.
+pub type SharedLiveGoal = Arc<std::sync::Mutex<Option<Option<devo_protocol::ThreadGoal>>>>;
 
 /// Shared handle to the last assembled provider request for the running turn.
 pub type SharedLastModelRequest = Arc<std::sync::Mutex<Option<ModelRequest>>>;
@@ -181,6 +208,14 @@ impl std::fmt::Debug for QueryOptions {
             .field(
                 "last_model_request",
                 &self.last_model_request.as_ref().map(|_| "<shared>"),
+            )
+            .field("live_goal", &self.live_goal.as_ref().map(|_| "<shared>"))
+            .field(
+                "harness_digest",
+                &self
+                    .harness_digest
+                    .as_ref()
+                    .map(|d| if d.is_empty() { "<empty>" } else { "<set>" }),
             )
             .finish()
     }
