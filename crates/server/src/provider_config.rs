@@ -581,6 +581,22 @@ mod tests {
         );
     }
 
+    // Fixed expectations for the server-normalization part of the v2 route
+    // contract. Adapter suffixes are /responses and /chat/completions; these
+    // assertions deliberately expose why catalog-only host bases must be skipped.
+    #[test]
+    fn catalog_openai_route_path_parity() {
+        for (base, suffix, expected) in [
+            ("https://gateway.example", "/responses", "https://gateway.example/v1/responses"),
+            ("https://gateway.example/", "/chat/completions", "https://gateway.example/v1/chat/completions"),
+            ("https://gateway.example/v1", "/responses", "https://gateway.example/v1/responses"),
+            ("https://gateway.example/api/", "/chat/completions", "https://gateway.example/api/chat/completions"),
+        ] {
+            let normalized = normalize_openai_base_url(base);
+            assert_eq!(format!("{normalized}{suffix}"), expected);
+        }
+    }
+
     #[test]
     fn sparse_connection_never_inherits_a_remote_endpoint() {
         let sparse = ProviderConfigEntry {

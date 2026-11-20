@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod transport_v2;
+
 const DEFAULT_MODELS_DEV_URL: &str = "https://models.dev/api.json";
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 
@@ -142,7 +144,7 @@ async fn refresh_catalog(
         Ok(api) => api,
         Err(error) => return failure(CatalogRefreshStage::Parse, error),
     };
-    let (catalog, providers, models) = match convert_models_dev_api(&api) {
+    let (mut catalog, providers, models) = match convert_models_dev_api(&api) {
         Ok(result) => result,
         Err(error) => return failure(CatalogRefreshStage::Convert, error),
     };
@@ -151,6 +153,29 @@ async fn refresh_catalog(
             CatalogRefreshStage::Convert,
             "catalog contains no supported models",
         );
+    }
+    // Enrich only the official default source. Custom sources/local fixtures
+    // never cause an extra network request. A failed optional v2 fetch or
+    // projection leaves the successfully converted v1 catalog intact.
+    if source == DEFAULT_MODELS_DEV_URL {
+        match tokio::time::timeout(
+            transport_v2::FETCH_BUDGET,
+            download_models_dev(transport_v2::SOURCE),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => match serde_json::from_slice::<Value>(&raw) {
+                Ok(api) => {
+                    if let Err(error) = transport_v2::enrich(&mut catalog, &api) {
+                        tracing::debug!(%error, "ignoring optional v2 route enrichment");
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "ignoring invalid optional v2 catalog"),
+            },
+            Ok(Err(_)) | Err(_) => {
+                tracing::debug!("optional v2 catalog unavailable; retaining v1 routes");
+            }
+        }
     }
     LIVE_CATALOGS
         .get_or_init(Default::default)
